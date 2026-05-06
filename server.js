@@ -20,6 +20,12 @@ const RATE_LIMIT_MAX = 100; // requests per window
 function rateLimit(req, res, next) {
   const key = req.ip || 'unknown';
   const now = Date.now();
+
+  // Cleanup old entries (memory leak fix)
+  for (const [k, v] of rateLimitMap.entries()) {
+    if (now > v.resetTime) rateLimitMap.delete(k);
+  }
+
   const entry = rateLimitMap.get(key) || { count: 0, resetTime: now + RATE_LIMIT_WINDOW };
 
   if (now > entry.resetTime) {
@@ -79,9 +85,26 @@ function requireBodyUserMatch(req, res, next) {
 }
 
 // ─── Payment Signature Verification ────────────────────────────
+async function fetchWithRetry(url, options, retries = 2, delay = 1000) {
+  try {
+    const response = await fetch(url, options);
+    if (response.status === 429 && retries > 0) {
+      await new Promise(r => setTimeout(r, delay));
+      return fetchWithRetry(url, options, retries - 1, delay * 2);
+    }
+    return response;
+  } catch (e) {
+    if (retries > 0) {
+      await new Promise(r => setTimeout(r, delay));
+      return fetchWithRetry(url, options, retries - 1, delay * 2);
+    }
+    throw e;
+  }
+}
+
 async function verifyPaymentWithPi(paymentId) {
   try {
-    const response = await fetch(`https://api.minepi.com/v2/payments/${paymentId}`, {
+    const response = await fetchWithRetry(`https://api.minepi.com/v2/payments/${paymentId}`, {
       method: 'GET',
       headers: {
         'Authorization': `Key ${PI_API_KEY}`,
@@ -112,7 +135,16 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization', 'x-user-id', 'x-pi-token'],
 }));
 app.use(rateLimit);
-app.use(express.json());
+app.use(express.json({ limit: '10kb' })); // Prevent large JSON attacks
+
+// Security headers
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  next();
+});
 
 // ─── SQLite Database ────────────────────────────────────────────
 const dbPath = path.join(__dirname, 'workpro.db');
@@ -231,12 +263,14 @@ db.serialize(() => {
 function getUser(userId, callback) {
   db.get(`SELECT * FROM users WHERE id = ?`, [userId], (err, row) => {
     if (err) return callback(err, null);
-    if (row) return callback(null, row);
-    // Create user if not exists with 20 starting connects
-    db.run(`INSERT INTO users (id, username, balance_connects) VALUES (?, ?, ?)`, [userId, 'User_' + userId.slice(0, 8), 20], (err) => {
-      if (err) return callback(err, null);
-      db.get(`SELECT * FROM users WHERE id = ?`, [userId], (err, row) => callback(err, row));
-    });
+    callback(null, row || null);
+  });
+}
+
+function createUser(userId, username, callback) {
+  db.run(`INSERT INTO users (id, username, balance_connects) VALUES (?, ?, ?)`, [userId, username || 'User_' + userId.slice(0, 8), 20], (err) => {
+    if (err) return callback(err, null);
+    db.get(`SELECT * FROM users WHERE id = ?`, [userId], (err, row) => callback(err, row));
   });
 }
 
@@ -483,7 +517,8 @@ app.get('/api/users/:userId', (req, res) => {
   const { userId } = req.params;
   getUser(userId, (err, user) => {
     if (err) return res.status(500).json({ error: 'Database error' });
-    res.json(user || { id: userId, balance_connects: 0, balance_pi: 0 });
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    res.json(user);
   });
 });
 
@@ -525,26 +560,42 @@ app.post('/api/users/:userId/availability', requireUser, (req, res) => {
 // ─── Jobs ─────────────────────────────────────────────────────
 app.get('/api/jobs', (req, res) => {
   const { category, search, page = 1, limit = 20 } = req.query;
-  let sql = `SELECT * FROM jobs WHERE status = 'open'`;
-  let params = [];
+  let whereSql = `WHERE status = 'open'`;
+  let whereParams = [];
+  let countParams = [];
 
   if (category && category !== 'all') {
-    sql += ` AND category = ?`;
-    params.push(category);
+    whereSql += ` AND category = ?`;
+    whereParams.push(category);
+    countParams.push(category);
   }
   if (search) {
-    sql += ` AND (title LIKE ? OR description LIKE ?)`;
-    params.push(`%${search}%`, `%${search}%`);
+    const safeSearch = search.replace(/[%_]/g, '\$&');
+    whereSql += ` AND (title LIKE ? OR description LIKE ?)`;
+    whereParams.push(`%${safeSearch}%`, `%${safeSearch}%`);
+    countParams.push(`%${safeSearch}%`, `%${safeSearch}%`);
   }
-  sql += ` ORDER BY created_at DESC LIMIT ? OFFSET ?`;
-  params.push(parseInt(limit), (parseInt(page) - 1) * parseInt(limit));
 
-  db.all(sql, params, (err, rows) => {
+  const pageInt = Math.max(1, parseInt(page) || 1);
+  const limitInt = Math.min(100, Math.max(1, parseInt(limit) || 20));
+  const offset = (pageInt - 1) * limitInt;
+
+  // Get total count for real pagination
+  db.get(`SELECT COUNT(*) as total FROM jobs ${whereSql}`, countParams, (err, countRow) => {
     if (err) return res.status(500).json({ error: 'Database error' });
-    rows.forEach(row => {
-      if (row.images) try { row.images = JSON.parse(row.images); } catch(e) {}
+    const total = countRow ? countRow.total : 0;
+    const totalPages = Math.ceil(total / limitInt);
+
+    const sql = `SELECT * FROM jobs ${whereSql} ORDER BY created_at DESC LIMIT ? OFFSET ?`;
+    const params = [...whereParams, limitInt, offset];
+
+    db.all(sql, params, (err, rows) => {
+      if (err) return res.status(500).json({ error: 'Database error' });
+      rows.forEach(row => {
+        if (row.images) try { row.images = JSON.parse(row.images); } catch(e) {}
+      });
+      res.json({ jobs: rows, page: pageInt, limit: limitInt, total, total_pages: totalPages });
     });
-    res.json({ jobs: rows, page: parseInt(page), total_pages: 1 });
   });
 });
 
@@ -568,8 +619,17 @@ app.get('/api/jobs/user/:username', (req, res) => {
 
 app.post('/api/jobs', requireUser, requireBodyUserMatch, (req, res) => {
   const { title, description, category, budget, skills, images, deadline, posted_by, posted_by_name } = req.body;
-  if (!title || !description) {
-    return res.status(400).json({ error: 'Title and description required' });
+  if (!title || typeof title !== 'string' || title.trim().length < 3) {
+    return res.status(400).json({ error: 'Title must be at least 3 characters' });
+  }
+  if (!description || typeof description !== 'string' || description.trim().length < 10) {
+    return res.status(400).json({ error: 'Description must be at least 10 characters' });
+  }
+  if (budget !== undefined && (typeof budget !== 'number' || budget < 0)) {
+    return res.status(400).json({ error: 'Budget must be a non-negative number' });
+  }
+  if (images && !Array.isArray(images)) {
+    return res.status(400).json({ error: 'Images must be an array' });
   }
 
   // Deduct 1 connect for posting
