@@ -8,14 +8,81 @@ const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 3000;
 const PI_API_KEY = process.env.PI_API_KEY;
+const ADMIN_API_KEY = process.env.ADMIN_API_KEY;
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://cherry19899.github.io';
+const NODE_ENV = process.env.NODE_ENV || 'development';
 
-// ─── Middleware ───────────────────────────────────────────────
+// ─── Rate Limiting ────────────────────────────────────────────
+const rateLimitMap = new Map();
+const RATE_LIMIT_WINDOW = 60 * 1000; // 1 minute
+const RATE_LIMIT_MAX = 100; // requests per window
+
+function rateLimit(req, res, next) {
+  const key = req.ip || 'unknown';
+  const now = Date.now();
+  const entry = rateLimitMap.get(key) || { count: 0, resetTime: now + RATE_LIMIT_WINDOW };
+
+  if (now > entry.resetTime) {
+    entry.count = 0;
+    entry.resetTime = now + RATE_LIMIT_WINDOW;
+  }
+
+  entry.count++;
+  rateLimitMap.set(key, entry);
+
+  if (entry.count > RATE_LIMIT_MAX) {
+    return res.status(429).json({ error: 'Too many requests, please try again later' });
+  }
+  next();
+}
+
+// ─── Admin Auth Middleware ────────────────────────────────────
+function requireAdmin(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Admin authentication required' });
+  }
+  const token = authHeader.slice(7);
+  if (token !== ADMIN_API_KEY) {
+    return res.status(403).json({ error: 'Invalid admin token' });
+  }
+  next();
+}
+
+// ─── Payment Signature Verification ────────────────────────────
+async function verifyPaymentWithPi(paymentId) {
+  try {
+    const response = await fetch(`https://api.minepi.com/v2/payments/${paymentId}`, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Key ${PI_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+    });
+    if (!response.ok) return null;
+    return await response.json();
+  } catch (e) {
+    console.error('[Pi API] Verification error:', e.message);
+    return null;
+  }
+}
+
+// ─── TXID Validation ──────────────────────────────────────────
+function isValidTxid(txid) {
+  return typeof txid === 'string' && /^[a-fA-F0-9]{64}$/.test(txid);
+}
+
+// ─── CORS Configuration ───────────────────────────────────────
+const corsOrigins = NODE_ENV === 'production'
+  ? [FRONTEND_URL, 'https://cherry19899.github.io']
+  : [FRONTEND_URL, 'https://cherry19899.github.io', 'http://localhost:5173', 'http://localhost:3000'];
+
 app.use(cors({
-  origin: [FRONTEND_URL, 'https://cherry19899.github.io', 'http://localhost:5173', 'http://localhost:3000'],
+  origin: corsOrigins,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
+app.use(rateLimit);
 app.use(express.json());
 
 // ─── SQLite Database ────────────────────────────────────────────
@@ -146,6 +213,12 @@ app.post('/api/payments/:paymentId/approve', async (req, res) => {
     return res.status(500).json({ error: 'PI_API_KEY not configured' });
   }
 
+  // Verify payment exists on Pi Network before approving
+  const piPayment = await verifyPaymentWithPi(paymentId);
+  if (!piPayment) {
+    return res.status(400).json({ error: 'Payment not found on Pi Network' });
+  }
+
   try {
     const response = await fetch(`https://api.minepi.com/v2/payments/${paymentId}/approve`, {
       method: 'POST',
@@ -162,11 +235,15 @@ app.post('/api/payments/:paymentId/approve', async (req, res) => {
       return res.status(response.status).json({ error: data.error || 'Approval failed', details: data });
     }
 
-    // Save payment record
-    const { user, amount, memo } = req.body;
+    // Save payment record using verified data from Pi API
+    const uid = piPayment.user_uid || req.body?.user?.uid || 'unknown';
+    const username = piPayment.metadata?.user?.username || req.body?.user?.username || 'unknown';
+    const amount = piPayment.amount || req.body?.amount || 0;
+    const memo = piPayment.memo || req.body?.memo || '';
+
     db.run(
       `INSERT OR REPLACE INTO payments (id, user_id, username, amount, memo, status) VALUES (?, ?, ?, ?, ?, 'approved')`,
-      [paymentId, user?.uid || 'unknown', user?.username || 'unknown', amount, memo],
+      [paymentId, uid, username, amount, memo],
       (err) => {
         if (err) console.error('[DB] Error saving payment:', err);
       }
@@ -191,6 +268,11 @@ app.post('/api/payments/:paymentId/complete', async (req, res) => {
 
   if (!txid) {
     return res.status(400).json({ error: 'txid is required' });
+  }
+
+  // Validate txid format (64-char hex)
+  if (!isValidTxid(txid)) {
+    return res.status(400).json({ error: 'Invalid txid format. Must be 64-character hex string.' });
   }
 
   try {
@@ -231,6 +313,17 @@ app.post('/api/payments/:paymentId/complete', async (req, res) => {
 app.post('/api/payments/:paymentId/cancelled', async (req, res) => {
   const { paymentId } = req.params;
 
+  // Verify payment exists on Pi Network before cancelling
+  const piPayment = await verifyPaymentWithPi(paymentId);
+  if (!piPayment) {
+    return res.status(400).json({ error: 'Payment not found on Pi Network' });
+  }
+
+  // Only allow cancelling payments that are still pending
+  if (piPayment.status !== 'pending' && piPayment.status !== 'approved') {
+    return res.status(400).json({ error: 'Payment cannot be cancelled in current state: ' + piPayment.status });
+  }
+
   db.run(
     `UPDATE payments SET status = 'cancelled' WHERE id = ?`,
     [paymentId],
@@ -239,6 +332,7 @@ app.post('/api/payments/:paymentId/cancelled', async (req, res) => {
     }
   );
 
+  console.log('[Pi API] Payment cancelled:', paymentId);
   res.json({ success: true, message: 'Payment marked as cancelled' });
 });
 
@@ -563,13 +657,6 @@ app.post('/api/escrows/:escrowId/message', (req, res) => {
   );
 });
 
-app.get('/api/admin/escrows', (req, res) => {
-  db.all(`SELECT * FROM escrows ORDER BY created_at DESC`, [], (err, rows) => {
-    if (err) return res.status(500).json({ error: 'Database error' });
-    res.json(rows);
-  });
-});
-
 // ─── Reviews ──────────────────────────────────────────────────
 app.post('/api/reviews', (req, res) => {
   const { reviewer_id, reviewer_name, target_id, target_name, job_id, job_title, rating, text } = req.body;
@@ -627,8 +714,8 @@ app.post('/api/offers/:offerId/decline', (req, res) => {
   });
 });
 
-// ─── Admin ────────────────────────────────────────────────────
-app.get('/api/admin/stats', (req, res) => {
+// ─── Admin (Protected) ────────────────────────────────────────
+app.get('/api/admin/stats', requireAdmin, (req, res) => {
   db.get(`SELECT COUNT(*) as total_users FROM users`, [], (err, usersRow) => {
     db.get(`SELECT COUNT(*) as total_jobs FROM jobs`, [], (err, jobsRow) => {
       db.get(`SELECT COUNT(*) as total_applications FROM applications`, [], (err, appsRow) => {
@@ -645,25 +732,32 @@ app.get('/api/admin/stats', (req, res) => {
   });
 });
 
-app.get('/api/admin/users', (req, res) => {
+app.get('/api/admin/users', requireAdmin, (req, res) => {
   db.all(`SELECT * FROM users ORDER BY created_at DESC`, [], (err, rows) => {
     if (err) return res.status(500).json({ error: 'Database error' });
     res.json(rows);
   });
 });
 
-app.get('/api/admin/jobs/all', (req, res) => {
+app.get('/api/admin/jobs/all', requireAdmin, (req, res) => {
   db.all(`SELECT * FROM jobs ORDER BY created_at DESC`, [], (err, rows) => {
     if (err) return res.status(500).json({ error: 'Database error' });
     res.json(rows);
   });
 });
 
-app.get('/api/admin/earnings', (req, res) => {
+app.get('/api/admin/earnings', requireAdmin, (req, res) => {
   db.all(`SELECT * FROM payments WHERE status = 'completed' ORDER BY created_at DESC`, [], (err, rows) => {
     if (err) return res.status(500).json({ error: 'Database error' });
     const total = rows.reduce((sum, p) => sum + (p.amount || 0), 0);
     res.json({ payments: rows, total });
+  });
+});
+
+app.get('/api/admin/escrows', requireAdmin, (req, res) => {
+  db.all(`SELECT * FROM escrows ORDER BY created_at DESC`, [], (err, rows) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    res.json(rows);
   });
 });
 
@@ -683,6 +777,8 @@ app.post('/api/chat/:roomId/messages', (req, res) => {
 // ─── Start Server ───────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`[WorkPro Backend] Running on port ${PORT}`);
-  console.log(`[WorkPro Backend] Frontend allowed: ${FRONTEND_URL}`);
+  console.log(`[WorkPro Backend] Environment: ${NODE_ENV}`);
+  console.log(`[WorkPro Backend] Frontend allowed: ${corsOrigins.join(', ')}`);
   console.log(`[WorkPro Backend] Pi API Key: ${PI_API_KEY ? 'Configured' : 'MISSING!'}`);
+  console.log(`[WorkPro Backend] Admin API Key: ${ADMIN_API_KEY ? 'Configured' : 'MISSING!'}`);
 });
