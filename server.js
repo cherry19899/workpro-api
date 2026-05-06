@@ -8,7 +8,7 @@ const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 3000;
 const PI_API_KEY = process.env.PI_API_KEY;
-const ADMIN_API_KEY = process.env.ADMIN_API_KEY || process.env.WORKPRO_API_ACCESS || PI_API_KEY || 'workpro-admin-change-me-in-production';
+const ADMIN_API_KEY = process.env.ADMIN_API_KEY || process.env.WORKPRO_API_ACCESS || 'workpro-admin-change-me-in-production';
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://cherry19899.github.io';
 const NODE_ENV = process.env.NODE_ENV || 'production';
 
