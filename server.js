@@ -335,6 +335,26 @@ function updateUserBalance(userId, connectsDelta, piDelta, callback) {
         db.run('ROLLBACK');
         return callback(err);
       }
+      if (!user) {
+        // Auto-create user with default balance
+        db.run(`INSERT INTO users (id, username, balance_connects, balance_pi) VALUES (?, ?, ?, ?)`,
+          [userId, 'User_' + userId.slice(0, 8), 20 + connectsDelta, piDelta],
+          (err) => {
+            if (err) {
+              db.run('ROLLBACK');
+              return callback(err);
+            }
+            db.run('COMMIT', (err) => {
+              if (err) {
+                db.run('ROLLBACK');
+                return callback(err);
+              }
+              callback(null, { balance_connects: 20 + connectsDelta, balance_pi: piDelta });
+            });
+          }
+        );
+        return;
+      }
       const newConnects = (user.balance_connects || 0) + connectsDelta;
       const newPi = (user.balance_pi || 0) + piDelta;
       db.run(`UPDATE users SET balance_connects = ?, balance_pi = ? WHERE id = ?`, [newConnects, newPi, userId], (err) => {
