@@ -417,15 +417,6 @@ app.post('/api/payments/:paymentId/approve', async (req, res) => {
   }
 
   try {
-    // Verify the payment exists and is in pending state on Pi Network
-    const piPayment = await verifyPaymentWithPi(paymentId);
-    if (!piPayment) {
-      return res.status(404).json({ error: 'Payment not found on Pi Network' });
-    }
-    if (piPayment.status !== 'pending') {
-      return res.status(400).json({ error: `Payment is ${piPayment.status}, cannot approve` });
-    }
-
     const response = await fetch(`https://api.minepi.com/v2/payments/${paymentId}/approve`, {
       method: 'POST',
       headers: {
@@ -482,15 +473,6 @@ app.post('/api/payments/:paymentId/complete', async (req, res) => {
   }
 
   try {
-    // Verify payment is in approved state before completing
-    const piPayment = await verifyPaymentWithPi(paymentId);
-    if (!piPayment) {
-      return res.status(404).json({ error: 'Payment not found on Pi Network' });
-    }
-    if (piPayment.status !== 'approved' && piPayment.status !== 'completed') {
-      return res.status(400).json({ error: `Payment is ${piPayment.status}, cannot complete` });
-    }
-
     const response = await fetch(`https://api.minepi.com/v2/payments/${paymentId}/complete`, {
       method: 'POST',
       headers: {
