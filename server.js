@@ -8,7 +8,7 @@ const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 3000;
 const PI_API_KEY = process.env.PI_API_KEY;
-const ADMIN_API_KEY = process.env.ADMIN_API_KEY || process.env.WORKPRO_API_ACCESS || 'workpro-admin-change-me-in-production';
+const ADMIN_API_KEY = process.env.ADMIN_API_KEY || process.env.WORKPRO_API_ACCESS || PI_API_KEY || 'workpro-admin-change-me-in-production';
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://cherry19899.github.io';
 const NODE_ENV = process.env.NODE_ENV || 'production';
 
@@ -39,11 +39,21 @@ function rateLimit(req, res, next) {
 // ─── Admin Auth Middleware ────────────────────────────────────
 function requireAdmin(req, res, next) {
   const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Admin authentication required' });
+  const token = authHeader && authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+
+  if (!token) {
+    return res.status(401).json({ error: 'Admin authentication required. Use: Authorization: Bearer <token>' });
   }
-  const token = authHeader.slice(7);
-  if (token !== ADMIN_API_KEY) {
+
+  // Timing-safe comparison
+  let match = true;
+  const expected = ADMIN_API_KEY || '';
+  if (token.length !== expected.length) match = false;
+  for (let i = 0; i < Math.max(token.length, expected.length); i++) {
+    if (i >= token.length || i >= expected.length || token[i] !== expected[i]) match = false;
+  }
+
+  if (!match) {
     return res.status(403).json({ error: 'Invalid admin token' });
   }
   next();
@@ -205,17 +215,6 @@ app.get('/', (req, res) => {
   res.json({ status: 'ok', message: 'Work Pro Backend Running', pi_api_configured: !!PI_API_KEY, admin_configured: !!ADMIN_API_KEY, env: NODE_ENV });
 });
 
-app.get('/_health/debug', (req, res) => {
-  res.json({
-    admin_key_length: ADMIN_API_KEY ? ADMIN_API_KEY.length : 0,
-    admin_key_prefix: ADMIN_API_KEY ? ADMIN_API_KEY.substring(0, 8) : null,
-    workpro_access_length: process.env.WORKPRO_API_ACCESS ? process.env.WORKPRO_API_ACCESS.length : 0,
-    workpro_access_prefix: process.env.WORKPRO_API_ACCESS ? process.env.WORKPRO_API_ACCESS.substring(0, 8) : null,
-    env_admin_length: process.env.ADMIN_API_KEY ? process.env.ADMIN_API_KEY.length : 0,
-    node_env: NODE_ENV,
-    pi_configured: !!PI_API_KEY,
-  });
-});
 
 // ─── Approve Pi Payment ───────────────────────────────────────
 app.post('/api/payments/:paymentId/approve', async (req, res) => {
