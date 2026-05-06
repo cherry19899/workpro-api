@@ -81,7 +81,7 @@ function requireBodyUserMatch(req, res, next) {
 // ─── Payment Signature Verification ────────────────────────────
 async function verifyPaymentWithPi(paymentId) {
   try {
-    const response = await fetch(`https://api.testnet.minepi.com/v2/payments/${paymentId}`, {
+    const response = await fetch(`https://api.minepi.com/v2/payments/${paymentId}`, {
       method: 'GET',
       headers: {
         'Authorization': `Key ${PI_API_KEY}`,
@@ -278,7 +278,7 @@ app.post('/api/payments/:paymentId/approve', requireUser, async (req, res) => {
   }
 
   try {
-    const response = await fetch(`https://api.testnet.minepi.com/v2/payments/${paymentId}/approve`, {
+    const response = await fetch(`https://api.minepi.com/v2/payments/${paymentId}/approve`, {
       method: 'POST',
       headers: {
         'Authorization': `Key ${PI_API_KEY}`,
@@ -334,7 +334,7 @@ app.post('/api/payments/:paymentId/complete', requireUser, async (req, res) => {
   }
 
   try {
-    const response = await fetch(`https://api.testnet.minepi.com/v2/payments/${paymentId}/complete`, {
+    const response = await fetch(`https://api.minepi.com/v2/payments/${paymentId}/complete`, {
       method: 'POST',
       headers: {
         'Authorization': `Key ${PI_API_KEY}`,
@@ -444,7 +444,7 @@ app.post('/api/connects/initiate', requireUser, requireBodyUserMatch, async (req
         if (err) return res.status(500).json({ error: 'Database error' });
       }
     );
-    const piRes = await fetch(`https://api.testnet.minepi.com/v2/payments/${payment_id}/approve`, {
+    const piRes = await fetch(`https://api.minepi.com/v2/payments/${payment_id}/approve`, {
       method: 'POST',
       headers: { 'Authorization': `Key ${PI_API_KEY}` },
     });
@@ -461,7 +461,7 @@ app.post('/api/connects/complete', requireUser, requireBodyUserMatch, async (req
   if (!isValidTxid(txid)) return res.status(400).json({ error: 'Invalid txid format' });
 
   try {
-    const piRes = await fetch(`https://api.testnet.minepi.com/v2/payments/${payment_id}/complete`, {
+    const piRes = await fetch(`https://api.minepi.com/v2/payments/${payment_id}/complete`, {
       method: 'POST',
       headers: { 'Authorization': `Key ${PI_API_KEY}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ txid }),
