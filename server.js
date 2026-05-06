@@ -109,7 +109,7 @@ const corsOrigins = NODE_ENV === 'production'
 app.use(cors({
   origin: corsOrigins,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-user-id', 'x-pi-token', 'x-admin-key'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-user-id', 'x-pi-token'],
 }));
 app.use(rateLimit);
 app.use(express.json());
@@ -270,7 +270,7 @@ app.get('/', (req, res) => {
 });
 
 // ─── Approve Pi Payment ───────────────────────────────────────
-app.post('/api/payments/:paymentId/approve', requireUser, async (req, res) => {
+app.post('/api/payments/:paymentId/approve', async (req, res) => {
   const { paymentId } = req.params;
 
   if (!PI_API_KEY) {
@@ -316,7 +316,7 @@ app.post('/api/payments/:paymentId/approve', requireUser, async (req, res) => {
 });
 
 // ─── Complete Pi Payment ──────────────────────────────────────
-app.post('/api/payments/:paymentId/complete', requireUser, async (req, res) => {
+app.post('/api/payments/:paymentId/complete', async (req, res) => {
   const { paymentId } = req.params;
   const { txid } = req.body;
 
@@ -368,7 +368,7 @@ app.post('/api/payments/:paymentId/complete', requireUser, async (req, res) => {
 });
 
 // ─── Cancelled Payment Webhook ──────────────────────────────────
-app.post('/api/payments/:paymentId/cancelled', requireUser, async (req, res) => {
+app.post('/api/payments/:paymentId/cancelled', async (req, res) => {
   const { paymentId } = req.params;
 
   // Verify payment exists on Pi Network before cancelling
@@ -395,7 +395,7 @@ app.post('/api/payments/:paymentId/cancelled', requireUser, async (req, res) => 
 });
 
 // ─── Get Payment Status ───────────────────────────────────────
-app.get('/api/payments/:paymentId', requireUser, (req, res) => {
+app.get('/api/payments/:paymentId', (req, res) => {
   const { paymentId } = req.params;
   db.get(`SELECT * FROM payments WHERE id = ?`, [paymentId], (err, row) => {
     if (err) return res.status(500).json({ error: 'Database error' });
@@ -404,7 +404,7 @@ app.get('/api/payments/:paymentId', requireUser, (req, res) => {
 });
 
 // ─── Connects Purchase (Legacy — backward compatible) ─────────
-app.post('/api/connects/buy', requireUser, requireBodyUserMatch, (req, res) => {
+app.post('/api/connects/buy', requireUser, (req, res) => {
   const { user_id, username, package_amount, pi_amount, payment_id } = req.body;
 
   db.run(
@@ -432,7 +432,7 @@ app.post('/api/connects/buy', requireUser, requireBodyUserMatch, (req, res) => {
 });
 
 // ─── Connects Purchase Initiate (Pi SDK flow) ────────────────
-app.post('/api/connects/initiate', requireUser, requireBodyUserMatch, async (req, res) => {
+app.post('/api/connects/initiate', requireUser, async (req, res) => {
   const { user_id, package_amount, pi_amount, payment_id } = req.body;
   if (!PI_API_KEY) return res.status(500).json({ error: 'PI_API_KEY not configured' });
 
@@ -455,7 +455,7 @@ app.post('/api/connects/initiate', requireUser, requireBodyUserMatch, async (req
 });
 
 // ─── Connects Purchase Complete (Pi SDK flow) ────────────────
-app.post('/api/connects/complete', requireUser, requireBodyUserMatch, async (req, res) => {
+app.post('/api/connects/complete', requireUser, async (req, res) => {
   const { payment_id, txid, user_id, package_amount } = req.body;
   if (!PI_API_KEY || !txid) return res.status(400).json({ error: 'Missing txid or API key' });
   if (!isValidTxid(txid)) return res.status(400).json({ error: 'Invalid txid format' });
@@ -664,7 +664,7 @@ app.post('/api/jobs/:jobId/apply', requireUser, requireBodyUserMatch, (req, res)
   });
 });
 
-app.get('/api/jobs/:jobId/applications', (req, res) => {
+app.get('/api/jobs/:jobId/applications', requireUser, (req, res) => {
   db.all(`SELECT * FROM applications WHERE job_id = ? ORDER BY created_at DESC`, [req.params.jobId], (err, rows) => {
     if (err) return res.status(500).json({ error: 'Database error' });
     res.json(rows);
@@ -953,7 +953,7 @@ app.get('/api/chat/rooms/:userId', requireUser, (req, res) => {
   res.json([]);
 });
 
-app.get('/api/chat/:roomId/messages', (req, res) => {
+app.get('/api/chat/:roomId/messages', requireUser, (req, res) => {
   res.json([]);
 });
 
@@ -967,6 +967,5 @@ app.listen(PORT, () => {
   console.log(`[WorkPro Backend] Environment: ${NODE_ENV}`);
   console.log(`[WorkPro Backend] Frontend allowed: ${corsOrigins.join(', ')}`);
   console.log(`[WorkPro Backend] Pi API Key: ${PI_API_KEY ? 'Configured' : 'MISSING!'}`);
-  console.log(`[WorkPro Backend] Admin API Key: ${ADMIN_API_KEY ? 'Configured' : 'MISSING!'}`);
+  console.log(`[WorkPro Backend] Admin API Key: ${ADMIN_API_KEY ? 'Configured' : 'MISSING!'}`); // TODO: remove in production
 });
-// Deployed at 2026-05-06-18:45:34 UTC
