@@ -59,6 +59,25 @@ function requireAdmin(req, res, next) {
   next();
 }
 
+// ─── User Auth Middleware ─────────────────────────────────────
+function requireUser(req, res, next) {
+  const userId = req.headers['x-user-id'];
+  if (!userId) {
+    return res.status(401).json({ error: 'Authentication required. Missing x-user-id header.' });
+  }
+  req.userId = userId;
+  next();
+}
+
+function requireBodyUserMatch(req, res, next) {
+  const userId = req.headers['x-user-id'];
+  const bodyUserId = req.body.user_id || req.body.posted_by || req.body.client_id || req.body.reviewer_id;
+  if (bodyUserId && bodyUserId !== userId) {
+    return res.status(403).json({ error: 'You can only act on your own behalf.' });
+  }
+  next();
+}
+
 // ─── Payment Signature Verification ────────────────────────────
 async function verifyPaymentWithPi(paymentId) {
   try {
@@ -90,7 +109,7 @@ const corsOrigins = NODE_ENV === 'production'
 app.use(cors({
   origin: corsOrigins,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-user-id', 'x-pi-token', 'x-admin-key'],
 }));
 app.use(rateLimit);
 app.use(express.json());
@@ -116,15 +135,12 @@ db.serialize(() => {
     id TEXT PRIMARY KEY,
     username TEXT NOT NULL,
     role TEXT DEFAULT 'freelancer',
-    balance_connects INTEGER DEFAULT 0,
+    balance_connects INTEGER DEFAULT 20,
     balance_pi REAL DEFAULT 0,
     kyc_verified INTEGER DEFAULT 0,
     availability TEXT DEFAULT 'available',
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )`);
-
-  // Add availability column if not exists (migration)
-
 
   db.run(`CREATE TABLE IF NOT EXISTS jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -172,6 +188,7 @@ db.serialize(() => {
     message TEXT NOT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )`);
+
   db.run(`CREATE TABLE IF NOT EXISTS connects_purchases (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id TEXT NOT NULL,
@@ -210,14 +227,50 @@ db.serialize(() => {
   )`);
 });
 
+// ─── Helpers ────────────────────────────────────────────────────
+function getUser(userId, callback) {
+  db.get(`SELECT * FROM users WHERE id = ?`, [userId], (err, row) => {
+    if (err) return callback(err, null);
+    if (row) return callback(null, row);
+    // Create user if not exists with 20 starting connects
+    db.run(`INSERT INTO users (id, username, balance_connects) VALUES (?, ?, ?)`, [userId, 'User_' + userId.slice(0, 8), 20], (err) => {
+      if (err) return callback(err, null);
+      db.get(`SELECT * FROM users WHERE id = ?`, [userId], (err, row) => callback(err, row));
+    });
+  });
+}
+
+function updateUserBalance(userId, connectsDelta, piDelta, callback) {
+  getUser(userId, (err, user) => {
+    if (err) return callback(err);
+    const newConnects = (user.balance_connects || 0) + connectsDelta;
+    const newPi = (user.balance_pi || 0) + piDelta;
+    db.run(`UPDATE users SET balance_connects = ?, balance_pi = ? WHERE id = ?`, [newConnects, newPi, userId], (err) => {
+      if (err) return callback(err);
+      callback(null, { balance_connects: newConnects, balance_pi: newPi });
+    });
+  });
+}
+
+function getJob(jobId, callback) {
+  db.get(`SELECT * FROM jobs WHERE id = ?`, [jobId], (err, row) => {
+    if (err) return callback(err, null);
+    if (row && row.images) try { row.images = JSON.parse(row.images); } catch(e) {}
+    callback(err, row);
+  });
+}
+
+function getEscrow(escrowId, callback) {
+  db.get(`SELECT * FROM escrows WHERE id = ?`, [escrowId], callback);
+}
+
 // ─── Health Check ───────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({ status: 'ok', message: 'Work Pro Backend Running', pi_api_configured: !!PI_API_KEY, admin_configured: !!ADMIN_API_KEY, env: NODE_ENV });
 });
 
-
 // ─── Approve Pi Payment ───────────────────────────────────────
-app.post('/api/payments/:paymentId/approve', async (req, res) => {
+app.post('/api/payments/:paymentId/approve', requireUser, async (req, res) => {
   const { paymentId } = req.params;
 
   if (!PI_API_KEY) {
@@ -269,7 +322,7 @@ app.post('/api/payments/:paymentId/approve', async (req, res) => {
 });
 
 // ─── Complete Pi Payment ──────────────────────────────────────
-app.post('/api/payments/:paymentId/complete', async (req, res) => {
+app.post('/api/payments/:paymentId/complete', requireUser, async (req, res) => {
   const { paymentId } = req.params;
   const { txid } = req.body;
 
@@ -321,7 +374,7 @@ app.post('/api/payments/:paymentId/complete', async (req, res) => {
 });
 
 // ─── Cancelled Payment Webhook ──────────────────────────────────
-app.post('/api/payments/:paymentId/cancelled', async (req, res) => {
+app.post('/api/payments/:paymentId/cancelled', requireUser, async (req, res) => {
   const { paymentId } = req.params;
 
   // Verify payment exists on Pi Network before cancelling
@@ -347,8 +400,17 @@ app.post('/api/payments/:paymentId/cancelled', async (req, res) => {
   res.json({ success: true, message: 'Payment marked as cancelled' });
 });
 
-// ─── Buy Connects ─────────────────────────────────────────────
-app.post('/api/connects/buy', async (req, res) => {
+// ─── Get Payment Status ───────────────────────────────────────
+app.get('/api/payments/:paymentId', requireUser, (req, res) => {
+  const { paymentId } = req.params;
+  db.get(`SELECT * FROM payments WHERE id = ?`, [paymentId], (err, row) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    res.json(row || { id: paymentId, status: 'not_found' });
+  });
+});
+
+// ─── Connects Purchase (Legacy — backward compatible) ─────────
+app.post('/api/connects/buy', requireUser, requireBodyUserMatch, (req, res) => {
   const { user_id, username, package_amount, pi_amount, payment_id } = req.body;
 
   db.run(
@@ -361,7 +423,7 @@ app.post('/api/connects/buy', async (req, res) => {
       }
 
       // Update user connects balance
-      db.get(`SELECT balance_connects FROM users WHERE id = ?`, [user_id], (err, row) => {
+      getUser(user_id, (err, row) => {
         if (row) {
           const newBalance = (row.balance_connects || 0) + package_amount;
           db.run(`UPDATE users SET balance_connects = ? WHERE id = ?`, [newBalance, user_id]);
@@ -375,43 +437,94 @@ app.post('/api/connects/buy', async (req, res) => {
   );
 });
 
+// ─── Connects Purchase Initiate (Pi SDK flow) ────────────────
+app.post('/api/connects/initiate', requireUser, requireBodyUserMatch, async (req, res) => {
+  const { user_id, package_amount, pi_amount, payment_id } = req.body;
+  if (!PI_API_KEY) return res.status(500).json({ error: 'PI_API_KEY not configured' });
+
+  try {
+    db.run(
+      `INSERT INTO connects_purchases (user_id, amount, pi_amount, payment_id, status) VALUES (?, ?, ?, ?, 'pending')`,
+      [user_id, package_amount, pi_amount, payment_id],
+      function(err) {
+        if (err) return res.status(500).json({ error: 'Database error' });
+      }
+    );
+    const piRes = await fetch(`https://api.minepi.com/v2/payments/${payment_id}/approve`, {
+      method: 'POST',
+      headers: { 'Authorization': `Key ${PI_API_KEY}` },
+    });
+    res.json({ success: piRes.ok });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Connects Purchase Complete (Pi SDK flow) ────────────────
+app.post('/api/connects/complete', requireUser, requireBodyUserMatch, async (req, res) => {
+  const { payment_id, txid, user_id, package_amount } = req.body;
+  if (!PI_API_KEY || !txid) return res.status(400).json({ error: 'Missing txid or API key' });
+  if (!isValidTxid(txid)) return res.status(400).json({ error: 'Invalid txid format' });
+
+  try {
+    const piRes = await fetch(`https://api.minepi.com/v2/payments/${payment_id}/complete`, {
+      method: 'POST',
+      headers: { 'Authorization': `Key ${PI_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ txid }),
+    });
+    if (!piRes.ok) return res.status(piRes.status).json({ error: 'Pi complete failed' });
+
+    updateUserBalance(user_id, package_amount, 0, (err, result) => {
+      if (err) return res.status(500).json({ error: 'DB error' });
+      db.run(`UPDATE connects_purchases SET status = 'completed' WHERE payment_id = ?`, [payment_id]);
+      res.json({ success: true, new_balance: result.balance_connects });
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ─── Get User Data ────────────────────────────────────────────
 app.get('/api/users/:userId', (req, res) => {
   const { userId } = req.params;
-  db.get(`SELECT * FROM users WHERE id = ?`, [userId], (err, row) => {
+  getUser(userId, (err, user) => {
     if (err) return res.status(500).json({ error: 'Database error' });
-    res.json(row || { id: userId, balance_connects: 0, balance_pi: 0 });
+    res.json(user || { id: userId, balance_connects: 0, balance_pi: 0 });
   });
 });
 
 // ─── Update User Balance ──────────────────────────────────────
-app.post('/api/users/:userId/balance', (req, res) => {
+app.post('/api/users/:userId/balance', requireUser, (req, res) => {
   const { userId } = req.params;
   const { connects, pi } = req.body;
+  if (req.userId !== userId) return res.status(403).json({ error: 'Can only update your own balance' });
 
-  db.get(`SELECT * FROM users WHERE id = ?`, [userId], (err, row) => {
-    if (row) {
-      const newConnects = connects !== undefined ? connects : (row.balance_connects || 0);
-      const newPi = pi !== undefined ? pi : (row.balance_pi || 0);
-      db.run(`UPDATE users SET balance_connects = ?, balance_pi = ? WHERE id = ?`, [newConnects, newPi, userId], (err) => {
-        if (err) return res.status(500).json({ error: 'Database error' });
-        res.json({ success: true, balance_connects: newConnects, balance_pi: newPi });
-      });
-    } else {
-      db.run(`INSERT INTO users (id, balance_connects, balance_pi) VALUES (?, ?, ?)`, [userId, connects || 0, pi || 0], (err) => {
-        if (err) return res.status(500).json({ error: 'Database error' });
-        res.json({ success: true, balance_connects: connects || 0, balance_pi: pi || 0 });
-      });
-    }
+  getUser(userId, (err, user) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    const newConnects = connects !== undefined ? connects : (user.balance_connects || 0);
+    const newPi = pi !== undefined ? pi : (user.balance_pi || 0);
+    db.run(`UPDATE users SET balance_connects = ?, balance_pi = ? WHERE id = ?`, [newConnects, newPi, userId], (err) => {
+      if (err) return res.status(500).json({ error: 'Database error' });
+      res.json({ success: true, balance_connects: newConnects, balance_pi: newPi });
+    });
   });
 });
 
-// ─── Get Payment Status ───────────────────────────────────────
-app.get('/api/payments/:paymentId', (req, res) => {
-  const { paymentId } = req.params;
-  db.get(`SELECT * FROM payments WHERE id = ?`, [paymentId], (err, row) => {
+// ─── Update User Availability ─────────────────────────────────
+app.post('/api/users/:userId/availability', requireUser, (req, res) => {
+  const { userId } = req.params;
+  const { availability } = req.body;
+  if (req.userId !== userId) return res.status(403).json({ error: 'Can only update your own availability' });
+  if (!availability || !['available', 'busy'].includes(availability)) {
+    return res.status(400).json({ error: 'Invalid availability value' });
+  }
+
+  getUser(userId, (err, user) => {
     if (err) return res.status(500).json({ error: 'Database error' });
-    res.json(row || { id: paymentId, status: 'not_found' });
+    db.run(`UPDATE users SET availability = ? WHERE id = ?`, [availability, userId], function(err) {
+      if (err) return res.status(500).json({ error: 'Database error' });
+      res.json({ success: true, availability });
+    });
   });
 });
 
@@ -420,7 +533,7 @@ app.get('/api/jobs', (req, res) => {
   const { category, search, page = 1, limit = 20 } = req.query;
   let sql = `SELECT * FROM jobs WHERE status = 'open'`;
   let params = [];
-  
+
   if (category && category !== 'all') {
     sql += ` AND category = ?`;
     params.push(category);
@@ -434,7 +547,6 @@ app.get('/api/jobs', (req, res) => {
 
   db.all(sql, params, (err, rows) => {
     if (err) return res.status(500).json({ error: 'Database error' });
-    // Parse images JSON if stored as string
     rows.forEach(row => {
       if (row.images) try { row.images = JSON.parse(row.images); } catch(e) {}
     });
@@ -443,18 +555,15 @@ app.get('/api/jobs', (req, res) => {
 });
 
 app.get('/api/jobs/:id', (req, res) => {
-  const { id } = req.params;
-  db.get(`SELECT * FROM jobs WHERE id = ?`, [id], (err, row) => {
+  getJob(req.params.id, (err, row) => {
     if (err) return res.status(500).json({ error: 'Database error' });
     if (!row) return res.status(404).json({ error: 'Job not found' });
-    if (row.images) try { row.images = JSON.parse(row.images); } catch(e) {}
     res.json(row);
   });
 });
 
 app.get('/api/jobs/user/:username', (req, res) => {
-  const { username } = req.params;
-  db.all(`SELECT * FROM jobs WHERE posted_by_name = ? ORDER BY created_at DESC`, [username], (err, rows) => {
+  db.all(`SELECT * FROM jobs WHERE posted_by_name = ? ORDER BY created_at DESC`, [req.params.username], (err, rows) => {
     if (err) return res.status(500).json({ error: 'Database error' });
     rows.forEach(row => {
       if (row.images) try { row.images = JSON.parse(row.images); } catch(e) {}
@@ -463,214 +572,280 @@ app.get('/api/jobs/user/:username', (req, res) => {
   });
 });
 
-app.post('/api/jobs', (req, res) => {
+app.post('/api/jobs', requireUser, requireBodyUserMatch, (req, res) => {
   const { title, description, category, budget, skills, images, deadline, posted_by, posted_by_name } = req.body;
-  
   if (!title || !description) {
     return res.status(400).json({ error: 'Title and description required' });
   }
 
-  const imagesStr = images && Array.isArray(images) ? JSON.stringify(images) : null;
-  
-  db.run(
-    `INSERT INTO jobs (title, description, category, budget, skills, images, deadline, posted_by, posted_by_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [title, description, category || 'other', budget || 0, skills || '', imagesStr, deadline || null, posted_by || 'unknown', posted_by_name || 'Anonymous'],
-    function(err) {
-      if (err) {
-        console.error('[DB] Error creating job:', err);
-        return res.status(500).json({ error: 'Failed to create job' });
-      }
-      res.json({ id: this.lastID, success: true, remaining_connects: 10 });
+  // Deduct 1 connect for posting
+  getUser(req.userId, (err, user) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    if ((user.balance_connects || 0) < 1) {
+      return res.status(400).json({ error: 'Not enough connects to post a job', required: 1, current: user.balance_connects });
     }
-  );
+    const imagesStr = images && Array.isArray(images) ? JSON.stringify(images) : null;
+    const newConnects = (user.balance_connects || 0) - 1;
+
+    db.run(
+      `INSERT INTO jobs (title, description, category, budget, skills, images, deadline, posted_by, posted_by_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [title, description, category || 'other', budget || 0, skills || '', imagesStr, deadline || null, posted_by || req.userId, posted_by_name || 'User'],
+      function(err) {
+        if (err) {
+          console.error('[DB] Error creating job:', err);
+          return res.status(500).json({ error: 'Failed to create job' });
+        }
+        db.run(`UPDATE users SET balance_connects = ? WHERE id = ?`, [newConnects, req.userId]);
+        res.json({ id: this.lastID, success: true, remaining_connects: newConnects });
+      }
+    );
+  });
 });
 
-app.put('/api/jobs/:id', (req, res) => {
+app.put('/api/jobs/:id', requireUser, (req, res) => {
   const { id } = req.params;
   const { title, description, category, budget, skills, images, deadline, status } = req.body;
-  const imagesStr = images && Array.isArray(images) ? JSON.stringify(images) : images;
-  
-  db.run(
-    `UPDATE jobs SET title = ?, description = ?, category = ?, budget = ?, skills = ?, images = ?, deadline = ?, status = ? WHERE id = ?`,
-    [title, description, category, budget, skills, imagesStr, deadline, status, id],
-    function(err) {
-      if (err) return res.status(500).json({ error: 'Failed to update job' });
-      res.json({ success: true });
-    }
-  );
+
+  getJob(id, (err, job) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    if (!job) return res.status(404).json({ error: 'Job not found' });
+    if (job.posted_by !== req.userId) return res.status(403).json({ error: 'You can only edit your own jobs' });
+
+    const imagesStr = images && Array.isArray(images) ? JSON.stringify(images) : images;
+    db.run(
+      `UPDATE jobs SET title = ?, description = ?, category = ?, budget = ?, skills = ?, images = ?, deadline = ?, status = ? WHERE id = ?`,
+      [title, description, category, budget, skills, imagesStr, deadline, status, id],
+      function(err) {
+        if (err) return res.status(500).json({ error: 'Failed to update job' });
+        res.json({ success: true });
+      }
+    );
+  });
 });
 
-app.delete('/api/jobs/:id', (req, res) => {
+app.delete('/api/jobs/:id', requireUser, (req, res) => {
   const { id } = req.params;
-  db.run(`DELETE FROM jobs WHERE id = ?`, [id], function(err) {
-    if (err) return res.status(500).json({ error: 'Failed to delete job' });
-    res.json({ success: true });
+  getJob(id, (err, job) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    if (!job) return res.status(404).json({ error: 'Job not found' });
+    if (job.posted_by !== req.userId) return res.status(403).json({ error: 'You can only delete your own jobs' });
+
+    db.run(`DELETE FROM jobs WHERE id = ?`, [id], function(err) {
+      if (err) return res.status(500).json({ error: 'Failed to delete job' });
+      res.json({ success: true });
+    });
   });
 });
 
 // ─── Applications ────────────────────────────────────────────
-app.post('/api/jobs/:jobId/apply', (req, res) => {
+app.post('/api/jobs/:jobId/apply', requireUser, requireBodyUserMatch, (req, res) => {
   const { jobId } = req.params;
   const { user_id, username, message } = req.body;
-  
-  db.run(
-    `INSERT INTO applications (job_id, user_id, username, message) VALUES (?, ?, ?, ?)`,
-    [jobId, user_id, username, message],
-    function(err) {
-      if (err) return res.status(500).json({ error: 'Failed to apply' });
-      // Increment applications count
-      db.run(`UPDATE jobs SET applications = applications + 1 WHERE id = ?`, [jobId]);
-      res.json({ success: true, id: this.lastID });
-    }
-  );
+
+  getJob(jobId, (err, job) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    if (!job) return res.status(404).json({ error: 'Job not found' });
+    if (job.posted_by === req.userId) return res.status(403).json({ error: 'Cannot apply to your own job' });
+    if (job.status !== 'open') return res.status(400).json({ error: 'Job is not open' });
+
+    getUser(req.userId, (err, user) => {
+      if (err) return res.status(500).json({ error: 'Database error' });
+      const applyCost = Math.ceil(job.budget / 50) || 1;
+      if ((user.balance_connects || 0) < applyCost) {
+        return res.status(400).json({ error: 'Not enough connects', required: applyCost, current: user.balance_connects });
+      }
+      const newConnects = (user.balance_connects || 0) - applyCost;
+
+      db.run(
+        `INSERT INTO applications (job_id, user_id, username, message) VALUES (?, ?, ?, ?)`,
+        [jobId, user_id, username, message],
+        function(err) {
+          if (err) return res.status(500).json({ error: 'Failed to apply' });
+          db.run(`UPDATE jobs SET applications = applications + 1 WHERE id = ?`, [jobId]);
+          db.run(`UPDATE users SET balance_connects = ? WHERE id = ?`, [newConnects, req.userId]);
+          res.json({ success: true, id: this.lastID, remaining_connects: newConnects });
+        }
+      );
+    });
+  });
 });
 
 app.get('/api/jobs/:jobId/applications', (req, res) => {
-  const { jobId } = req.params;
-  db.all(`SELECT * FROM applications WHERE job_id = ? ORDER BY created_at DESC`, [jobId], (err, rows) => {
+  db.all(`SELECT * FROM applications WHERE job_id = ? ORDER BY created_at DESC`, [req.params.jobId], (err, rows) => {
     if (err) return res.status(500).json({ error: 'Database error' });
     res.json(rows);
   });
 });
 
-// ─── Update User Availability ─────────────────────────────────
-app.post('/api/users/:userId/availability', (req, res) => {
-  const { userId } = req.params;
-  const { availability } = req.body;
-
-  if (!availability || !['available', 'busy'].includes(availability)) {
-    return res.status(400).json({ error: 'Invalid availability value' });
-  }
-
-  db.run(
-    `UPDATE users SET availability = ? WHERE id = ?`,
-    [availability, userId],
-    function(err) {
-      if (err) {
-        console.error('[DB] Error updating availability:', err);
-        return res.status(500).json({ error: 'Database error' });
-      }
-      if (this.changes === 0) {
-        // User not found, create with availability
-        db.run(
-          `INSERT INTO users (id, availability) VALUES (?, ?)`,
-          [userId, availability],
-          (err) => {
-            if (err) return res.status(500).json({ error: 'Database error' });
-            res.json({ success: true, availability });
-          }
-        );
-      } else {
-        res.json({ success: true, availability });
-      }
-    }
-  );
-});
-
-// ─── Application Management ────────────────────────────────────
-app.post('/api/applications/:id/accept', (req, res) => {
-  const { id } = req.params;
-  db.run(`UPDATE applications SET status = 'accepted' WHERE id = ?`, [id], function(err) {
-    if (err) return res.status(500).json({ error: 'Failed to accept' });
-    if (this.changes === 0) return res.status(404).json({ error: 'Application not found' });
-    res.json({ success: true, status: 'accepted' });
-  });
-});
-
-app.post('/api/applications/:id/reject', (req, res) => {
-  const { id } = req.params;
-  db.run(`UPDATE applications SET status = 'rejected' WHERE id = ?`, [id], function(err) {
-    if (err) return res.status(500).json({ error: 'Failed to reject' });
-    if (this.changes === 0) return res.status(404).json({ error: 'Application not found' });
-    res.json({ success: true, status: 'rejected' });
-  });
-});
-
-app.get('/api/applications/user/:userId', (req, res) => {
-  const { userId } = req.params;
-  db.all(`SELECT * FROM applications WHERE user_id = ? ORDER BY created_at DESC`, [userId], (err, rows) => {
+app.get('/api/applications/user/:userId', requireUser, (req, res) => {
+  if (req.userId !== req.params.userId) return res.status(403).json({ error: 'Access denied' });
+  db.all(`SELECT * FROM applications WHERE user_id = ? ORDER BY created_at DESC`, [req.params.userId], (err, rows) => {
     if (err) return res.status(500).json({ error: 'Database error' });
     res.json(rows);
   });
 });
 
-app.get('/api/applications/me', (req, res) => {
+app.get('/api/applications/me', requireUser, (req, res) => {
   const { user_id } = req.query;
-  if (!user_id) return res.status(400).json({ error: 'user_id required' });
+  if (!user_id || user_id !== req.userId) return res.status(403).json({ error: 'user_id mismatch' });
   db.all(`SELECT * FROM applications WHERE user_id = ? ORDER BY created_at DESC`, [user_id], (err, rows) => {
     if (err) return res.status(500).json({ error: 'Database error' });
     res.json(rows);
   });
 });
 
+app.post('/api/applications/:id/accept', requireUser, (req, res) => {
+  const { id } = req.params;
+  db.get(`SELECT a.*, j.posted_by as job_owner FROM applications a JOIN jobs j ON a.job_id = j.id WHERE a.id = ?`, [id], (err, row) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    if (!row) return res.status(404).json({ error: 'Application not found' });
+    if (row.job_owner !== req.userId) return res.status(403).json({ error: 'Only the job owner can accept applications' });
+    if (row.status !== 'pending') return res.status(400).json({ error: 'Application already processed' });
+
+    db.run(`UPDATE applications SET status = 'accepted' WHERE id = ?`, [id], function(err) {
+      if (err) return res.status(500).json({ error: 'Failed to accept' });
+      res.json({ success: true, status: 'accepted' });
+    });
+  });
+});
+
+app.post('/api/applications/:id/reject', requireUser, (req, res) => {
+  const { id } = req.params;
+  db.get(`SELECT a.*, j.posted_by as job_owner FROM applications a JOIN jobs j ON a.job_id = j.id WHERE a.id = ?`, [id], (err, row) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    if (!row) return res.status(404).json({ error: 'Application not found' });
+    if (row.job_owner !== req.userId) return res.status(403).json({ error: 'Only the job owner can reject applications' });
+    if (row.status !== 'pending') return res.status(400).json({ error: 'Application already processed' });
+
+    db.run(`UPDATE applications SET status = 'rejected' WHERE id = ?`, [id], function(err) {
+      if (err) return res.status(500).json({ error: 'Failed to reject' });
+      res.json({ success: true, status: 'rejected' });
+    });
+  });
+});
+
 // ─── Escrows ──────────────────────────────────────────────────
-app.get('/api/escrows/user/:userId', (req, res) => {
-  const { userId } = req.params;
-  db.all(`SELECT * FROM escrows WHERE client_id = ? OR freelancer_id = ? ORDER BY created_at DESC`, [userId, userId], (err, rows) => {
+app.get('/api/escrows/user/:userId', requireUser, (req, res) => {
+  if (req.userId !== req.params.userId) return res.status(403).json({ error: 'Access denied' });
+  db.all(`SELECT * FROM escrows WHERE client_id = ? OR freelancer_id = ? ORDER BY created_at DESC`, [req.params.userId, req.params.userId], (err, rows) => {
     if (err) return res.status(500).json({ error: 'Database error' });
     res.json(rows);
   });
 });
 
-app.post('/api/escrows', (req, res) => {
+app.post('/api/escrows', requireUser, requireBodyUserMatch, (req, res) => {
   const { job_id, client_id, freelancer_id, amount } = req.body;
-  const id = 'esc_' + Date.now();
-  db.run(`INSERT INTO escrows (id, job_id, client_id, freelancer_id, amount) VALUES (?, ?, ?, ?, ?)`,
-    [id, job_id, client_id, freelancer_id, amount],
-    function(err) {
-      if (err) return res.status(500).json({ error: 'Failed to create escrow' });
-      res.json({ id, success: true });
-    }
-  );
-});
+  if (!job_id || !client_id || !freelancer_id || !amount) {
+    return res.status(400).json({ error: 'Missing required fields' });
+  }
 
-app.post('/api/escrows/:id/fund', (req, res) => {
-  const { id } = req.params;
-  db.run(`UPDATE escrows SET status = 'funded', funded_at = CURRENT_TIMESTAMP WHERE id = ?`, [id], function(err) {
-    if (err) return res.status(500).json({ error: 'Failed to fund' });
-    res.json({ success: true, status: 'funded' });
-  });
-});
-
-app.post('/api/escrows/:id/release', (req, res) => {
-  const { id } = req.params;
-  db.run(`UPDATE escrows SET status = 'released', released_at = CURRENT_TIMESTAMP WHERE id = ?`, [id], function(err) {
-    if (err) return res.status(500).json({ error: 'Failed to release' });
-    res.json({ success: true, status: 'released' });
-  });
-});
-
-app.post('/api/escrows/:id/dispute', (req, res) => {
-  const { id } = req.params;
-  db.run(`UPDATE escrows SET status = 'disputed' WHERE id = ?`, [id], function(err) {
-    if (err) return res.status(500).json({ error: 'Failed to dispute' });
-    res.json({ success: true, status: 'disputed' });
-  });
-});
-
-app.get('/api/escrows/:escrowId/room', (req, res) => {
-  const { escrowId } = req.params;
-  db.all(`SELECT * FROM escrow_messages WHERE escrow_id = ? ORDER BY created_at ASC`, [escrowId], (err, rows) => {
+  getJob(job_id, (err, job) => {
     if (err) return res.status(500).json({ error: 'Database error' });
-    res.json({ messages: rows, escrow_id: escrowId });
+    if (!job) return res.status(404).json({ error: 'Job not found' });
+    if (job.posted_by !== req.userId) return res.status(403).json({ error: 'Only the job owner can create escrow' });
+    if (job.status !== 'open') return res.status(400).json({ error: 'Job is not open' });
+
+    const id = 'esc_' + Date.now();
+    db.run(`INSERT INTO escrows (id, job_id, client_id, freelancer_id, amount) VALUES (?, ?, ?, ?, ?)`,
+      [id, job_id, client_id, freelancer_id, amount],
+      function(err) {
+        if (err) return res.status(500).json({ error: 'Failed to create escrow' });
+        db.run(`UPDATE jobs SET status = 'in_progress' WHERE id = ?`, [job_id]);
+        res.json({ id, success: true });
+      }
+    );
   });
 });
 
-app.post('/api/escrows/:escrowId/message', (req, res) => {
+app.post('/api/escrows/:id/fund', requireUser, (req, res) => {
+  const { id } = req.params;
+  getEscrow(id, (err, escrow) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    if (!escrow) return res.status(404).json({ error: 'Escrow not found' });
+    if (escrow.client_id !== req.userId) return res.status(403).json({ error: 'Only the client can fund escrow' });
+    if (escrow.status !== 'pending') return res.status(400).json({ error: `Escrow is ${escrow.status}, not pending` });
+
+    db.run(`UPDATE escrows SET status = 'funded', funded_at = CURRENT_TIMESTAMP WHERE id = ?`, [id], function(err) {
+      if (err) return res.status(500).json({ error: 'Failed to fund' });
+      res.json({ success: true, status: 'funded' });
+    });
+  });
+});
+
+app.post('/api/escrows/:id/release', requireUser, (req, res) => {
+  const { id } = req.params;
+  getEscrow(id, (err, escrow) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    if (!escrow) return res.status(404).json({ error: 'Escrow not found' });
+    if (escrow.client_id !== req.userId) return res.status(403).json({ error: 'Only the client can release escrow' });
+    if (escrow.status !== 'funded') return res.status(400).json({ error: `Escrow is ${escrow.status}, must be funded` });
+
+    db.run(`UPDATE escrows SET status = 'released', released_at = CURRENT_TIMESTAMP WHERE id = ?`, [id], function(err) {
+      if (err) return res.status(500).json({ error: 'Failed to release' });
+      res.json({ success: true, status: 'released' });
+    });
+  });
+});
+
+app.post('/api/escrows/:id/dispute', requireUser, (req, res) => {
+  const { id } = req.params;
+  getEscrow(id, (err, escrow) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    if (!escrow) return res.status(404).json({ error: 'Escrow not found' });
+    if (escrow.client_id !== req.userId && escrow.freelancer_id !== req.userId) {
+      return res.status(403).json({ error: 'Only escrow participants can dispute' });
+    }
+    if (!['funded', 'pending'].includes(escrow.status)) {
+      return res.status(400).json({ error: `Cannot dispute escrow in ${escrow.status} status` });
+    }
+
+    db.run(`UPDATE escrows SET status = 'disputed' WHERE id = ?`, [id], function(err) {
+      if (err) return res.status(500).json({ error: 'Failed to dispute' });
+      res.json({ success: true, status: 'disputed' });
+    });
+  });
+});
+
+app.get('/api/escrows/:escrowId/room', requireUser, (req, res) => {
+  const { escrowId } = req.params;
+  getEscrow(escrowId, (err, escrow) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    if (!escrow) return res.status(404).json({ error: 'Escrow not found' });
+    if (escrow.client_id !== req.userId && escrow.freelancer_id !== req.userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+    db.all(`SELECT * FROM escrow_messages WHERE escrow_id = ? ORDER BY created_at ASC`, [escrowId], (err, rows) => {
+      if (err) return res.status(500).json({ error: 'Database error' });
+      res.json({ messages: rows, escrow_id: escrowId });
+    });
+  });
+});
+
+app.post('/api/escrows/:escrowId/message', requireUser, requireBodyUserMatch, (req, res) => {
   const { escrowId } = req.params;
   const { sender_id, sender_name, message } = req.body;
-  db.run(`INSERT INTO escrow_messages (escrow_id, sender_id, sender_name, message) VALUES (?, ?, ?, ?)`,
-    [escrowId, sender_id, sender_name, message],
-    function(err) {
-      if (err) return res.status(500).json({ error: 'Failed to send message' });
-      res.json({ id: this.lastID, success: true });
+  if (!message || message.trim() === '') return res.status(400).json({ error: 'Message is required' });
+
+  getEscrow(escrowId, (err, escrow) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    if (!escrow) return res.status(404).json({ error: 'Escrow not found' });
+    if (escrow.client_id !== req.userId && escrow.freelancer_id !== req.userId) {
+      return res.status(403).json({ error: 'Only escrow participants can send messages' });
     }
-  );
+    db.run(`INSERT INTO escrow_messages (escrow_id, sender_id, sender_name, message) VALUES (?, ?, ?, ?)`,
+      [escrowId, sender_id, sender_name, message.trim()],
+      function(err) {
+        if (err) return res.status(500).json({ error: 'Failed to send message' });
+        res.json({ id: this.lastID, success: true });
+      }
+    );
+  });
 });
 
 // ─── Reviews ──────────────────────────────────────────────────
-app.post('/api/reviews', (req, res) => {
+app.post('/api/reviews', requireUser, requireBodyUserMatch, (req, res) => {
   const { reviewer_id, reviewer_name, target_id, target_name, job_id, job_title, rating, text } = req.body;
+  if (!rating || rating < 1 || rating > 5) return res.status(400).json({ error: 'Rating must be 1-5' });
   const id = 'rev_' + Date.now();
   db.run(
     `INSERT INTO reviews (id, reviewer_id, reviewer_name, target_id, target_name, job_id, job_title, rating, text) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -683,16 +858,14 @@ app.post('/api/reviews', (req, res) => {
 });
 
 app.get('/api/reviews/:username', (req, res) => {
-  const { username } = req.params;
-  db.all(`SELECT * FROM reviews WHERE target_name = ? ORDER BY created_at DESC`, [username], (err, rows) => {
+  db.all(`SELECT * FROM reviews WHERE target_name = ? ORDER BY created_at DESC`, [req.params.username], (err, rows) => {
     if (err) return res.status(500).json({ error: 'Database error' });
     res.json(rows);
   });
 });
 
 app.get('/api/reviews/stats/:username', (req, res) => {
-  const { username } = req.params;
-  db.all(`SELECT rating FROM reviews WHERE target_name = ?`, [username], (err, rows) => {
+  db.all(`SELECT rating FROM reviews WHERE target_name = ?`, [req.params.username], (err, rows) => {
     if (err) return res.status(500).json({ error: 'Database error' });
     const count = rows.length;
     const average_rating = count > 0 ? (rows.reduce((sum, r) => sum + r.rating, 0) / count).toFixed(1) : 0;
@@ -701,27 +874,35 @@ app.get('/api/reviews/stats/:username', (req, res) => {
 });
 
 // ─── Offers ───────────────────────────────────────────────────
-app.get('/api/offers/:userId', (req, res) => {
-  const { userId } = req.params;
-  db.all(`SELECT * FROM offers WHERE freelancer_id = ? ORDER BY created_at DESC`, [userId], (err, rows) => {
+app.get('/api/offers/:userId', requireUser, (req, res) => {
+  if (req.userId !== req.params.userId) return res.status(403).json({ error: 'Access denied' });
+  db.all(`SELECT * FROM offers WHERE freelancer_id = ? ORDER BY created_at DESC`, [req.params.userId], (err, rows) => {
     if (err) return res.status(500).json({ error: 'Database error' });
     res.json(rows);
   });
 });
 
-app.post('/api/offers/:offerId/accept', (req, res) => {
-  const { offerId } = req.params;
-  db.run(`UPDATE offers SET status = 'accepted' WHERE id = ?`, [offerId], function(err) {
-    if (err) return res.status(500).json({ error: 'Failed to accept offer' });
-    res.json({ success: true });
+app.post('/api/offers/:offerId/accept', requireUser, (req, res) => {
+  db.get(`SELECT * FROM offers WHERE id = ?`, [req.params.offerId], (err, offer) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    if (!offer) return res.status(404).json({ error: 'Offer not found' });
+    if (offer.freelancer_id !== req.userId) return res.status(403).json({ error: 'Only the freelancer can accept this offer' });
+    db.run(`UPDATE offers SET status = 'accepted' WHERE id = ?`, [req.params.offerId], function(err) {
+      if (err) return res.status(500).json({ error: 'Failed to accept offer' });
+      res.json({ success: true });
+    });
   });
 });
 
-app.post('/api/offers/:offerId/decline', (req, res) => {
-  const { offerId } = req.params;
-  db.run(`UPDATE offers SET status = 'declined' WHERE id = ?`, [offerId], function(err) {
-    if (err) return res.status(500).json({ error: 'Failed to decline offer' });
-    res.json({ success: true });
+app.post('/api/offers/:offerId/decline', requireUser, (req, res) => {
+  db.get(`SELECT * FROM offers WHERE id = ?`, [req.params.offerId], (err, offer) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    if (!offer) return res.status(404).json({ error: 'Offer not found' });
+    if (offer.freelancer_id !== req.userId) return res.status(403).json({ error: 'Only the freelancer can decline this offer' });
+    db.run(`UPDATE offers SET status = 'declined' WHERE id = ?`, [req.params.offerId], function(err) {
+      if (err) return res.status(500).json({ error: 'Failed to decline offer' });
+      res.json({ success: true });
+    });
   });
 });
 
@@ -773,7 +954,8 @@ app.get('/api/admin/escrows', requireAdmin, (req, res) => {
 });
 
 // ─── Chat ─────────────────────────────────────────────────────
-app.get('/api/chat/rooms/:userId', (req, res) => {
+app.get('/api/chat/rooms/:userId', requireUser, (req, res) => {
+  if (req.userId !== req.params.userId) return res.status(403).json({ error: 'Access denied' });
   res.json([]);
 });
 
@@ -781,7 +963,7 @@ app.get('/api/chat/:roomId/messages', (req, res) => {
   res.json([]);
 });
 
-app.post('/api/chat/:roomId/messages', (req, res) => {
+app.post('/api/chat/:roomId/messages', requireUser, (req, res) => {
   res.json({ success: true, id: 'msg_' + Date.now() });
 });
 
