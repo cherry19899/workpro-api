@@ -386,7 +386,7 @@ app.get('/health', (req, res) => {
 });
 
 // ─── Approve Pi Payment ───────────────────────────────────────
-app.post('/api/payments/:paymentId/approve', requireUser, async (req, res) => {
+app.post('/api/payments/:paymentId/approve', async (req, res) => {
   const { paymentId } = req.params;
 
   if (!PI_API_KEY) {
@@ -441,7 +441,7 @@ app.post('/api/payments/:paymentId/approve', requireUser, async (req, res) => {
 });
 
 // ─── Complete Pi Payment ──────────────────────────────────────
-app.post('/api/payments/:paymentId/complete', requireUser, async (req, res) => {
+app.post('/api/payments/:paymentId/complete', async (req, res) => {
   const { paymentId } = req.params;
   const { txid } = req.body;
 
