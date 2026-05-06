@@ -75,6 +75,10 @@ function requireAdmin(req, res, next) {
   next();
 }
 
+// ─── Body Parser Limits (for photo uploads) ───────────────────
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
 // ─── User Auth Middleware ─────────────────────────────────────
 function requireUser(req, res, next) {
   const userId = req.headers['x-user-id'];
@@ -145,7 +149,6 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization', 'x-user-id', 'x-pi-token'],
 }));
 app.use(rateLimit);
-app.use(express.json({ limit: '10kb' })); // Prevent large JSON attacks
 
 // Security headers
 app.use((req, res, next) => {
