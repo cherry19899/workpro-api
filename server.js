@@ -202,7 +202,19 @@ db.serialize(() => {
 
 // ─── Health Check ───────────────────────────────────────────────
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', message: 'Work Pro Backend Running', pi_api_configured: !!PI_API_KEY });
+  res.json({ status: 'ok', message: 'Work Pro Backend Running', pi_api_configured: !!PI_API_KEY, admin_configured: !!ADMIN_API_KEY, env: NODE_ENV });
+});
+
+app.get('/_health/debug', (req, res) => {
+  res.json({
+    admin_key_length: ADMIN_API_KEY ? ADMIN_API_KEY.length : 0,
+    admin_key_prefix: ADMIN_API_KEY ? ADMIN_API_KEY.substring(0, 8) : null,
+    workpro_access_length: process.env.WORKPRO_API_ACCESS ? process.env.WORKPRO_API_ACCESS.length : 0,
+    workpro_access_prefix: process.env.WORKPRO_API_ACCESS ? process.env.WORKPRO_API_ACCESS.substring(0, 8) : null,
+    env_admin_length: process.env.ADMIN_API_KEY ? process.env.ADMIN_API_KEY.length : 0,
+    node_env: NODE_ENV,
+    pi_configured: !!PI_API_KEY,
+  });
 });
 
 // ─── Approve Pi Payment ───────────────────────────────────────
