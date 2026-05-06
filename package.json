@@ -1,11 +1,12 @@
 {
   "name": "workpro-backend",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Work Pro Backend API for Pi Network Freelance Marketplace",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node server.js"
+    "dev": "node server.js",
+    "lint": "node --check server.js"
   },
   "dependencies": {
     "cors": "^2.8.5",

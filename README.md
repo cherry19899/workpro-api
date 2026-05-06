@@ -1,57 +1,57 @@
-# Work Pro Backend — Deploy to Render
+# Work Pro Backend API
 
-## Quick Deploy
-
-1. Go to https://dashboard.render.com
-2. Click **New +** → **Web Service**
-3. Connect your GitHub repo or use **Public Git repository**
-4. Enter: `https://github.com/cherry19899/workpro-api`
-5. Configure:
-   - **Name**: `workpro-api`
-   - **Environment**: `Node`
-   - **Build Command**: `npm install`
-   - **Start Command**: `node server.js`
-6. Click **Environment** → add variables:
-   - `PI_API_KEY` = your key from develop.pinet.com
-   - `ADMIN_API_KEY` = generate a strong random secret (for /api/admin/* protection)
-   - `NODE_ENV` = `production`
-   - `FRONTEND_URL` = `https://cherry19899.github.io`
-7. Click **Create Web Service**
-
-Your backend will be at: `https://workpro-api.onrender.com`
+Pi Network Freelance Marketplace — Backend Server
 
 ## Environment Variables
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `PI_API_KEY` | Yes | Pi Network API key from develop.pinet.com |
-| `ADMIN_API_KEY` | Yes | Secret token for admin endpoints (Bearer auth) |
-| `NODE_ENV` | No | `development` or `production` (default: development) |
-| `FRONTEND_URL` | No | Frontend URL for CORS (default: https://cherry19899.github.io) |
+Copy this to `.env` and fill in your values:
 
-## Security Features
+```env
+PORT=3000
+PI_API_KEY=your_pi_api_key_here
+ADMIN_API_KEY=your_random_admin_key_here
+FRONTEND_URL=https://cherry19899.github.io
+NODE_ENV=production
+```
 
-- **Rate limiting**: 100 requests/minute per IP
-- **Admin endpoints protected**: All `/api/admin/*` routes require `Authorization: Bearer <ADMIN_API_KEY>` header
-- **Payment verification**: All payment callbacks verify payment status with Pi Network API
-- **TXID validation**: 64-character hex format enforced
-- **CORS**: Localhost origins only in development mode
+⚠️ **Never commit `.env` to GitHub.**
 
-## API Endpoints
+## Quick Start
 
-| Method | Endpoint | Description | Auth |
-|--------|----------|-------------|------|
-| POST | `/api/payments/:id/approve` | Approve Pi payment | None |
-| POST | `/api/payments/:id/complete` | Complete Pi payment | None |
-| POST | `/api/payments/:id/cancelled` | Cancel payment (verified) | None |
-| GET | `/api/payments/:id` | Check payment status | None |
-| POST | `/api/connects/buy` | Buy connects | None |
-| POST | `/api/users/:id/balance` | Update balance | None |
-| GET | `/api/users/:id` | Get user data | None |
-| GET | `/api/admin/stats` | Admin statistics | Admin API Key |
-| GET | `/api/admin/users` | List all users | Admin API Key |
-| GET | `/api/admin/jobs/all` | List all jobs | Admin API Key |
-| GET | `/api/admin/earnings` | Payment earnings | Admin API Key |
-| GET | `/api/admin/escrows` | List all escrows | Admin API Key |
-Thu May  7 01:10:44 CST 2026
-# Deploy Thu May  7 02:01:45 CST 2026
+```bash
+npm install
+npm start
+```
+
+## Health Check
+
+```bash
+curl https://workpro-api.onrender.com/health
+```
+
+## Pi Network Payment Flow
+
+1. Frontend calls `Pi.createPayment()`
+2. `onReadyForServerApproval` → `POST /api/payments/:id/approve`
+3. User confirms in Pi Wallet
+4. `onReadyForServerCompletion` → `POST /api/payments/:id/complete` (with txid)
+5. If timeout occurs, frontend calls `onIncompletePaymentFound` → `POST /api/payments/incomplete`
+
+## Admin Endpoints (require `Authorization: Bearer <ADMIN_API_KEY>`)
+
+- `GET /api/admin/stats`
+- `GET /api/admin/users`
+- `GET /api/admin/jobs/all`
+- `GET /api/admin/escrows`
+- `GET /api/admin/earnings`
+
+## Tech Stack
+
+- Node.js + Express
+- SQLite3 (WAL mode enabled)
+- node-fetch v2
+- CORS + Security headers
+
+## License
+
+MIT

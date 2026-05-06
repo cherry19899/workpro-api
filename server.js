@@ -4,11 +4,12 @@ const cors = require('cors');
 const sqlite3 = require('sqlite3').verbose();
 const fetch = require('node-fetch');
 const path = require('path');
+const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const PI_API_KEY = process.env.PI_API_KEY;
-const ADMIN_API_KEY = process.env.ADMIN_API_KEY || process.env.WORKPRO_API_ACCESS || 'workpro-admin-change-me-in-production';
+const ADMIN_API_KEY = process.env.ADMIN_API_KEY || process.env.WORKPRO_API_ACCESS;
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://cherry19899.github.io';
 const NODE_ENV = process.env.NODE_ENV || 'production';
 
@@ -16,10 +17,13 @@ const NODE_ENV = process.env.NODE_ENV || 'production';
 const rateLimitMap = new Map();
 const RATE_LIMIT_WINDOW = 60 * 1000; // 1 minute
 const RATE_LIMIT_MAX = 100; // requests per window
+const PAYMENT_RATE_LIMIT_MAX = 10; // stricter for payment endpoints
 
 function rateLimit(req, res, next) {
   const key = req.ip || 'unknown';
   const now = Date.now();
+  const isPaymentEndpoint = req.path && (req.path.includes('/payments') || req.path.includes('/connects'));
+  const limit = isPaymentEndpoint ? PAYMENT_RATE_LIMIT_MAX : RATE_LIMIT_MAX;
 
   // Cleanup old entries (memory leak fix)
   for (const [k, v] of rateLimitMap.entries()) {
@@ -36,7 +40,7 @@ function rateLimit(req, res, next) {
   entry.count++;
   rateLimitMap.set(key, entry);
 
-  if (entry.count > RATE_LIMIT_MAX) {
+  if (entry.count > limit) {
     return res.status(429).json({ error: 'Too many requests, please try again later' });
   }
   next();
@@ -51,15 +55,21 @@ function requireAdmin(req, res, next) {
     return res.status(401).json({ error: 'Admin authentication required. Use: Authorization: Bearer <token>' });
   }
 
-  // Timing-safe comparison
-  let match = true;
+  // Constant-time comparison using crypto.timingSafeEqual
   const expected = ADMIN_API_KEY || '';
-  if (token.length !== expected.length) match = false;
-  for (let i = 0; i < Math.max(token.length, expected.length); i++) {
-    if (i >= token.length || i >= expected.length || token[i] !== expected[i]) match = false;
+  const tokenBuf = Buffer.from(token, 'utf8');
+  const expectedBuf = Buffer.from(expected, 'utf8');
+  let match = false;
+  if (tokenBuf.length === expectedBuf.length) {
+    match = crypto.timingSafeEqual(tokenBuf, expectedBuf);
+  }
+  // If lengths differ, still do a dummy comparison to avoid timing leaks
+  else {
+    const dummy = Buffer.alloc(tokenBuf.length, 0);
+    crypto.timingSafeEqual(tokenBuf, dummy);
   }
 
-  if (!match) {
+  if (!match || !expected) {
     return res.status(403).json({ error: 'Invalid admin token' });
   }
   next();
@@ -150,7 +160,12 @@ app.use((req, res, next) => {
 const dbPath = path.join(__dirname, 'workpro.db');
 const db = new sqlite3.Database(dbPath);
 
+// Prevent SQLITE_BUSY errors under concurrent load
+// WAL mode improves write performance and concurrency
+
 db.serialize(() => {
+  db.run(`PRAGMA busy_timeout = 10000`);
+  db.run(`PRAGMA journal_mode = WAL`);
   db.run(`CREATE TABLE IF NOT EXISTS payments (
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL,
@@ -257,7 +272,45 @@ db.serialize(() => {
     status TEXT DEFAULT 'pending',
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )`);
+
+  // ─── Indexes for performance ──────────────────────────────────
+  db.run(`CREATE INDEX IF NOT EXISTS idx_payments_user ON payments(user_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_jobs_posted_by ON jobs(posted_by)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_jobs_category ON jobs(category)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_applications_job ON applications(job_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_applications_user ON applications(user_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_escrows_job ON escrows(job_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_escrows_client ON escrows(client_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_escrows_freelancer ON escrows(freelancer_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_reviews_target ON reviews(target_name)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_connects_payment ON connects_purchases(payment_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_connects_user ON connects_purchases(user_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_offers_freelancer ON offers(freelancer_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_escrow_messages_escrow ON escrow_messages(escrow_id)`);
 });
+
+// ─── Input Validation Helpers ───────────────────────────────────
+function sanitizeString(str, maxLength = 500) {
+  if (typeof str !== 'string') return null;
+  const trimmed = str.trim();
+  if (trimmed.length === 0) return null;
+  return trimmed.slice(0, maxLength);
+}
+
+function sanitizeArray(arr, maxItems = 10) {
+  if (!Array.isArray(arr)) return null;
+  return arr.slice(0, maxItems).filter(x => typeof x === 'string').map(x => x.trim().slice(0, 200));
+}
+
+// ─── Startup Security Check ────────────────────────────────────
+if (!ADMIN_API_KEY) {
+  console.warn('[Security] ADMIN_API_KEY is not set! Admin endpoints will return 403.');
+}
+if (!PI_API_KEY) {
+  console.warn('[Security] PI_API_KEY is not set! Pi payment endpoints will return 500.');
+}
 
 // ─── Helpers ────────────────────────────────────────────────────
 function getUser(userId, callback) {
@@ -275,13 +328,28 @@ function createUser(userId, username, callback) {
 }
 
 function updateUserBalance(userId, connectsDelta, piDelta, callback) {
-  getUser(userId, (err, user) => {
+  db.run('BEGIN TRANSACTION', (err) => {
     if (err) return callback(err);
-    const newConnects = (user.balance_connects || 0) + connectsDelta;
-    const newPi = (user.balance_pi || 0) + piDelta;
-    db.run(`UPDATE users SET balance_connects = ?, balance_pi = ? WHERE id = ?`, [newConnects, newPi, userId], (err) => {
-      if (err) return callback(err);
-      callback(null, { balance_connects: newConnects, balance_pi: newPi });
+    getUser(userId, (err, user) => {
+      if (err) {
+        db.run('ROLLBACK');
+        return callback(err);
+      }
+      const newConnects = (user.balance_connects || 0) + connectsDelta;
+      const newPi = (user.balance_pi || 0) + piDelta;
+      db.run(`UPDATE users SET balance_connects = ?, balance_pi = ? WHERE id = ?`, [newConnects, newPi, userId], (err) => {
+        if (err) {
+          db.run('ROLLBACK');
+          return callback(err);
+        }
+        db.run('COMMIT', (err) => {
+          if (err) {
+            db.run('ROLLBACK');
+            return callback(err);
+          }
+          callback(null, { balance_connects: newConnects, balance_pi: newPi });
+        });
+      });
     });
   });
 }
@@ -303,8 +371,22 @@ app.get('/', (req, res) => {
   res.json({ status: 'ok', message: 'Work Pro Backend Running', pi_api_configured: !!PI_API_KEY, admin_configured: !!ADMIN_API_KEY, env: NODE_ENV });
 });
 
+app.get('/health', (req, res) => {
+  const mem = process.memoryUsage();
+  db.get(`SELECT 1 as ok`, [], (err) => {
+    res.json({
+      status: 'ok',
+      uptime: process.uptime(),
+      memory: { rss: mem.rss, heapUsed: mem.heapUsed },
+      database: err ? 'error' : 'connected',
+      version: require('./package.json').version,
+      timestamp: new Date().toISOString(),
+    });
+  });
+});
+
 // ─── Approve Pi Payment ───────────────────────────────────────
-app.post('/api/payments/:paymentId/approve', async (req, res) => {
+app.post('/api/payments/:paymentId/approve', requireUser, async (req, res) => {
   const { paymentId } = req.params;
 
   if (!PI_API_KEY) {
@@ -312,6 +394,15 @@ app.post('/api/payments/:paymentId/approve', async (req, res) => {
   }
 
   try {
+    // Verify the payment exists and is in pending state on Pi Network
+    const piPayment = await verifyPaymentWithPi(paymentId);
+    if (!piPayment) {
+      return res.status(404).json({ error: 'Payment not found on Pi Network' });
+    }
+    if (piPayment.status !== 'pending') {
+      return res.status(400).json({ error: `Payment is ${piPayment.status}, cannot approve` });
+    }
+
     const response = await fetch(`https://api.minepi.com/v2/payments/${paymentId}/approve`, {
       method: 'POST',
       headers: {
@@ -350,7 +441,7 @@ app.post('/api/payments/:paymentId/approve', async (req, res) => {
 });
 
 // ─── Complete Pi Payment ──────────────────────────────────────
-app.post('/api/payments/:paymentId/complete', async (req, res) => {
+app.post('/api/payments/:paymentId/complete', requireUser, async (req, res) => {
   const { paymentId } = req.params;
   const { txid } = req.body;
 
@@ -368,6 +459,15 @@ app.post('/api/payments/:paymentId/complete', async (req, res) => {
   }
 
   try {
+    // Verify payment is in approved state before completing
+    const piPayment = await verifyPaymentWithPi(paymentId);
+    if (!piPayment) {
+      return res.status(404).json({ error: 'Payment not found on Pi Network' });
+    }
+    if (piPayment.status !== 'approved' && piPayment.status !== 'completed') {
+      return res.status(400).json({ error: `Payment is ${piPayment.status}, cannot complete` });
+    }
+
     const response = await fetch(`https://api.minepi.com/v2/payments/${paymentId}/complete`, {
       method: 'POST',
       headers: {
@@ -428,6 +528,80 @@ app.post('/api/payments/:paymentId/cancelled', async (req, res) => {
   res.json({ success: true, message: 'Payment marked as cancelled' });
 });
 
+// ─── Check Payment Status on Pi Network ──────────────────────
+app.get('/api/payments/:paymentId/status', async (req, res) => {
+  const { paymentId } = req.params;
+  if (!PI_API_KEY) return res.status(500).json({ error: 'PI_API_KEY not configured' });
+
+  try {
+    const piPayment = await verifyPaymentWithPi(paymentId);
+    if (!piPayment) {
+      return res.status(404).json({ error: 'Payment not found on Pi Network' });
+    }
+    res.json({
+      payment_id: paymentId,
+      pi_status: piPayment.status,
+      amount: piPayment.amount,
+      memo: piPayment.memo,
+      metadata: piPayment.metadata,
+      txid: piPayment.transaction?.txid || null,
+    });
+  } catch (err) {
+    console.error('[Server] Status check error:', err);
+    res.status(500).json({ error: 'Failed to check payment status', message: err.message });
+  }
+});
+
+// ─── Handle Incomplete Payments (onIncompletePaymentFound) ───
+app.post('/api/payments/incomplete', requireUser, async (req, res) => {
+  const { payment_id, txid, user_id, package_amount } = req.body;
+  if (!payment_id) {
+    return res.status(400).json({ error: 'payment_id is required' });
+  }
+  if (!PI_API_KEY) return res.status(500).json({ error: 'PI_API_KEY not configured' });
+
+  try {
+    // Verify payment on Pi Network
+    const piPayment = await verifyPaymentWithPi(payment_id);
+    if (!piPayment) {
+      return res.status(404).json({ error: 'Payment not found on Pi Network' });
+    }
+
+    // If it's already completed on Pi, complete it locally
+    if (piPayment.status === 'completed' && txid) {
+      if (!isValidTxid(txid)) {
+        return res.status(400).json({ error: 'Invalid txid format' });
+      }
+      db.run(
+        `INSERT OR REPLACE INTO payments (id, user_id, username, amount, memo, status, txid, completed_at) VALUES (?, ?, ?, ?, ?, 'completed', ?, CURRENT_TIMESTAMP)`,
+        [payment_id, user_id || req.userId, req.body.username || 'unknown', req.body.amount || piPayment.amount, req.body.memo || piPayment.memo || '', txid],
+        (err) => { if (err) console.error('[DB] Error saving completed payment:', err); }
+      );
+      // Also update connects purchase if applicable
+      if (package_amount && user_id) {
+        updateUserBalance(user_id, package_amount, 0, (err) => {
+          if (err) console.error('[DB] Balance update error:', err);
+        });
+        db.run(`UPDATE connects_purchases SET status = 'completed' WHERE payment_id = ?`, [payment_id]);
+      }
+      return res.json({ success: true, status: 'completed', message: 'Payment was already completed on Pi Network' });
+    }
+
+    // If cancelled, mark as cancelled locally
+    if (piPayment.status === 'cancelled') {
+      db.run(`UPDATE payments SET status = 'cancelled' WHERE id = ?`, [payment_id]);
+      db.run(`UPDATE connects_purchases SET status = 'cancelled' WHERE payment_id = ?`, [payment_id]);
+      return res.json({ success: true, status: 'cancelled', message: 'Payment was cancelled on Pi Network' });
+    }
+
+    // Still pending or approved — just return current status
+    res.json({ success: true, status: piPayment.status, message: 'Payment is still in progress' });
+  } catch (err) {
+    console.error('[Server] Incomplete payment error:', err);
+    res.status(500).json({ error: 'Server error', message: err.message });
+  }
+});
+
 // ─── Get Payment Status ───────────────────────────────────────
 app.get('/api/payments/:paymentId', (req, res) => {
   const { paymentId } = req.params;
@@ -440,50 +614,89 @@ app.get('/api/payments/:paymentId', (req, res) => {
 // ─── Connects Purchase (Legacy — backward compatible) ─────────
 app.post('/api/connects/buy', requireUser, (req, res) => {
   const { user_id, username, package_amount, pi_amount, payment_id } = req.body;
+  if (!user_id || !package_amount) {
+    return res.status(400).json({ error: 'Missing user_id or package_amount' });
+  }
 
-  db.run(
-    `INSERT INTO connects_purchases (user_id, amount, pi_amount, payment_id, status) VALUES (?, ?, ?, ?, 'pending')`,
-    [user_id, package_amount, pi_amount, payment_id],
-    function(err) {
-      if (err) {
-        console.error('[DB] Error saving connects purchase:', err);
-        return res.status(500).json({ error: 'Database error' });
-      }
-
-      // Update user connects balance
-      getUser(user_id, (err, row) => {
-        if (row) {
-          const newBalance = (row.balance_connects || 0) + package_amount;
-          db.run(`UPDATE users SET balance_connects = ? WHERE id = ?`, [newBalance, user_id]);
-        } else {
-          db.run(`INSERT INTO users (id, username, balance_connects) VALUES (?, ?, ?)`, [user_id, username || 'user', package_amount]);
-        }
-      });
-
-      res.json({ success: true, purchase_id: this.lastID, added_connects: package_amount });
-    }
-  );
-});
-
-// ─── Connects Purchase Initiate (Pi SDK flow) ────────────────
-app.post('/api/connects/initiate', requireUser, async (req, res) => {
-  const { user_id, package_amount, pi_amount, payment_id } = req.body;
-  if (!PI_API_KEY) return res.status(500).json({ error: 'PI_API_KEY not configured' });
-
-  try {
+  db.run('BEGIN TRANSACTION', (err) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
     db.run(
       `INSERT INTO connects_purchases (user_id, amount, pi_amount, payment_id, status) VALUES (?, ?, ?, ?, 'pending')`,
       [user_id, package_amount, pi_amount, payment_id],
       function(err) {
-        if (err) return res.status(500).json({ error: 'Database error' });
+        if (err) {
+          db.run('ROLLBACK');
+          console.error('[DB] Error saving connects purchase:', err);
+          return res.status(500).json({ error: 'Database error' });
+        }
+        const purchaseId = this.lastID;
+
+        // Update user connects balance
+        getUser(user_id, (err, row) => {
+          if (err) {
+            db.run('ROLLBACK');
+            return res.status(500).json({ error: 'Database error' });
+          }
+          if (row) {
+            const newBalance = (row.balance_connects || 0) + package_amount;
+            db.run(`UPDATE users SET balance_connects = ? WHERE id = ?`, [newBalance, user_id], (err) => {
+              if (err) {
+                db.run('ROLLBACK');
+                return res.status(500).json({ error: 'Database error' });
+              }
+              db.run('COMMIT', (err) => {
+                if (err) {
+                  db.run('ROLLBACK');
+                  return res.status(500).json({ error: 'Failed to commit transaction' });
+                }
+                res.json({ success: true, purchase_id: purchaseId, added_connects: package_amount });
+              });
+            });
+          } else {
+            db.run(`INSERT INTO users (id, username, balance_connects) VALUES (?, ?, ?)`, [user_id, username || 'user', package_amount], (err) => {
+              if (err) {
+                db.run('ROLLBACK');
+                return res.status(500).json({ error: 'Database error' });
+              }
+              db.run('COMMIT', (err) => {
+                if (err) {
+                  db.run('ROLLBACK');
+                  return res.status(500).json({ error: 'Failed to commit transaction' });
+                }
+                res.json({ success: true, purchase_id: purchaseId, added_connects: package_amount });
+              });
+            });
+          }
+        });
       }
     );
-    const piRes = await fetch(`https://api.minepi.com/v2/payments/${payment_id}/approve`, {
-      method: 'POST',
-      headers: { 'Authorization': `Key ${PI_API_KEY}` },
+  });
+});
+
+// ─── Connects Purchase Initiate (Pi SDK flow) ────────────────
+// This ONLY records the pending purchase. The frontend must call
+// /api/payments/:paymentId/approve from onReadyForServerApproval callback.
+app.post('/api/connects/initiate', requireUser, async (req, res) => {
+  const { user_id, package_amount, pi_amount, payment_id } = req.body;
+  if (!PI_API_KEY) return res.status(500).json({ error: 'PI_API_KEY not configured' });
+  if (!payment_id || !user_id || !package_amount || !pi_amount) {
+    return res.status(400).json({ error: 'Missing required fields: user_id, package_amount, pi_amount, payment_id' });
+  }
+
+  try {
+    const result = await new Promise((resolve, reject) => {
+      db.run(
+        `INSERT INTO connects_purchases (user_id, amount, pi_amount, payment_id, status) VALUES (?, ?, ?, ?, 'pending')`,
+        [user_id, package_amount, pi_amount, payment_id],
+        function(err) {
+          if (err) reject(err);
+          else resolve({ purchase_id: this.lastID });
+        }
+      );
     });
-    res.json({ success: piRes.ok });
+    res.json({ success: true, purchase_id: result.purchase_id, payment_id, status: 'pending' });
   } catch (err) {
+    console.error('[DB] Initiate error:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -500,14 +713,36 @@ app.post('/api/connects/complete', requireUser, async (req, res) => {
       headers: { 'Authorization': `Key ${PI_API_KEY}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ txid }),
     });
-    if (!piRes.ok) return res.status(piRes.status).json({ error: 'Pi complete failed' });
+    if (!piRes.ok) {
+      const errData = await piRes.json().catch(() => ({}));
+      console.error('[Pi API] Complete failed:', errData);
+      return res.status(piRes.status).json({ error: 'Pi complete failed', details: errData });
+    }
 
-    updateUserBalance(user_id, package_amount, 0, (err, result) => {
-      if (err) return res.status(500).json({ error: 'DB error' });
-      db.run(`UPDATE connects_purchases SET status = 'completed' WHERE payment_id = ?`, [payment_id]);
-      res.json({ success: true, new_balance: result.balance_connects });
+    db.run('BEGIN TRANSACTION', (err) => {
+      if (err) return res.status(500).json({ error: 'Database error' });
+      updateUserBalance(user_id, package_amount, 0, (err, result) => {
+        if (err) {
+          db.run('ROLLBACK');
+          return res.status(500).json({ error: 'DB error updating balance' });
+        }
+        db.run(`UPDATE connects_purchases SET status = 'completed' WHERE payment_id = ?`, [payment_id], (err) => {
+          if (err) {
+            db.run('ROLLBACK');
+            return res.status(500).json({ error: 'DB error updating purchase' });
+          }
+          db.run('COMMIT', (err) => {
+            if (err) {
+              db.run('ROLLBACK');
+              return res.status(500).json({ error: 'Failed to commit transaction' });
+            }
+            res.json({ success: true, new_balance: result.balance_connects });
+          });
+        });
+      });
     });
   } catch (err) {
+    console.error('[Server] Complete error:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -619,14 +854,22 @@ app.get('/api/jobs/user/:username', (req, res) => {
 
 app.post('/api/jobs', requireUser, requireBodyUserMatch, (req, res) => {
   const { title, description, category, budget, skills, images, deadline, posted_by, posted_by_name } = req.body;
-  if (!title || typeof title !== 'string' || title.trim().length < 3) {
-    return res.status(400).json({ error: 'Title must be at least 3 characters' });
+  const safeTitle = sanitizeString(title, 120);
+  const safeDescription = sanitizeString(description, 2000);
+  const safeCategory = sanitizeString(category, 30) || 'other';
+  const safeSkills = sanitizeString(skills, 200);
+  const safeImages = sanitizeArray(images);
+  const safeDeadline = sanitizeString(deadline, 30);
+  const safePostedByName = sanitizeString(posted_by_name, 50) || 'User';
+
+  if (!safeTitle) {
+    return res.status(400).json({ error: 'Title must be at least 3 characters and max 120' });
   }
-  if (!description || typeof description !== 'string' || description.trim().length < 10) {
-    return res.status(400).json({ error: 'Description must be at least 10 characters' });
+  if (!safeDescription) {
+    return res.status(400).json({ error: 'Description must be at least 10 characters and max 2000' });
   }
-  if (budget !== undefined && (typeof budget !== 'number' || budget < 0)) {
-    return res.status(400).json({ error: 'Budget must be a non-negative number' });
+  if (budget !== undefined && (typeof budget !== 'number' || budget < 0 || budget > 1000000)) {
+    return res.status(400).json({ error: 'Budget must be a non-negative number and max 1,000,000' });
   }
   if (images && !Array.isArray(images)) {
     return res.status(400).json({ error: 'Images must be an array' });
@@ -638,21 +881,38 @@ app.post('/api/jobs', requireUser, requireBodyUserMatch, (req, res) => {
     if ((user.balance_connects || 0) < 1) {
       return res.status(400).json({ error: 'Not enough connects to post a job', required: 1, current: user.balance_connects });
     }
-    const imagesStr = images && Array.isArray(images) ? JSON.stringify(images) : null;
+    const imagesStr = safeImages ? JSON.stringify(safeImages) : null;
     const newConnects = (user.balance_connects || 0) - 1;
 
-    db.run(
-      `INSERT INTO jobs (title, description, category, budget, skills, images, deadline, posted_by, posted_by_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [title, description, category || 'other', budget || 0, skills || '', imagesStr, deadline || null, posted_by || req.userId, posted_by_name || 'User'],
-      function(err) {
-        if (err) {
-          console.error('[DB] Error creating job:', err);
-          return res.status(500).json({ error: 'Failed to create job' });
+    db.run('BEGIN TRANSACTION', (err) => {
+      if (err) return res.status(500).json({ error: 'Database error' });
+      db.run(
+        `INSERT INTO jobs (title, description, category, budget, skills, images, deadline, posted_by, posted_by_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [safeTitle, safeDescription, safeCategory, budget || 0, safeSkills || '', imagesStr, safeDeadline || null, posted_by || req.userId, safePostedByName],
+        function(err) {
+          if (err) {
+            db.run('ROLLBACK');
+            console.error('[DB] Error creating job:', err);
+            return res.status(500).json({ error: 'Failed to create job' });
+          }
+          const jobId = this.lastID;
+          db.run(`UPDATE users SET balance_connects = ? WHERE id = ?`, [newConnects, req.userId], (err) => {
+            if (err) {
+              db.run('ROLLBACK');
+              console.error('[DB] Error updating balance:', err);
+              return res.status(500).json({ error: 'Failed to deduct connects' });
+            }
+            db.run('COMMIT', (err) => {
+              if (err) {
+                db.run('ROLLBACK');
+                return res.status(500).json({ error: 'Failed to commit transaction' });
+              }
+              res.json({ id: jobId, success: true, remaining_connects: newConnects });
+            });
+          });
         }
-        db.run(`UPDATE users SET balance_connects = ? WHERE id = ?`, [newConnects, req.userId]);
-        res.json({ id: this.lastID, success: true, remaining_connects: newConnects });
-      }
-    );
+      );
+    });
   });
 });
 
@@ -665,10 +925,21 @@ app.put('/api/jobs/:id', requireUser, (req, res) => {
     if (!job) return res.status(404).json({ error: 'Job not found' });
     if (job.posted_by !== req.userId) return res.status(403).json({ error: 'You can only edit your own jobs' });
 
-    const imagesStr = images && Array.isArray(images) ? JSON.stringify(images) : images;
+    const safeTitle = title !== undefined ? sanitizeString(title, 120) : job.title;
+    const safeDesc = description !== undefined ? sanitizeString(description, 2000) : job.description;
+    const safeCategory = category !== undefined ? (sanitizeString(category, 30) || 'other') : job.category;
+    const safeSkills = skills !== undefined ? sanitizeString(skills, 200) : job.skills;
+    const safeImages = images !== undefined ? (sanitizeArray(images) ? JSON.stringify(sanitizeArray(images)) : null) : job.images;
+    const safeDeadline = deadline !== undefined ? sanitizeString(deadline, 30) : job.deadline;
+    const safeStatus = status !== undefined ? (['open','in_progress','completed','cancelled'].includes(status) ? status : job.status) : job.status;
+
+    if (budget !== undefined && (typeof budget !== 'number' || budget < 0 || budget > 1000000)) {
+      return res.status(400).json({ error: 'Budget must be between 0 and 1,000,000' });
+    }
+
     db.run(
       `UPDATE jobs SET title = ?, description = ?, category = ?, budget = ?, skills = ?, images = ?, deadline = ?, status = ? WHERE id = ?`,
-      [title, description, category, budget, skills, imagesStr, deadline, status, id],
+      [safeTitle, safeDesc, safeCategory, budget !== undefined ? budget : job.budget, safeSkills, safeImages, safeDeadline, safeStatus, id],
       function(err) {
         if (err) return res.status(500).json({ error: 'Failed to update job' });
         res.json({ success: true });
@@ -710,16 +981,39 @@ app.post('/api/jobs/:jobId/apply', requireUser, requireBodyUserMatch, (req, res)
       }
       const newConnects = (user.balance_connects || 0) - applyCost;
 
-      db.run(
-        `INSERT INTO applications (job_id, user_id, username, message) VALUES (?, ?, ?, ?)`,
-        [jobId, user_id, username, message],
-        function(err) {
-          if (err) return res.status(500).json({ error: 'Failed to apply' });
-          db.run(`UPDATE jobs SET applications = applications + 1 WHERE id = ?`, [jobId]);
-          db.run(`UPDATE users SET balance_connects = ? WHERE id = ?`, [newConnects, req.userId]);
-          res.json({ success: true, id: this.lastID, remaining_connects: newConnects });
-        }
-      );
+      db.run('BEGIN TRANSACTION', (err) => {
+        if (err) return res.status(500).json({ error: 'Database error' });
+        db.run(
+          `INSERT INTO applications (job_id, user_id, username, message) VALUES (?, ?, ?, ?)`,
+          [jobId, user_id, username, message],
+          function(err) {
+            if (err) {
+              db.run('ROLLBACK');
+              return res.status(500).json({ error: 'Failed to apply' });
+            }
+            const appId = this.lastID;
+            db.run(`UPDATE jobs SET applications = applications + 1 WHERE id = ?`, [jobId], (err) => {
+              if (err) {
+                db.run('ROLLBACK');
+                return res.status(500).json({ error: 'Failed to update job' });
+              }
+              db.run(`UPDATE users SET balance_connects = ? WHERE id = ?`, [newConnects, req.userId], (err) => {
+                if (err) {
+                  db.run('ROLLBACK');
+                  return res.status(500).json({ error: 'Failed to deduct connects' });
+                }
+                db.run('COMMIT', (err) => {
+                  if (err) {
+                    db.run('ROLLBACK');
+                    return res.status(500).json({ error: 'Failed to commit transaction' });
+                  }
+                  res.json({ success: true, id: appId, remaining_connects: newConnects });
+                });
+              });
+            });
+          }
+        );
+      });
     });
   });
 });
@@ -878,7 +1172,8 @@ app.get('/api/escrows/:escrowId/room', requireUser, (req, res) => {
 app.post('/api/escrows/:escrowId/message', requireUser, requireBodyUserMatch, (req, res) => {
   const { escrowId } = req.params;
   const { sender_id, sender_name, message } = req.body;
-  if (!message || message.trim() === '') return res.status(400).json({ error: 'Message is required' });
+  const safeMessage = sanitizeString(message, 1000);
+  if (!safeMessage) return res.status(400).json({ error: 'Message is required (1-1000 characters)' });
 
   getEscrow(escrowId, (err, escrow) => {
     if (err) return res.status(500).json({ error: 'Database error' });
@@ -887,7 +1182,7 @@ app.post('/api/escrows/:escrowId/message', requireUser, requireBodyUserMatch, (r
       return res.status(403).json({ error: 'Only escrow participants can send messages' });
     }
     db.run(`INSERT INTO escrow_messages (escrow_id, sender_id, sender_name, message) VALUES (?, ?, ?, ?)`,
-      [escrowId, sender_id, sender_name, message.trim()],
+      [escrowId, sender_id, sanitizeString(sender_name, 50) || 'User', safeMessage],
       function(err) {
         if (err) return res.status(500).json({ error: 'Failed to send message' });
         res.json({ id: this.lastID, success: true });
@@ -900,10 +1195,14 @@ app.post('/api/escrows/:escrowId/message', requireUser, requireBodyUserMatch, (r
 app.post('/api/reviews', requireUser, requireBodyUserMatch, (req, res) => {
   const { reviewer_id, reviewer_name, target_id, target_name, job_id, job_title, rating, text } = req.body;
   if (!rating || rating < 1 || rating > 5) return res.status(400).json({ error: 'Rating must be 1-5' });
+  const safeText = sanitizeString(text, 1000) || '';
+  const safeReviewerName = sanitizeString(reviewer_name, 50) || 'User';
+  const safeTargetName = sanitizeString(target_name, 50) || 'User';
+  const safeJobTitle = sanitizeString(job_title, 120) || '';
   const id = 'rev_' + Date.now();
   db.run(
     `INSERT INTO reviews (id, reviewer_id, reviewer_name, target_id, target_name, job_id, job_title, rating, text) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [id, reviewer_id, reviewer_name, target_id, target_name, job_id, job_title || '', rating, text],
+    [id, reviewer_id, safeReviewerName, target_id, safeTargetName, job_id, safeJobTitle, rating, safeText],
     function(err) {
       if (err) return res.status(500).json({ error: 'Failed to submit review' });
       res.json({ success: true, id });
@@ -995,8 +1294,10 @@ app.get('/api/admin/jobs/all', requireAdmin, (req, res) => {
 app.get('/api/admin/earnings', requireAdmin, (req, res) => {
   db.all(`SELECT * FROM payments WHERE status = 'completed' ORDER BY created_at DESC`, [], (err, rows) => {
     if (err) return res.status(500).json({ error: 'Database error' });
-    const total = rows.reduce((sum, p) => sum + (p.amount || 0), 0);
-    res.json({ payments: rows, total });
+    db.get(`SELECT COALESCE(SUM(amount), 0) as total FROM payments WHERE status = 'completed'`, [], (err, sumRow) => {
+      if (err) return res.status(500).json({ error: 'Database error' });
+      res.json({ payments: rows, total: sumRow?.total || 0 });
+    });
   });
 });
 
@@ -1021,11 +1322,24 @@ app.post('/api/chat/:roomId/messages', requireUser, (req, res) => {
   res.json({ success: true, id: 'msg_' + Date.now() });
 });
 
+// ─── Graceful Shutdown ────────────────────────────────────────
+function gracefulShutdown(signal) {
+  console.log(`[WorkPro Backend] ${signal} received. Closing database and server...`);
+  db.close((err) => {
+    if (err) console.error('[DB] Error closing database:', err);
+    else console.log('[DB] Database connection closed.');
+    process.exit(0);
+  });
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
 // ─── Start Server ───────────────────────────────────────────────
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`[WorkPro Backend] Running on port ${PORT}`);
   console.log(`[WorkPro Backend] Environment: ${NODE_ENV}`);
   console.log(`[WorkPro Backend] Frontend allowed: ${corsOrigins.join(', ')}`);
   console.log(`[WorkPro Backend] Pi API Key: ${PI_API_KEY ? 'Configured' : 'MISSING!'}`);
-  console.log(`[WorkPro Backend] Admin API Key: ${ADMIN_API_KEY ? 'Configured' : 'MISSING!'}`); // TODO: remove in production
+  console.log(`[WorkPro Backend] Admin API Key: ${ADMIN_API_KEY ? 'Configured' : 'MISSING!'}`);
 });
