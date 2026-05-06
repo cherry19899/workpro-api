@@ -277,12 +277,6 @@ app.post('/api/payments/:paymentId/approve', requireUser, async (req, res) => {
     return res.status(500).json({ error: 'PI_API_KEY not configured' });
   }
 
-  // Verify payment exists on Pi Network before approving
-  const piPayment = await verifyPaymentWithPi(paymentId);
-  if (!piPayment) {
-    return res.status(400).json({ error: 'Payment not found on Pi Network' });
-  }
-
   try {
     const response = await fetch(`https://api.minepi.com/v2/payments/${paymentId}/approve`, {
       method: 'POST',
@@ -299,11 +293,11 @@ app.post('/api/payments/:paymentId/approve', requireUser, async (req, res) => {
       return res.status(response.status).json({ error: data.error || 'Approval failed', details: data });
     }
 
-    // Save payment record using verified data from Pi API
-    const uid = piPayment.user_uid || req.body?.user?.uid || 'unknown';
-    const username = piPayment.metadata?.user?.username || req.body?.user?.username || 'unknown';
-    const amount = piPayment.amount || req.body?.amount || 0;
-    const memo = piPayment.memo || req.body?.memo || '';
+    // Save payment record (use Pi API data if available, else body)
+    const uid = data.user_uid || req.body?.user?.uid || req.userId || 'unknown';
+    const username = data.metadata?.user?.username || req.body?.user?.username || 'unknown';
+    const amount = data.amount || req.body?.amount || 0;
+    const memo = data.memo || req.body?.memo || '';
 
     db.run(
       `INSERT OR REPLACE INTO payments (id, user_id, username, amount, memo, status) VALUES (?, ?, ?, ?, ?, 'approved')`,
