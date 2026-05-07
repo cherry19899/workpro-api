@@ -194,7 +194,7 @@ db.serialize(() => {
     id TEXT PRIMARY KEY,
     username TEXT NOT NULL,
     role TEXT DEFAULT 'freelancer',
-    balance_connects INTEGER DEFAULT 20,
+    balance_connects INTEGER DEFAULT 0,
     balance_pi REAL DEFAULT 0,
     kyc_verified INTEGER DEFAULT 0,
     availability TEXT DEFAULT 'available',
@@ -333,7 +333,7 @@ function getUser(userId, callback) {
 }
 
 function createUser(userId, username, callback) {
-  db.run(`INSERT INTO users (id, username, balance_connects) VALUES (?, ?, ?)`, [userId, username || 'User_' + userId.slice(0, 8), 20], (err) => {
+  db.run(`INSERT INTO users (id, username, balance_connects) VALUES (?, ?, ?)`, [userId, username || 'User_' + userId.slice(0, 8), 0], (err) => {
     if (err) return callback(err, null);
     db.get(`SELECT * FROM users WHERE id = ?`, [userId], (err, row) => callback(err, row));
   });
@@ -350,7 +350,7 @@ function updateUserBalance(userId, connectsDelta, piDelta, callback) {
       if (!user) {
         // Auto-create user with default balance
         db.run(`INSERT INTO users (id, username, balance_connects, balance_pi) VALUES (?, ?, ?, ?)`,
-          [userId, 'User_' + userId.slice(0, 8), 20 + connectsDelta, piDelta],
+          [userId, 'User_' + userId.slice(0, 8), connectsDelta, piDelta],
           (err) => {
             if (err) {
               db.run('ROLLBACK');
@@ -361,7 +361,7 @@ function updateUserBalance(userId, connectsDelta, piDelta, callback) {
                 db.run('ROLLBACK');
                 return callback(err);
               }
-              callback(null, { balance_connects: 20 + connectsDelta, balance_pi: piDelta });
+              callback(null, { balance_connects: connectsDelta, balance_pi: piDelta });
             });
           }
         );
