@@ -285,6 +285,22 @@ db.serialize(() => {
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )`);
 
+  db.run(`CREATE TABLE IF NOT EXISTS chat_rooms (
+    id TEXT PRIMARY KEY,
+    user1_id TEXT NOT NULL,
+    user2_id TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`);
+
+  db.run(`CREATE TABLE IF NOT EXISTS chat_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_id TEXT NOT NULL,
+    sender_id TEXT NOT NULL,
+    sender_name TEXT,
+    message TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`);
+
   // ─── Indexes for performance ──────────────────────────────────
   db.run(`CREATE INDEX IF NOT EXISTS idx_payments_user ON payments(user_id)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status)`);
@@ -301,6 +317,9 @@ db.serialize(() => {
   db.run(`CREATE INDEX IF NOT EXISTS idx_connects_user ON connects_purchases(user_id)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_offers_freelancer ON offers(freelancer_id)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_escrow_messages_escrow ON escrow_messages(escrow_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_chat_rooms_user1 ON chat_rooms(user1_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_chat_rooms_user2 ON chat_rooms(user2_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_chat_messages_room ON chat_messages(room_id)`);
 });
 
 // ─── Input Validation Helpers ───────────────────────────────────
@@ -1147,9 +1166,41 @@ app.post('/api/escrows/:id/release', requireUser, (req, res) => {
     if (escrow.client_id !== req.userId) return res.status(403).json({ error: 'Only the client can release escrow' });
     if (escrow.status !== 'funded') return res.status(400).json({ error: `Escrow is ${escrow.status}, must be funded` });
 
-    db.run(`UPDATE escrows SET status = 'released', released_at = CURRENT_TIMESTAMP WHERE id = ?`, [id], function(err) {
-      if (err) return res.status(500).json({ error: 'Failed to release' });
-      res.json({ success: true, status: 'released' });
+    db.run('BEGIN TRANSACTION', (err) => {
+      if (err) return res.status(500).json({ error: 'Database error' });
+
+      db.run(`UPDATE escrows SET status = 'released', released_at = CURRENT_TIMESTAMP WHERE id = ?`, [id], function(err) {
+        if (err) {
+          db.run('ROLLBACK');
+          return res.status(500).json({ error: 'Failed to release' });
+        }
+
+        db.run(`UPDATE users SET balance_pi = balance_pi + ? WHERE id = ?`, [escrow.amount, escrow.freelancer_id], function(err) {
+          if (err) {
+            db.run('ROLLBACK');
+            return res.status(500).json({ error: 'Failed to transfer Pi to freelancer' });
+          }
+
+          db.run(`UPDATE jobs SET status = 'completed' WHERE id = ?`, [escrow.job_id], function(err) {
+            if (err) {
+              db.run('ROLLBACK');
+              return res.status(500).json({ error: 'Failed to mark job as completed' });
+            }
+
+            db.run('COMMIT', (err) => {
+              if (err) {
+                db.run('ROLLBACK');
+                return res.status(500).json({ error: 'Failed to commit transaction' });
+              }
+
+              db.get(`SELECT balance_pi FROM users WHERE id = ?`, [escrow.freelancer_id], (err, row) => {
+                const newBalance = row ? row.balance_pi : null;
+                res.json({ success: true, status: 'released', freelancer_new_balance: newBalance });
+              });
+            });
+          });
+        });
+      });
     });
   });
 });
@@ -1169,6 +1220,53 @@ app.post('/api/escrows/:id/dispute', requireUser, (req, res) => {
     db.run(`UPDATE escrows SET status = 'disputed' WHERE id = ?`, [id], function(err) {
       if (err) return res.status(500).json({ error: 'Failed to dispute' });
       res.json({ success: true, status: 'disputed' });
+    });
+  });
+});
+
+app.post('/api/escrows/:id/cancel', requireUser, (req, res) => {
+  const { id } = req.params;
+  getEscrow(id, (err, escrow) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    if (!escrow) return res.status(404).json({ error: 'Escrow not found' });
+    if (escrow.client_id !== req.userId) return res.status(403).json({ error: 'Only the client can cancel escrow' });
+    if (escrow.status !== 'pending') return res.status(400).json({ error: `Escrow is ${escrow.status}, only pending escrows can be cancelled` });
+
+    db.run('BEGIN TRANSACTION', (err) => {
+      if (err) return res.status(500).json({ error: 'Database error' });
+
+      db.run(`UPDATE escrows SET status = 'cancelled' WHERE id = ?`, [id], function(err) {
+        if (err) {
+          db.run('ROLLBACK');
+          return res.status(500).json({ error: 'Failed to cancel escrow' });
+        }
+
+        db.run(`UPDATE users SET balance_pi = balance_pi + ? WHERE id = ?`, [escrow.amount, escrow.client_id], function(err) {
+          if (err) {
+            db.run('ROLLBACK');
+            return res.status(500).json({ error: 'Failed to return Pi to client' });
+          }
+
+          db.run(`UPDATE jobs SET status = 'cancelled' WHERE id = ?`, [escrow.job_id], function(err) {
+            if (err) {
+              db.run('ROLLBACK');
+              return res.status(500).json({ error: 'Failed to update job status' });
+            }
+
+            db.run('COMMIT', (err) => {
+              if (err) {
+                db.run('ROLLBACK');
+                return res.status(500).json({ error: 'Failed to commit transaction' });
+              }
+
+              db.get(`SELECT balance_pi FROM users WHERE id = ?`, [escrow.client_id], (err, row) => {
+                const newBalance = row ? row.balance_pi : null;
+                res.json({ success: true, status: 'cancelled', client_new_balance: newBalance });
+              });
+            });
+          });
+        });
+      });
     });
   });
 });
@@ -1330,15 +1428,80 @@ app.get('/api/admin/escrows', requireAdmin, (req, res) => {
 // ─── Chat ─────────────────────────────────────────────────────
 app.get('/api/chat/rooms/:userId', requireUser, (req, res) => {
   if (req.userId !== req.params.userId) return res.status(403).json({ error: 'Access denied' });
-  res.json([]);
+  const { userId } = req.params;
+  db.all(
+    `SELECT r.*,
+      CASE WHEN r.user1_id = ? THEN r.user2_id ELSE r.user1_id END as other_user_id
+     FROM chat_rooms r WHERE r.user1_id = ? OR r.user2_id = ? ORDER BY r.created_at DESC`,
+    [userId, userId, userId],
+    (err, rows) => {
+      if (err) return res.status(500).json({ error: 'Database error' });
+      res.json(rows);
+    }
+  );
 });
 
 app.get('/api/chat/:roomId/messages', requireUser, (req, res) => {
-  res.json([]);
+  const { roomId } = req.params;
+  db.get(`SELECT * FROM chat_rooms WHERE id = ? AND (user1_id = ? OR user2_id = ?)`, [roomId, req.userId, req.userId], (err, room) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    if (!room) return res.status(403).json({ error: 'Access denied' });
+    db.all(`SELECT * FROM chat_messages WHERE room_id = ? ORDER BY created_at ASC`, [roomId], (err, rows) => {
+      if (err) return res.status(500).json({ error: 'Database error' });
+      res.json(rows);
+    });
+  });
 });
 
 app.post('/api/chat/:roomId/messages', requireUser, (req, res) => {
-  res.json({ success: true, id: 'msg_' + Date.now() });
+  const { roomId } = req.params;
+  const { sender_id, sender_name, message } = req.body;
+  const safeMessage = sanitizeString(message, 1000);
+  if (!safeMessage) return res.status(400).json({ error: 'Message is required (1-1000 characters)' });
+
+  db.get(`SELECT * FROM chat_rooms WHERE id = ? AND (user1_id = ? OR user2_id = ?)`, [roomId, req.userId, req.userId], (err, room) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    if (!room) return res.status(403).json({ error: 'Access denied' });
+
+    db.run(
+      `INSERT INTO chat_messages (room_id, sender_id, sender_name, message) VALUES (?, ?, ?, ?)`,
+      [roomId, sender_id || req.userId, sanitizeString(sender_name, 50) || 'User', safeMessage],
+      function(err) {
+        if (err) return res.status(500).json({ error: 'Failed to send message' });
+        res.json({ id: this.lastID, success: true });
+      }
+    );
+  });
+});
+
+app.post('/api/chat/start', requireUser, (req, res) => {
+  const { user_id, other_user_id } = req.body;
+  if (!user_id || !other_user_id) return res.status(400).json({ error: 'Missing user_id or other_user_id' });
+  if (req.userId !== user_id) return res.status(403).json({ error: 'Access denied' });
+  if (user_id === other_user_id) return res.status(400).json({ error: 'Cannot start chat with yourself' });
+
+  // Normalize ordering so room is unique regardless of who initiates
+  const u1 = user_id < other_user_id ? user_id : other_user_id;
+  const u2 = user_id < other_user_id ? other_user_id : user_id;
+
+  db.get(
+    `SELECT * FROM chat_rooms WHERE user1_id = ? AND user2_id = ?`,
+    [u1, u2],
+    (err, room) => {
+      if (err) return res.status(500).json({ error: 'Database error' });
+      if (room) return res.json({ room_id: room.id, existing: true });
+
+      const roomId = 'room_' + Date.now();
+      db.run(
+        `INSERT INTO chat_rooms (id, user1_id, user2_id) VALUES (?, ?, ?)`,
+        [roomId, u1, u2],
+        function(err) {
+          if (err) return res.status(500).json({ error: 'Failed to create chat room' });
+          res.json({ room_id: roomId, existing: false });
+        }
+      );
+    }
+  );
 });
 
 // ─── Graceful Shutdown ────────────────────────────────────────
