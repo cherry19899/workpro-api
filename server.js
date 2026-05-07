@@ -380,7 +380,10 @@ function updateUserBalance(userId, connectsDelta, piDelta, callback) {
 function getJob(jobId, callback) {
   db.get(`SELECT * FROM jobs WHERE id = ?`, [jobId], (err, row) => {
     if (err) return callback(err, null);
-    if (row && row.images) try { row.images = JSON.parse(row.images); } catch(e) {}
+    if (row) {
+      if (row.images) try { row.images = JSON.parse(row.images); } catch(e) {}
+      row.apply_cost = Math.ceil((row.budget || 0) / 50) || 1;
+    }
     callback(err, row);
   });
 }
@@ -833,6 +836,7 @@ app.get('/api/jobs', (req, res) => {
       if (err) return res.status(500).json({ error: 'Database error' });
       rows.forEach(row => {
         if (row.images) try { row.images = JSON.parse(row.images); } catch(e) {}
+        row.apply_cost = Math.ceil((row.budget || 0) / 50) || 1;
       });
       res.json({ jobs: rows, page: pageInt, limit: limitInt, total, total_pages: totalPages });
     });
@@ -852,6 +856,7 @@ app.get('/api/jobs/user/:username', (req, res) => {
     if (err) return res.status(500).json({ error: 'Database error' });
     rows.forEach(row => {
       if (row.images) try { row.images = JSON.parse(row.images); } catch(e) {}
+      row.apply_cost = Math.ceil((row.budget || 0) / 50) || 1;
     });
     res.json(rows);
   });
