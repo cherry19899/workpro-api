@@ -1175,7 +1175,7 @@ app.post('/api/escrows/:id/release', requireUser, (req, res) => {
           return res.status(500).json({ error: 'Failed to release' });
         }
 
-        db.run(`UPDATE users SET balance_pi = balance_pi + ? WHERE id = ?`, [escrow.amount, escrow.freelancer_id], function(err) {
+        db.run(`UPDATE users SET balance_pi = COALESCE(balance_pi, 0) + ? WHERE id = ?`, [escrow.amount, escrow.freelancer_id], function(err) {
           if (err) {
             db.run('ROLLBACK');
             return res.status(500).json({ error: 'Failed to transfer Pi to freelancer' });
@@ -1241,7 +1241,7 @@ app.post('/api/escrows/:id/cancel', requireUser, (req, res) => {
           return res.status(500).json({ error: 'Failed to cancel escrow' });
         }
 
-        db.run(`UPDATE users SET balance_pi = balance_pi + ? WHERE id = ?`, [escrow.amount, escrow.client_id], function(err) {
+        db.run(`UPDATE users SET balance_pi = COALESCE(balance_pi, 0) + ? WHERE id = ?`, [escrow.amount, escrow.client_id], function(err) {
           if (err) {
             db.run('ROLLBACK');
             return res.status(500).json({ error: 'Failed to return Pi to client' });
