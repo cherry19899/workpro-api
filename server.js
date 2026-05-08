@@ -964,11 +964,13 @@ app.post('/api/push/unsubscribe', requireUser, (req, res) => {
 app.post('/api/jobs/expire', (req, res) => {
   // Can be called by cron job or manually by admin
   const adminSecret = req.headers['x-admin-secret'];
-  // CRIT: Must check both exist AND match — undefined === undefined is true!
-  const isAdmin = !!(adminSecret && process.env.ADMIN_SECRET && adminSecret === process.env.ADMIN_SECRET);
   const cronSecret = req.headers['x-cron-secret'];
+  // CRIT: Must check header exists, env exists, AND values match
+  // undefined === undefined would be true without !!() wrapper
+  const isAdmin = !!(adminSecret && process.env.ADMIN_SECRET && adminSecret === process.env.ADMIN_SECRET);
   const isCron = !!(cronSecret && process.env.CRON_SECRET && cronSecret === process.env.CRON_SECRET);
-  if (!isAdmin && !isCron) return res.status(401).json({ error: 'Unauthorized' });
+  // Additional safety: require at least one auth header to be present
+  if (!isAdmin && !isCron) return res.status(401).json({ error: 'Unauthorized. Use x-admin-secret or x-cron-secret.' });
 
   const now = new Date().toISOString();
   db.run(`UPDATE jobs SET status = 'expired' WHERE status = 'open' AND deadline IS NOT NULL AND deadline < ?`, [now], function(err) {
