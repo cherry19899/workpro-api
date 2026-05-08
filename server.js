@@ -363,6 +363,29 @@ db.serialize(() => {
   db.run(`CREATE INDEX IF NOT EXISTS idx_chat_rooms_user2 ON chat_rooms(user2_id)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_chat_messages_room ON chat_messages(room_id)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_push_subscriptions_user ON push_subscriptions(user_id)`);
+
+  // ─── Notifications ────────────────────────────────────────────
+  db.run(`CREATE TABLE IF NOT EXISTS notifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    type TEXT NOT NULL,
+    title TEXT NOT NULL,
+    message TEXT NOT NULL,
+    related_id TEXT,
+    is_read INTEGER DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`);
+
+  // ─── Job Views Counter ────────────────────────────────────────
+  db.run(`CREATE TABLE IF NOT EXISTS job_views (
+    job_id TEXT NOT NULL,
+    viewer_id TEXT,
+    viewed_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`);
+
+  db.run(`CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_notifications_read ON notifications(user_id, is_read)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_job_views_job ON job_views(job_id)`);
 });
 
 // ─── Input Validation Helpers ───────────────────────────────────
@@ -387,6 +410,13 @@ if (!PI_API_KEY) {
 }
 
 // ─── Helpers ────────────────────────────────────────────────────
+function createNotification(userId, type, title, message, relatedId) {
+  db.run(`INSERT INTO notifications (user_id, type, title, message, related_id) VALUES (?, ?, ?, ?, ?)`,
+    [userId, type, title, message, relatedId || null],
+    (err) => { if (err) console.error('[DB] Notification error:', err); }
+  );
+}
+
 function getUser(userId, callback) {
   db.get(`SELECT * FROM users WHERE id = ?`, [userId], (err, row) => {
     if (err) return callback(err, null);
@@ -959,6 +989,57 @@ app.post('/api/push/unsubscribe', requireUser, (req, res) => {
   });
 });
 
+// ─── Notifications ────────────────────────────────────────────
+app.get('/api/notifications', requireUser, (req, res) => {
+  const limit = Math.min(50, parseInt(req.query.limit) || 20);
+  db.all(`SELECT * FROM notifications WHERE user_id = ? ORDER BY created_at DESC LIMIT ?`, [req.userId, limit], (err, rows) => {
+    if (err) { console.error('[DB] Notifications error:', err); return res.status(500).json({ error: 'Database error' }); }
+    res.json(rows || []);
+  });
+});
+
+app.get('/api/notifications/unread-count', requireUser, (req, res) => {
+  db.get(`SELECT COUNT(*) as count FROM notifications WHERE user_id = ? AND is_read = 0`, [req.userId], (err, row) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    res.json({ count: row ? row.count : 0 });
+  });
+});
+
+app.post('/api/notifications/:id/read', requireUser, (req, res) => {
+  db.run(`UPDATE notifications SET is_read = 1 WHERE id = ? AND user_id = ?`, [req.params.id, req.userId], function(err) {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    res.json({ success: true, updated: this.changes });
+  });
+});
+
+app.post('/api/notifications/read-all', requireUser, (req, res) => {
+  db.run(`UPDATE notifications SET is_read = 1 WHERE user_id = ? AND is_read = 0`, [req.userId], function(err) {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    res.json({ success: true, updated: this.changes });
+  });
+});
+
+// ─── Job Views ────────────────────────────────────────────────
+app.post('/api/jobs/:id/view', (req, res) => {
+  const jobId = req.params.id;
+  const viewerId = req.headers['x-user-id'] || 'anonymous';
+  db.run(`INSERT INTO job_views (job_id, viewer_id) VALUES (?, ?)`, [jobId, viewerId], (err) => {
+    if (err) console.error('[DB] View track error:', err);
+  });
+  // Return current view count
+  db.get(`SELECT COUNT(*) as views FROM job_views WHERE job_id = ?`, [jobId], (err, row) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    res.json({ views: row ? row.views : 0 });
+  });
+});
+
+app.get('/api/jobs/:id/views', (req, res) => {
+  db.get(`SELECT COUNT(*) as views FROM job_views WHERE job_id = ?`, [req.params.id], (err, row) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    res.json({ views: row ? row.views : 0 });
+  });
+});
+
 // ─── Job Expiration ───────────────────────────────────────────
 // Auto-close jobs past their deadline
 app.post('/api/jobs/expire', (req, res) => {
@@ -1196,6 +1277,9 @@ app.post('/api/jobs/:jobId/apply', requireUser, requireBodyUserMatch, (req, res)
                     db.run('ROLLBACK');
                     return res.status(500).json({ error: 'Failed to commit transaction' });
                   }
+                  // Notify job owner about new application
+                  createNotification(job.posted_by, 'application', 'New Application', 
+                    `${username} applied to your job "${job.title}"`, String(jobId));
                   res.json({ success: true, id: appId, remaining_connects: newConnects });
                 });
               });
@@ -1241,6 +1325,9 @@ app.post('/api/applications/:id/accept', requireUser, (req, res) => {
 
     db.run(`UPDATE applications SET status = 'accepted' WHERE id = ?`, [id], function(err) {
       if (err) return res.status(500).json({ error: 'Failed to accept' });
+      // Notify freelancer
+      createNotification(row.user_id, 'accepted', 'Application Accepted',
+        `Your application was accepted! You can now start working.`, String(row.job_id));
       res.json({ success: true, status: 'accepted' });
     });
   });
@@ -1343,6 +1430,10 @@ app.post('/api/escrows/:id/release', requireUser, (req, res) => {
                 db.run('ROLLBACK');
                 return res.status(500).json({ error: 'Failed to commit transaction' });
               }
+
+              // Notify freelancer that escrow was released
+              createNotification(escrow.freelancer_id, 'escrow', 'Escrow Released',
+                `Client released escrow! +${escrow.amount} Pi transferred to your balance.`, String(escrow.job_id));
 
               db.get(`SELECT balance_pi FROM users WHERE id = ?`, [escrow.freelancer_id], (err, row) => {
                 const newBalance = row ? row.balance_pi : null;
@@ -1623,6 +1714,10 @@ app.post('/api/chat/:roomId/messages', requireUser, (req, res) => {
       [roomId, req.userId, sanitizeString(sender_name, 50) || 'User', safeMessage],
       function(err) {
         if (err) return res.status(500).json({ error: 'Failed to send message' });
+        // Notify recipient (the other user in the room)
+        const recipientId = room.user1_id === req.userId ? room.user2_id : room.user1_id;
+        createNotification(recipientId, 'message', 'New Message',
+          `New message from ${sanitizeString(sender_name, 50) || 'User'}`, roomId);
         res.json({ id: this.lastID, success: true });
       }
     );
