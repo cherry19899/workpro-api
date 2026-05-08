@@ -649,6 +649,59 @@ app.get('/api/payments/:paymentId', (req, res) => {
   });
 });
 
+// ─── Search & Filter Jobs ────────────────────────────────────
+app.get('/api/jobs/search', (req, res) => {
+  const {
+    q, keyword,
+    category,
+    min_budget, max_budget,
+    status,
+    posted_by,
+    sort = 'newest',
+    page = 1, limit = 10
+  } = req.query;
+
+  const searchKeyword = sanitizeString(q || keyword || '', 100);
+  const safeCategory = sanitizeString(category || '', 50);
+  const safeStatus = sanitizeString(status || '', 20);
+  const safePostedBy = sanitizeString(posted_by || '', 100);
+  const minBudget = parseInt(min_budget) || 0;
+  const maxBudget = parseInt(max_budget) || 0;
+  const pageNum = Math.max(1, parseInt(page) || 1);
+  const pageSize = Math.min(50, Math.max(1, parseInt(limit) || 10));
+  const offset = (pageNum - 1) * pageSize;
+
+  const conditions = ['1=1'];
+  const params = [];
+
+  if (searchKeyword) {
+    conditions.push('(title LIKE ? OR description LIKE ?)');
+    const like = `%${searchKeyword}%`;
+    params.push(like, like);
+  }
+  if (safeCategory) { conditions.push('category = ?'); params.push(safeCategory); }
+  if (safeStatus) { conditions.push('status = ?'); params.push(safeStatus); }
+  if (safePostedBy) { conditions.push('posted_by = ?'); params.push(safePostedBy); }
+  if (minBudget > 0) { conditions.push('budget >= ?'); params.push(minBudget); }
+  if (maxBudget > 0) { conditions.push('budget <= ?'); params.push(maxBudget); }
+
+  const where = conditions.join(' AND ');
+  let orderBy = 'created_at DESC';
+  if (sort === 'oldest') orderBy = 'created_at ASC';
+  else if (sort === 'budget_high') orderBy = 'budget DESC';
+  else if (sort === 'budget_low') orderBy = 'budget ASC';
+
+  db.get(`SELECT COUNT(*) as total FROM jobs WHERE ${where}`, params, (err, countRow) => {
+    if (err) { console.error('[DB] Search count error:', err); return res.status(500).json({ error: 'Database error' }); }
+    const total = countRow ? countRow.total : 0;
+    const queryParams = [...params, pageSize, offset];
+    db.all(`SELECT * FROM jobs WHERE ${where} ORDER BY ${orderBy} LIMIT ? OFFSET ?`, queryParams, (err, rows) => {
+      if (err) { console.error('[DB] Search error:', err); return res.status(500).json({ error: 'Database error' }); }
+      res.json({ jobs: rows || [], total, page: pageNum, page_size: pageSize, total_pages: Math.ceil(total / pageSize), filters: { keyword: searchKeyword, category: safeCategory, status: safeStatus, min_budget: minBudget, max_budget: maxBudget }, sort });
+    });
+  });
+});
+
 // ─── Connects Purchase (Legacy — backward compatible) ─────────
 app.post('/api/connects/buy', requireUser, (req, res) => {
   const { user_id, username, package_amount, pi_amount, payment_id } = req.body;
