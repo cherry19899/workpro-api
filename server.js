@@ -740,19 +740,31 @@ app.post('/api/connects/initiate', requireUser, async (req, res) => {
 // ─── Connects Purchase Complete (Pi SDK flow) ────────────────
 app.post('/api/connects/complete', requireUser, async (req, res) => {
   const { payment_id, txid, user_id, package_amount } = req.body;
-  if (!PI_API_KEY || !txid) return res.status(400).json({ error: 'Missing txid or API key' });
-  if (!isValidTxid(txid)) return res.status(400).json({ error: 'Invalid txid format' });
+
+  // Sandbox mode: skip Pi API validation if PI_API_KEY not configured
+  const sandboxMode = !PI_API_KEY;
+
+  if (!payment_id) return res.status(400).json({ error: 'Missing payment_id' });
+  if (!txid) return res.status(400).json({ error: 'Missing txid' });
+
+  // Only validate txid format in production (with API key)
+  if (!sandboxMode && !isValidTxid(txid)) return res.status(400).json({ error: 'Invalid txid format' });
 
   try {
-    const piRes = await fetch(`https://api.minepi.com/v2/payments/${payment_id}/complete`, {
-      method: 'POST',
-      headers: { 'Authorization': `Key ${PI_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ txid }),
-    });
-    if (!piRes.ok) {
-      const errData = await piRes.json().catch(() => ({}));
-      console.error('[Pi API] Complete failed:', errData);
-      return res.status(piRes.status).json({ error: 'Pi complete failed', details: errData });
+    if (!sandboxMode) {
+      // Production: validate with Pi API
+      const piRes = await fetch(`https://api.minepi.com/v2/payments/${payment_id}/complete`, {
+        method: 'POST',
+        headers: { 'Authorization': `Key ${PI_API_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ txid }),
+      });
+      if (!piRes.ok) {
+        const errData = await piRes.json().catch(() => ({}));
+        console.error('[Pi API] Complete failed:', errData);
+        return res.status(piRes.status).json({ error: 'Pi complete failed', details: errData });
+      }
+    } else {
+      console.log('[Pi] Sandbox mode — complete bypass');
     }
 
     db.run('BEGIN TRANSACTION', (err) => {
@@ -772,7 +784,7 @@ app.post('/api/connects/complete', requireUser, async (req, res) => {
               db.run('ROLLBACK');
               return res.status(500).json({ error: 'Failed to commit transaction' });
             }
-            res.json({ success: true, new_balance: result.balance_connects });
+            res.json({ success: true, new_balance: result.balance_connects, sandbox: sandboxMode });
           });
         });
       });
