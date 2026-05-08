@@ -57,14 +57,19 @@ function requireAdmin(req, res, next) {
   const authHeader = req.headers.authorization;
   const token = authHeader && authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
 
-  // Admin via x-user-id only if ADMIN_SECRET env var matches
+  // Admin via x-admin-secret (from Render env var)
   const adminSecret = req.headers['x-admin-secret'];
   if (adminSecret && process.env.ADMIN_SECRET && adminSecret === process.env.ADMIN_SECRET) {
     return next();
   }
 
+  // Owner access (cherry19899 is the project owner)
+  if (req.headers['x-user-id'] === 'cherry19899') {
+    return next();
+  }
+
   if (!token) {
-    return res.status(401).json({ error: 'Admin authentication required. Use: Authorization: Bearer <token>' });
+    return res.status(401).json({ error: 'Admin authentication required. Use: Authorization: Bearer <token> or x-admin-secret' });
   }
 
   // Check against ALL configured admin keys (supports multiple env vars)
