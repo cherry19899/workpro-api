@@ -165,7 +165,7 @@ const corsOrigins = NODE_ENV === 'production'
 app.use(cors({
   origin: corsOrigins,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-user-id', 'x-pi-token'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-user-id', 'x-pi-token', 'x-admin-secret'],
 }));
 app.use(rateLimit);
 
