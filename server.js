@@ -1455,7 +1455,10 @@ app.get('/api/chat/:roomId/messages', requireUser, (req, res) => {
 
 app.post('/api/chat/:roomId/messages', requireUser, (req, res) => {
   const { roomId } = req.params;
-  const { sender_id, sender_name, message } = req.body;
+  // Support both API format (sender_id, sender_name, message) and bundle format (user_id, user_name, text)
+  const sender_id = req.body.sender_id || req.body.user_id;
+  const sender_name = req.body.sender_name || req.body.user_name;
+  const message = req.body.message || req.body.text;
   const safeMessage = sanitizeString(message, 1000);
   if (!safeMessage) return res.status(400).json({ error: 'Message is required (1-1000 characters)' });
 
