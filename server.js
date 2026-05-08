@@ -964,8 +964,10 @@ app.post('/api/push/unsubscribe', requireUser, (req, res) => {
 app.post('/api/jobs/expire', (req, res) => {
   // Can be called by cron job or manually by admin
   const adminSecret = req.headers['x-admin-secret'];
-  const isAdmin = adminSecret && process.env.ADMIN_SECRET && adminSecret === process.env.ADMIN_SECRET;
-  const isCron = req.headers['x-cron-secret'] === process.env.CRON_SECRET;
+  // CRIT: Must check both exist AND match — undefined === undefined is true!
+  const isAdmin = !!(adminSecret && process.env.ADMIN_SECRET && adminSecret === process.env.ADMIN_SECRET);
+  const cronSecret = req.headers['x-cron-secret'];
+  const isCron = !!(cronSecret && process.env.CRON_SECRET && cronSecret === process.env.CRON_SECRET);
   if (!isAdmin && !isCron) return res.status(401).json({ error: 'Unauthorized' });
 
   const now = new Date().toISOString();
