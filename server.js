@@ -20,10 +20,22 @@ const RATE_LIMIT_MAX = 100; // requests per window
 const PAYMENT_RATE_LIMIT_MAX = 10; // stricter for payment endpoints
 
 function rateLimit(req, res, next) {
-  const key = req.ip || 'unknown';
+  // MEDIUM-001 FIX: Use x-user-id for per-user rate limiting, fallback to IP
+  const userId = req.headers['x-user-id'];
+  const ip = req.ip || 'unknown';
+  const key = userId ? `user:${userId}` : `ip:${ip}`;
   const now = Date.now();
   const isPaymentEndpoint = req.path && (req.path.includes('/payments') || req.path.includes('/connects'));
-  const limit = isPaymentEndpoint ? PAYMENT_RATE_LIMIT_MAX : RATE_LIMIT_MAX;
+  const isJobPost = req.method === 'POST' && req.path === '/api/jobs';
+  const isChat = req.method === 'POST' && req.path.includes('/chat');
+  const isApply = req.method === 'POST' && req.path.includes('/apply');
+
+  let limit = RATE_LIMIT_MAX;
+  let window = RATE_LIMIT_WINDOW;
+  if (isPaymentEndpoint) { limit = PAYMENT_RATE_LIMIT_MAX; }
+  if (isJobPost) { limit = 10; window = 60 * 60 * 1000; } // 10 jobs/hour per user
+  if (isChat) { limit = 30; window = 60 * 1000; } // 30 messages/min per user
+  if (isApply) { limit = 20; window = 60 * 60 * 1000; } // 20 applies/hour per user
 
   // HIGH-006 FIX: Cap map size + cleanup old entries
   const MAX_MAP_SIZE = 10000;
@@ -31,23 +43,22 @@ function rateLimit(req, res, next) {
     const firstKey = rateLimitMap.keys().next().value;
     if (firstKey !== undefined) rateLimitMap.delete(firstKey);
   }
-  // Cleanup old entries (memory leak fix)
   for (const [k, v] of rateLimitMap.entries()) {
     if (now > v.resetTime) rateLimitMap.delete(k);
   }
 
-  const entry = rateLimitMap.get(key) || { count: 0, resetTime: now + RATE_LIMIT_WINDOW };
+  const entry = rateLimitMap.get(key) || { count: 0, resetTime: now + window };
 
   if (now > entry.resetTime) {
     entry.count = 0;
-    entry.resetTime = now + RATE_LIMIT_WINDOW;
+    entry.resetTime = now + window;
   }
 
   entry.count++;
   rateLimitMap.set(key, entry);
 
   if (entry.count > limit) {
-    return res.status(429).json({ error: 'Too many requests, please try again later' });
+    return res.status(429).json({ error: 'Rate limit exceeded. Please try again later.', retry_after: Math.ceil((entry.resetTime - now) / 1000) });
   }
   next();
 }
@@ -1767,6 +1778,38 @@ function gracefulShutdown(signal) {
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
+// ─── Error Handling (MEDIUM-005, MEDIUM-006) ─────────────────
+process.on('uncaughtException', (err) => {
+  console.error('[FATAL] Uncaught Exception:', err);
+  // Give time for logs to flush before exit
+  setTimeout(() => process.exit(1), 1000);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[FATAL] Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+// ─── Graceful Shutdown ────────────────────────────────────────
+function gracefulShutdown(signal) {
+  console.log(`[${signal}] Shutting down gracefully...`);
+  server.close(() => {
+    console.log('[Server] Closed');
+    db.close((err) => {
+      if (err) console.error('[DB] Close error:', err);
+      else console.log('[DB] Connection closed');
+      process.exit(0);
+    });
+  });
+  // Force exit after 10s if graceful shutdown hangs
+  setTimeout(() => {
+    console.error('[FATAL] Force shutdown after timeout');
+    process.exit(1);
+  }, 10000);
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
 // ─── Start Server ───────────────────────────────────────────────
 const server = app.listen(PORT, () => {
   console.log(`[WorkPro Backend] Running on port ${PORT}`);
@@ -1774,6 +1817,6 @@ const server = app.listen(PORT, () => {
   console.log(`[WorkPro Backend] Frontend allowed: ${corsOrigins.join(', ')}`);
   console.log(`[WorkPro Backend] Pi API Key: ${PI_API_KEY ? 'Configured' : 'MISSING!'}`);
   console.log(`[WorkPro Backend] Admin API Key: ${ADMIN_API_KEY ? 'Configured' : 'MISSING!'}`);
+  console.log(`[WorkPro Backend] Rate limit: ${RATE_LIMIT_MAX}/min per user, ${PAYMENT_RATE_LIMIT_MAX}/min payments`);
+  console.log(`[WorkPro Backend] Job post limit: 10/hour, Chat: 30/min, Apply: 20/hour`);
 });
-// Render deploy trigger: Thu May  7 05:24:11 AM CST 2026
-// Render deploy trigger: Thu May  7 22:01:55 UTC 2026
