@@ -90,6 +90,8 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // ─── User Auth Middleware ─────────────────────────────────────
 function requireUser(req, res, next) {
+  // CORS preflight: skip auth check (browser sends OPTIONS without custom headers)
+  if (req.method === 'OPTIONS') return next();
   const userId = req.headers['x-user-id'];
   if (!userId) {
     return res.status(401).json({ error: 'Authentication required. Missing x-user-id header.' });
@@ -99,6 +101,7 @@ function requireUser(req, res, next) {
 }
 
 function requireBodyUserMatch(req, res, next) {
+  if (req.method === 'OPTIONS') return next();
   const userId = req.headers['x-user-id'];
   const bodyUserId = req.body.user_id || req.body.posted_by || req.body.client_id || req.body.reviewer_id;
   if (bodyUserId && bodyUserId !== userId) {
