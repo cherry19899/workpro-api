@@ -51,8 +51,9 @@ function requireAdmin(req, res, next) {
   const authHeader = req.headers.authorization;
   const token = authHeader && authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
 
-  // TEMP: allow cherry19899 as admin via x-user-id (remove after setting proper token)
-  if (req.headers['x-user-id'] === 'cherry19899') {
+  // Admin via x-user-id only if ADMIN_SECRET env var matches
+  const adminSecret = req.headers['x-admin-secret'];
+  if (adminSecret && process.env.ADMIN_SECRET && adminSecret === process.env.ADMIN_SECRET) {
     return next();
   }
 
@@ -831,22 +832,19 @@ app.post('/api/connects/complete', requireUser, async (req, res) => {
 
     db.run('BEGIN TRANSACTION', (err) => {
       if (err) return res.status(500).json({ error: 'Database error' });
-      updateUserBalance(user_id, package_amount, 0, (err, result) => {
-        if (err) {
-          db.run('ROLLBACK');
-          return res.status(500).json({ error: 'DB error updating balance' });
-        }
-        db.run(`UPDATE connects_purchases SET status = 'completed' WHERE payment_id = ?`, [payment_id], (err) => {
-          if (err) {
-            db.run('ROLLBACK');
-            return res.status(500).json({ error: 'DB error updating purchase' });
-          }
-          db.run('COMMIT', (err) => {
-            if (err) {
-              db.run('ROLLBACK');
-              return res.status(500).json({ error: 'Failed to commit transaction' });
-            }
-            res.json({ success: true, new_balance: result.balance_connects, sandbox: sandboxMode });
+      // CRIT-003 FIX: Inline balance update instead of calling updateUserBalance (avoids nested transaction)
+      db.get(`SELECT balance_connects, balance_pi FROM users WHERE id = ?`, [user_id], (err, user) => {
+        if (err) { db.run('ROLLBACK'); return res.status(500).json({ error: 'DB error' }); }
+        const newConnects = (user ? user.balance_connects || 0 : 0) + package_amount;
+        db.run(`INSERT INTO users (id, username, balance_connects, balance_pi) VALUES (?, COALESCE((SELECT username FROM users WHERE id = ?), ?), ?, 0) ON CONFLICT(id) DO UPDATE SET balance_connects = ?`,
+          [user_id, user_id, 'User_' + user_id.slice(0,8), newConnects, newConnects], (err) => {
+          if (err) { db.run('ROLLBACK'); return res.status(500).json({ error: 'DB error updating balance' }); }
+          db.run(`UPDATE connects_purchases SET status = 'completed' WHERE payment_id = ?`, [payment_id], (err) => {
+            if (err) { db.run('ROLLBACK'); return res.status(500).json({ error: 'DB error updating purchase' }); }
+            db.run('COMMIT', (err) => {
+              if (err) { db.run('ROLLBACK'); return res.status(500).json({ error: 'Failed to commit' }); }
+              res.json({ success: true, new_balance: newConnects, sandbox: sandboxMode });
+            });
           });
         });
       });
@@ -868,20 +866,10 @@ app.get('/api/users/:userId', (req, res) => {
 });
 
 // ─── Update User Balance ──────────────────────────────────────
+// CRIT-002 FIX: Disabled direct balance manipulation.
+// Balances should only change via verified payment flows (/api/connects/buy, /api/connects/initiate+complete, escrow).
 app.post('/api/users/:userId/balance', requireUser, (req, res) => {
-  const { userId } = req.params;
-  const { connects, pi } = req.body;
-  if (req.userId !== userId) return res.status(403).json({ error: 'Can only update your own balance' });
-
-  getUser(userId, (err, user) => {
-    if (err) return res.status(500).json({ error: 'Database error' });
-    const newConnects = connects !== undefined ? connects : (user.balance_connects || 0);
-    const newPi = pi !== undefined ? pi : (user.balance_pi || 0);
-    db.run(`UPDATE users SET balance_connects = ?, balance_pi = ? WHERE id = ?`, [newConnects, newPi, userId], (err) => {
-      if (err) return res.status(500).json({ error: 'Database error' });
-      res.json({ success: true, balance_connects: newConnects, balance_pi: newPi });
-    });
-  });
+  return res.status(403).json({ error: 'Direct balance updates are disabled. Use /api/connects/buy or escrow flows.' });
 });
 
 // ─── Update User Availability ─────────────────────────────────
