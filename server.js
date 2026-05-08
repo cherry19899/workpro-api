@@ -747,8 +747,12 @@ app.post('/api/connects/complete', requireUser, async (req, res) => {
   if (!payment_id) return res.status(400).json({ error: 'Missing payment_id' });
   if (!txid) return res.status(400).json({ error: 'Missing txid' });
 
-  // Only validate txid format in production (with API key)
-  if (!sandboxMode && !isValidTxid(txid)) return res.status(400).json({ error: 'Invalid txid format' });
+  // In sandbox mode, accept any non-empty txid; in production validate hex format
+  if (sandboxMode) {
+    // Sandbox: any non-empty txid is fine
+  } else if (!isValidTxid(txid)) {
+    return res.status(400).json({ error: 'Invalid txid format' });
+  }
 
   try {
     if (!sandboxMode) {
