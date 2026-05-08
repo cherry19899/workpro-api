@@ -334,7 +334,35 @@ db.serialize(() => {
   db.run(`CREATE INDEX IF NOT EXISTS idx_escrow_messages_escrow ON escrow_messages(escrow_id)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_chat_rooms_user1 ON chat_rooms(user1_id)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_chat_rooms_user2 ON chat_rooms(user2_id)`);
+  db.run(`CREATE TABLE IF NOT EXISTS push_subscriptions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    endpoint TEXT NOT NULL UNIQUE,
+    auth TEXT,
+    p256dh TEXT,
+    created_at INTEGER
+  )`);
+
+  // ─── Indexes for performance ──────────────────────────────────
+  db.run(`CREATE INDEX IF NOT EXISTS idx_payments_user ON payments(user_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_jobs_posted_by ON jobs(posted_by)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_jobs_category ON jobs(category)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_applications_job ON applications(job_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_applications_user ON applications(user_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_escrows_job ON escrows(job_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_escrows_client ON escrows(client_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_escrows_freelancer ON escrows(freelancer_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_reviews_target ON reviews(target_name)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_connects_payment ON connects_purchases(payment_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_connects_user ON connects_purchases(user_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_offers_freelancer ON offers(freelancer_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_escrow_messages_escrow ON escrow_messages(escrow_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_chat_rooms_user1 ON chat_rooms(user1_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_chat_rooms_user2 ON chat_rooms(user2_id)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_chat_messages_room ON chat_messages(room_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_push_subscriptions_user ON push_subscriptions(user_id)`);
 });
 
 // ─── Input Validation Helpers ───────────────────────────────────
@@ -902,6 +930,48 @@ app.post('/api/users/:userId/availability', requireUser, (req, res) => {
       if (err) return res.status(500).json({ error: 'Database error' });
       res.json({ success: true, availability });
     });
+  });
+});
+
+// ─── Push Notification Subscriptions ──────────────────────────
+// Store push subscriptions for users (for new job alerts, messages)
+app.post('/api/push/subscribe', requireUser, (req, res) => {
+  const { subscription } = req.body;
+  if (!subscription || !subscription.endpoint) {
+    return res.status(400).json({ error: 'Invalid push subscription' });
+  }
+  db.run(`INSERT INTO push_subscriptions (user_id, endpoint, auth, p256dh, created_at) VALUES (?, ?, ?, ?, ?) 
+    ON CONFLICT(endpoint) DO UPDATE SET user_id = ?, auth = ?, p256dh = ?, created_at = ?`,
+    [req.userId, subscription.endpoint, subscription.keys?.auth || '', subscription.keys?.p256dh || '', Date.now(),
+     req.userId, subscription.keys?.auth || '', subscription.keys?.p256dh || '', Date.now()],
+    (err) => {
+      if (err) { console.error('[DB] Push sub error:', err); return res.status(500).json({ error: 'Database error' }); }
+      res.json({ success: true });
+    }
+  );
+});
+
+app.post('/api/push/unsubscribe', requireUser, (req, res) => {
+  const { endpoint } = req.body;
+  db.run(`DELETE FROM push_subscriptions WHERE endpoint = ? AND user_id = ?`, [endpoint, req.userId], (err) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    res.json({ success: true });
+  });
+});
+
+// ─── Job Expiration ───────────────────────────────────────────
+// Auto-close jobs past their deadline
+app.post('/api/jobs/expire', (req, res) => {
+  // Can be called by cron job or manually by admin
+  const adminSecret = req.headers['x-admin-secret'];
+  const isAdmin = adminSecret && process.env.ADMIN_SECRET && adminSecret === process.env.ADMIN_SECRET;
+  const isCron = req.headers['x-cron-secret'] === process.env.CRON_SECRET;
+  if (!isAdmin && !isCron) return res.status(401).json({ error: 'Unauthorized' });
+
+  const now = new Date().toISOString();
+  db.run(`UPDATE jobs SET status = 'expired' WHERE status = 'open' AND deadline IS NOT NULL AND deadline < ?`, [now], function(err) {
+    if (err) { console.error('[DB] Expire error:', err); return res.status(500).json({ error: 'Database error' }); }
+    res.json({ expired_count: this.changes, timestamp: now });
   });
 });
 
