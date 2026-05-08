@@ -25,6 +25,12 @@ function rateLimit(req, res, next) {
   const isPaymentEndpoint = req.path && (req.path.includes('/payments') || req.path.includes('/connects'));
   const limit = isPaymentEndpoint ? PAYMENT_RATE_LIMIT_MAX : RATE_LIMIT_MAX;
 
+  // HIGH-006 FIX: Cap map size + cleanup old entries
+  const MAX_MAP_SIZE = 10000;
+  if (rateLimitMap.size >= MAX_MAP_SIZE && !rateLimitMap.has(key)) {
+    const firstKey = rateLimitMap.keys().next().value;
+    if (firstKey !== undefined) rateLimitMap.delete(firstKey);
+  }
   // Cleanup old entries (memory leak fix)
   for (const [k, v] of rateLimitMap.entries()) {
     if (now > v.resetTime) rateLimitMap.delete(k);
@@ -446,7 +452,7 @@ app.get('/health', (req, res) => {
 });
 
 // ─── Approve Pi Payment ───────────────────────────────────────
-app.post('/api/payments/:paymentId/approve', async (req, res) => {
+app.post('/api/payments/:paymentId/approve', requireUser, async (req, res) => {
   const { paymentId } = req.params;
 
   if (!PI_API_KEY) {
@@ -492,7 +498,7 @@ app.post('/api/payments/:paymentId/approve', async (req, res) => {
 });
 
 // ─── Complete Pi Payment ──────────────────────────────────────
-app.post('/api/payments/:paymentId/complete', async (req, res) => {
+app.post('/api/payments/:paymentId/complete', requireUser, async (req, res) => {
   const { paymentId } = req.params;
   const { txid } = req.body;
 
@@ -645,7 +651,7 @@ app.post('/api/payments/incomplete', requireUser, async (req, res) => {
 });
 
 // ─── Get Payment Status ───────────────────────────────────────
-app.get('/api/payments/:paymentId', (req, res) => {
+app.get('/api/payments/:paymentId', requireUser, (req, res) => {
   const { paymentId } = req.params;
   db.get(`SELECT * FROM payments WHERE id = ?`, [paymentId], (err, row) => {
     if (err) return res.status(500).json({ error: 'Database error' });
@@ -856,8 +862,12 @@ app.post('/api/connects/complete', requireUser, async (req, res) => {
 });
 
 // ─── Get User Data ────────────────────────────────────────────
-app.get('/api/users/:userId', (req, res) => {
+app.get('/api/users/:userId', requireUser, (req, res) => {
   const { userId } = req.params;
+  // HIGH-004 FIX: Users can only view their own profile
+  if (req.userId !== userId) {
+    return res.status(403).json({ error: 'Access denied. Can only view your own profile.' });
+  }
   getUser(userId, (err, user) => {
     if (err) return res.status(500).json({ error: 'Database error' });
     if (!user) return res.status(404).json({ error: 'User not found' });
@@ -1193,7 +1203,7 @@ app.post('/api/escrows', requireUser, requireBodyUserMatch, (req, res) => {
     if (job.posted_by !== req.userId) return res.status(403).json({ error: 'Only the job owner can create escrow' });
     if (job.status !== 'open') return res.status(400).json({ error: 'Job is not open' });
 
-    const id = 'esc_' + Date.now();
+    const id = 'esc_' + Date.now() + '_' + Math.random().toString(36).substring(2, 10);
     db.run(`INSERT INTO escrows (id, job_id, client_id, freelancer_id, amount) VALUES (?, ?, ?, ?, ?)`,
       [id, job_id, client_id, freelancer_id, amount],
       function(err) {
@@ -1378,7 +1388,7 @@ app.post('/api/reviews', requireUser, requireBodyUserMatch, (req, res) => {
   const safeReviewerName = sanitizeString(reviewer_name, 50) || 'User';
   const safeTargetName = sanitizeString(target_name, 50) || 'User';
   const safeJobTitle = sanitizeString(job_title, 120) || '';
-  const id = 'rev_' + Date.now();
+  const id = 'rev_' + Date.now() + '_' + Math.random().toString(36).substring(2, 10);
   db.run(
     `INSERT INTO reviews (id, reviewer_id, reviewer_name, target_id, target_name, job_id, job_title, rating, text) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [id, reviewer_id, safeReviewerName, target_id, safeTargetName, job_id, safeJobTitle, rating, safeText],
@@ -1518,7 +1528,7 @@ app.get('/api/chat/:roomId/messages', requireUser, (req, res) => {
 app.post('/api/chat/:roomId/messages', requireUser, (req, res) => {
   const { roomId } = req.params;
   // Support both API format (sender_id, sender_name, message) and bundle format (user_id, user_name, text)
-  const sender_id = req.body.sender_id || req.body.user_id;
+  // HIGH-003 FIX: Override sender_id with authenticated user to prevent impersonation
   const sender_name = req.body.sender_name || req.body.user_name;
   const message = req.body.message || req.body.text;
   const safeMessage = sanitizeString(message, 1000);
@@ -1530,7 +1540,8 @@ app.post('/api/chat/:roomId/messages', requireUser, (req, res) => {
 
     db.run(
       `INSERT INTO chat_messages (room_id, sender_id, sender_name, message) VALUES (?, ?, ?, ?)`,
-      [roomId, sender_id || req.userId, sanitizeString(sender_name, 50) || 'User', safeMessage],
+      // sender_id forced to req.userId — prevents impersonation
+      [roomId, req.userId, sanitizeString(sender_name, 50) || 'User', safeMessage],
       function(err) {
         if (err) return res.status(500).json({ error: 'Failed to send message' });
         res.json({ id: this.lastID, success: true });
@@ -1556,7 +1567,7 @@ app.post('/api/chat/start', requireUser, (req, res) => {
       if (err) return res.status(500).json({ error: 'Database error' });
       if (room) return res.json({ room_id: room.id, existing: true });
 
-      const roomId = 'room_' + Date.now();
+      const roomId = 'room_' + Date.now() + '_' + Math.random().toString(36).substring(2, 10);
       db.run(
         `INSERT INTO chat_rooms (id, user1_id, user2_id) VALUES (?, ?, ?)`,
         [roomId, u1, u2],
