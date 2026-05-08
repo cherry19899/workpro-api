@@ -526,7 +526,14 @@ app.get('/health', (req, res) => {
 });
 
 // ─── Approve Pi Payment ───────────────────────────────────────
-app.post('/api/payments/:paymentId/approve', requireUser, async (req, res) => {
+// FIX: Pi.createPayment callback sends user in body, not x-user-id header
+app.post('/api/payments/:paymentId/approve', (req, res, next) => {
+  // Auth from body (Pi SDK callback format: {user: {id, username}, amount, memo})
+  const uid = req.body?.user?.id || req.body?.user_id || req.body?.user?.uid;
+  if (!uid) return res.status(401).json({ error: 'Missing user identification' });
+  req.userId = uid;
+  next();
+}, async (req, res) => {
   const { paymentId } = req.params;
 
   if (!PI_API_KEY) {
@@ -549,8 +556,8 @@ app.post('/api/payments/:paymentId/approve', requireUser, async (req, res) => {
       return res.status(response.status).json({ error: data.error || 'Approval failed', details: data });
     }
 
-    // Save payment record (use Pi API data if available, else body)
-    const uid = data.user_uid || req.body?.user?.uid || req.userId || 'unknown';
+    // Save payment record
+    const uid = data.user_uid || req.userId || 'unknown';
     const username = data.metadata?.user?.username || req.body?.user?.username || 'unknown';
     const amount = data.amount || req.body?.amount || 0;
     const memo = data.memo || req.body?.memo || '';
@@ -572,7 +579,8 @@ app.post('/api/payments/:paymentId/approve', requireUser, async (req, res) => {
 });
 
 // ─── Complete Pi Payment ──────────────────────────────────────
-app.post('/api/payments/:paymentId/complete', requireUser, async (req, res) => {
+// FIX: Pi SDK callback sends only {txid} — no x-user-id. We lookup user_id from DB.
+app.post('/api/payments/:paymentId/complete', async (req, res) => {
   const { paymentId } = req.params;
   const { txid } = req.body;
 
