@@ -433,6 +433,8 @@ app.get('/health', (req, res) => {
       uptime: process.uptime(),
       memory: { rss: mem.rss, heapUsed: mem.heapUsed },
       database: err ? 'error' : 'connected',
+      pi_api_configured: !!PI_API_KEY,
+      admin_configured: !!ADMIN_API_KEY,
       version: require('./package.json').version,
       timestamp: new Date().toISOString(),
     });
