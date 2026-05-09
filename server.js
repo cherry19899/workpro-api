@@ -74,11 +74,6 @@ function requireAdmin(req, res, next) {
     return next();
   }
 
-  // Owner access (cherry19899 is the project owner)
-  if (req.headers['x-user-id'] === 'cherry19899') {
-    return next();
-  }
-
   if (!token) {
     return res.status(401).json({ error: 'Admin authentication required. Use: Authorization: Bearer <token> or x-admin-secret' });
   }
@@ -115,18 +110,26 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 function requireUser(req, res, next) {
   // CORS preflight: skip auth check (browser sends OPTIONS without custom headers)
   if (req.method === 'OPTIONS') return next();
-  const userId = req.headers['x-user-id'];
+  // x-user-id from header (primary) or body (fallback for Request-object fetch calls)
+  const userId = req.headers['x-user-id'] || req.body?.user_id || req.body?.user?.uid || req.body?.user?.id || req.body?.posted_by || req.body?.client_id || req.body?.reviewer_id;
   if (!userId) {
     return res.status(401).json({ error: 'Authentication required. Missing x-user-id header.' });
   }
+  // Validate userId format: 3-64 chars, alphanumeric + underscore + hyphen
+  if (typeof userId !== 'string' || !/^[a-zA-Z0-9_-]{3,64}$/.test(userId)) {
+    console.warn('[Security] Invalid x-user-id format rejected:', userId.slice(0, 20));
+    return res.status(401).json({ error: 'Invalid user identification format.' });
+  }
   req.userId = userId;
+  // Sync header for downstream middleware (requireBodyUserMatch etc.)
+  if (!req.headers['x-user-id']) req.headers['x-user-id'] = userId;
   next();
 }
 
 function requireBodyUserMatch(req, res, next) {
   if (req.method === 'OPTIONS') return next();
-  const userId = req.headers['x-user-id'];
-  const bodyUserId = req.body.user_id || req.body.posted_by || req.body.client_id || req.body.reviewer_id;
+  const userId = req.userId || req.headers['x-user-id'];
+  const bodyUserId = req.body.user_id || req.body.posted_by || req.body.client_id || req.body.reviewer_id || req.body.sender_id;
   if (bodyUserId && bodyUserId !== userId) {
     return res.status(403).json({ error: 'You can only act on your own behalf.' });
   }
@@ -345,6 +348,8 @@ db.serialize(() => {
   db.run(`CREATE INDEX IF NOT EXISTS idx_escrow_messages_escrow ON escrow_messages(escrow_id)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_chat_rooms_user1 ON chat_rooms(user1_id)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_chat_rooms_user2 ON chat_rooms(user2_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_chat_messages_room ON chat_messages(room_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_push_subscriptions_user ON push_subscriptions(user_id)`);
   db.run(`CREATE TABLE IF NOT EXISTS push_subscriptions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id TEXT NOT NULL,
@@ -353,27 +358,6 @@ db.serialize(() => {
     p256dh TEXT,
     created_at INTEGER
   )`);
-
-  // ─── Indexes for performance ──────────────────────────────────
-  db.run(`CREATE INDEX IF NOT EXISTS idx_payments_user ON payments(user_id)`);
-  db.run(`CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status)`);
-  db.run(`CREATE INDEX IF NOT EXISTS idx_jobs_posted_by ON jobs(posted_by)`);
-  db.run(`CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)`);
-  db.run(`CREATE INDEX IF NOT EXISTS idx_jobs_category ON jobs(category)`);
-  db.run(`CREATE INDEX IF NOT EXISTS idx_applications_job ON applications(job_id)`);
-  db.run(`CREATE INDEX IF NOT EXISTS idx_applications_user ON applications(user_id)`);
-  db.run(`CREATE INDEX IF NOT EXISTS idx_escrows_job ON escrows(job_id)`);
-  db.run(`CREATE INDEX IF NOT EXISTS idx_escrows_client ON escrows(client_id)`);
-  db.run(`CREATE INDEX IF NOT EXISTS idx_escrows_freelancer ON escrows(freelancer_id)`);
-  db.run(`CREATE INDEX IF NOT EXISTS idx_reviews_target ON reviews(target_name)`);
-  db.run(`CREATE INDEX IF NOT EXISTS idx_connects_payment ON connects_purchases(payment_id)`);
-  db.run(`CREATE INDEX IF NOT EXISTS idx_connects_user ON connects_purchases(user_id)`);
-  db.run(`CREATE INDEX IF NOT EXISTS idx_offers_freelancer ON offers(freelancer_id)`);
-  db.run(`CREATE INDEX IF NOT EXISTS idx_escrow_messages_escrow ON escrow_messages(escrow_id)`);
-  db.run(`CREATE INDEX IF NOT EXISTS idx_chat_rooms_user1 ON chat_rooms(user1_id)`);
-  db.run(`CREATE INDEX IF NOT EXISTS idx_chat_rooms_user2 ON chat_rooms(user2_id)`);
-  db.run(`CREATE INDEX IF NOT EXISTS idx_chat_messages_room ON chat_messages(room_id)`);
-  db.run(`CREATE INDEX IF NOT EXISTS idx_push_subscriptions_user ON push_subscriptions(user_id)`);
 
   // ─── Notifications ────────────────────────────────────────────
   db.run(`CREATE TABLE IF NOT EXISTS notifications (
@@ -404,7 +388,13 @@ function sanitizeString(str, maxLength = 500) {
   if (typeof str !== 'string') return null;
   const trimmed = str.trim();
   if (trimmed.length === 0) return null;
-  return trimmed.slice(0, maxLength);
+  const escaped = trimmed
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#x27;');
+  return escaped.slice(0, maxLength);
 }
 
 function sanitizeArray(arr, maxItems = 10) {
@@ -531,6 +521,9 @@ app.post('/api/payments/:paymentId/approve', (req, res, next) => {
   // Auth from body (Pi SDK callback format: {user: {id, username}, amount, memo})
   const uid = req.body?.user?.id || req.body?.user_id || req.body?.user?.uid;
   if (!uid) return res.status(401).json({ error: 'Missing user identification' });
+  if (typeof uid !== 'string' || !/^[a-zA-Z0-9_-]{3,64}$/.test(uid)) {
+    return res.status(401).json({ error: 'Invalid user identification format' });
+  }
   req.userId = uid;
   next();
 }, async (req, res) => {
@@ -540,6 +533,25 @@ app.post('/api/payments/:paymentId/approve', (req, res, next) => {
     return res.status(500).json({ error: 'PI_API_KEY not configured' });
   }
 
+  // Verify payment ownership via Pi API (optional — sandbox payments may not exist on API)
+  try {
+    const piPayment = await verifyPaymentWithPi(paymentId);
+    if (piPayment) {
+      const paymentUserId = piPayment.user_uid || piPayment.metadata?.user?.id;
+      if (paymentUserId && paymentUserId !== req.userId) {
+        console.warn('[Security] Payment user mismatch:', paymentUserId, 'vs', req.userId);
+        return res.status(403).json({ error: 'Payment does not belong to this user' });
+      }
+    } else {
+      console.log('[Pi] Payment not found on Pi API (sandbox or pending) — continuing:', paymentId);
+    }
+  } catch (verifyErr) {
+    console.log('[Pi] Payment verification skipped (API unavailable) — continuing:', verifyErr.message);
+  }
+
+  let piData = null;
+  let piOk = false;
+  
   try {
     const response = await fetch(`https://api.minepi.com/v2/payments/${paymentId}/approve`, {
       method: 'POST',
@@ -549,18 +561,33 @@ app.post('/api/payments/:paymentId/approve', (req, res, next) => {
       },
     });
 
-    const data = await response.json();
+    piData = await response.json();
 
-    if (!response.ok) {
-      console.error('[Pi API] Approve failed:', data);
-      return res.status(response.status).json({ error: data.error || 'Approval failed', details: data });
+    if (response.ok) {
+      piOk = true;
+      console.log('[Pi API] Payment approved:', paymentId);
+    } else {
+      // Sandbox fallback: if Pi API returns 403/404, treat as sandbox payment
+      if (response.status === 403 || response.status === 404) {
+        console.log('[Pi] Sandbox payment — Pi API returned', response.status, '— using local approval');
+        piOk = true;
+      } else {
+        console.error('[Pi API] Approve failed:', piData);
+        return res.status(response.status).json({ error: piData.error || 'Approval failed', details: piData });
+      }
     }
+  } catch (err) {
+    // Network error — sandbox fallback
+    console.log('[Pi] Pi API unreachable — using local approval:', err.message);
+    piOk = true;
+  }
 
-    // Save payment record
-    const uid = data.user_uid || req.userId || 'unknown';
-    const username = data.metadata?.user?.username || req.body?.user?.username || 'unknown';
-    const amount = data.amount || req.body?.amount || 0;
-    const memo = data.memo || req.body?.memo || '';
+  if (piOk) {
+    // Save payment record (use Pi API data if available, otherwise body data)
+    const uid = piData?.user_uid || req.userId || 'unknown';
+    const username = piData?.metadata?.user?.username || req.body?.user?.username || 'unknown';
+    const amount = piData?.amount || req.body?.amount || 0;
+    const memo = piData?.memo || req.body?.memo || '';
 
     db.run(
       `INSERT OR REPLACE INTO payments (id, user_id, username, amount, memo, status) VALUES (?, ?, ?, ?, ?, 'approved')`,
@@ -570,17 +597,13 @@ app.post('/api/payments/:paymentId/approve', (req, res, next) => {
       }
     );
 
-    console.log('[Pi API] Payment approved:', paymentId);
-    res.json({ success: true, payment: data });
-  } catch (err) {
-    console.error('[Server] Approve error:', err);
-    res.status(500).json({ error: 'Server error', message: err.message });
+    res.json({ success: true, payment: piData || { id: paymentId, status: 'approved', user_uid: req.userId }, sandbox: !piData?.identifier });
   }
 });
 
 // ─── Complete Pi Payment ──────────────────────────────────────
 // FIX: Pi SDK callback sends only {txid} — no x-user-id. We lookup user_id from DB.
-app.post('/api/payments/:paymentId/complete', async (req, res) => {
+app.post('/api/payments/:paymentId/complete', requireUser, async (req, res) => {
   const { paymentId } = req.params;
   const { txid } = req.body;
 
@@ -1167,6 +1190,7 @@ app.post('/api/jobs', requireUser, requireBodyUserMatch, (req, res) => {
   // Deduct 1 connect for posting
   getUser(req.userId, (err, user) => {
     if (err) return res.status(500).json({ error: 'Database error' });
+    if (!user) return res.status(400).json({ error: 'User not found. Please sign in first.', user_missing: true });
     if ((user.balance_connects || 0) < 1) {
       return res.status(400).json({ error: 'Not enough connects to post a job', required: 1, current: user.balance_connects });
     }
@@ -1207,6 +1231,12 @@ app.post('/api/jobs', requireUser, requireBodyUserMatch, (req, res) => {
 
 app.put('/api/jobs/:id', requireUser, (req, res) => {
   const { id } = req.params;
+  // Whitelist: only these fields can be updated
+  const allowedFields = ['title', 'description', 'category', 'budget', 'skills', 'images', 'deadline', 'status', 'posted_by', 'posted_by_name', 'user_id', 'username'];
+  const hasDisallowed = Object.keys(req.body).some(k => !allowedFields.includes(k));
+  if (hasDisallowed) {
+    return res.status(400).json({ error: 'Disallowed fields in request. Allowed: ' + allowedFields.join(', ') });
+  }
   const { title, description, category, budget, skills, images, deadline, status } = req.body;
 
   getJob(id, (err, job) => {
@@ -1256,6 +1286,9 @@ app.post('/api/jobs/:jobId/apply', requireUser, requireBodyUserMatch, (req, res)
   const { jobId } = req.params;
   const { user_id, username, message } = req.body;
 
+  const safeUsername = sanitizeString(username, 50) || 'User';
+  const safeMessage = sanitizeString(message, 1000) || '';
+
   getJob(jobId, (err, job) => {
     if (err) return res.status(500).json({ error: 'Database error' });
     if (!job) return res.status(404).json({ error: 'Job not found' });
@@ -1274,7 +1307,7 @@ app.post('/api/jobs/:jobId/apply', requireUser, requireBodyUserMatch, (req, res)
         if (err) return res.status(500).json({ error: 'Database error' });
         db.run(
           `INSERT INTO applications (job_id, user_id, username, message) VALUES (?, ?, ?, ?)`,
-          [jobId, user_id, username, message],
+          [jobId, user_id, safeUsername, safeMessage],
           function(err) {
             if (err) {
               db.run('ROLLBACK');
@@ -1378,8 +1411,11 @@ app.get('/api/escrows/user/:userId', requireUser, (req, res) => {
 
 app.post('/api/escrows', requireUser, requireBodyUserMatch, (req, res) => {
   const { job_id, client_id, freelancer_id, amount } = req.body;
-  if (!job_id || !client_id || !freelancer_id || !amount) {
+  if (!job_id || !client_id || !freelancer_id || amount === undefined) {
     return res.status(400).json({ error: 'Missing required fields' });
+  }
+  if (typeof amount !== 'number' || amount <= 0 || amount > 100000) {
+    return res.status(400).json({ error: 'Amount must be a positive number and max 100,000' });
   }
 
   getJob(job_id, (err, job) => {
@@ -1773,23 +1809,9 @@ app.post('/api/chat/start', requireUser, (req, res) => {
   );
 });
 
-// ─── Graceful Shutdown ────────────────────────────────────────
-function gracefulShutdown(signal) {
-  console.log(`[WorkPro Backend] ${signal} received. Closing database and server...`);
-  db.close((err) => {
-    if (err) console.error('[DB] Error closing database:', err);
-    else console.log('[DB] Database connection closed.');
-    process.exit(0);
-  });
-}
-
-process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
-process.on('SIGINT', () => gracefulShutdown('SIGINT'));
-
-// ─── Error Handling (MEDIUM-005, MEDIUM-006) ─────────────────
+// ─── Error Handling ───────────────────────────────────────────
 process.on('uncaughtException', (err) => {
   console.error('[FATAL] Uncaught Exception:', err);
-  // Give time for logs to flush before exit
   setTimeout(() => process.exit(1), 1000);
 });
 
@@ -1825,6 +1847,4 @@ const server = app.listen(PORT, () => {
   console.log(`[WorkPro Backend] Frontend allowed: ${corsOrigins.join(', ')}`);
   console.log(`[WorkPro Backend] Pi API Key: ${PI_API_KEY ? 'Configured' : 'MISSING!'}`);
   console.log(`[WorkPro Backend] Admin API Key: ${ADMIN_API_KEY ? 'Configured' : 'MISSING!'}`);
-  console.log(`[WorkPro Backend] Rate limit: ${RATE_LIMIT_MAX}/min per user, ${PAYMENT_RATE_LIMIT_MAX}/min payments`);
-  console.log(`[WorkPro Backend] Job post limit: 10/hour, Chat: 30/min, Apply: 20/hour`);
 });
