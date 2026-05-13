@@ -1626,6 +1626,27 @@ app.get('/api/categories', (req, res) => {
  */
 app.post('/api/payments/:paymentId/approve', async (req, res) => {
   const { paymentId } = req.params;
+
+  // Check if this is a sandbox payment (exists in connects_purchases)
+  const sandboxPurchase = await new Promise((resolve) => {
+    db.get(`SELECT * FROM connects_purchases WHERE payment_id = ?`, [paymentId], (err, row) => {
+      resolve(err ? null : row);
+    });
+  });
+
+  if (sandboxPurchase) {
+    // Sandbox mode: update local status without calling Pi API
+    db.run(`UPDATE connects_purchases SET status = 'approved' WHERE payment_id = ?`, [paymentId], (err) => {
+      if (err) console.error('[DB] Error updating sandbox purchase:', err);
+    });
+    db.run(
+      `INSERT OR REPLACE INTO payments (id, user_id, username, amount, memo, status) VALUES (?, ?, ?, ?, ?, 'approved')`,
+      [paymentId, sandboxPurchase.user_id, 'sandbox_user', sandboxPurchase.pi_amount || 0, 'Sandbox connects purchase'],
+      (err) => { if (err) console.error('[DB] Error saving payment:', err); }
+    );
+    return res.json({ success: true, payment: { id: paymentId, status: 'approved', sandbox: true } });
+  }
+
   if (!PI_API_KEY) return res.status(500).json({ error: 'PI_API_KEY not configured' });
 
   try {
