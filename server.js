@@ -1733,9 +1733,8 @@ app.post('/api/payments/:paymentId/complete', async (req, res) => {
  * POST /api/payments/:paymentId/cancelled - Cancel payment
  */
 app.post('/api/payments/:paymentId/cancelled', async (req, res) => {
-  const userId = req.headers['x-user-id'];
-  if (!userId) return res.status(401).json({ error: 'Authentication required' });
   const { paymentId } = req.params;
+  const userId = req.headers['x-user-id'] || req.body?.user_id || 'unknown';
 
   if (PI_API_KEY) {
     try {
