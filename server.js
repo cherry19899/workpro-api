@@ -610,7 +610,8 @@ app.get('/api/me', async (req, res) => {
   db.get(`SELECT * FROM users WHERE id = ?`, [userId], (err, user) => {
     if (err) return res.status(500).json({ error: 'Database error' });
     if (!user) return res.status(404).json({ error: 'User not found' });
-    res.json({ success: true, user });
+    const isAdmin = user.role === 'admin' || user.username === 'cherry19899' || user.username === 'admin';
+    res.json({ success: true, user: { ...user, is_admin: isAdmin } });
   });
 });
 
@@ -2000,6 +2001,23 @@ app.get('/api/admin/jobs/all', requireAdmin, (req, res) => {
     if (err) return res.status(500).json({ error: 'Database error' });
     res.json(rows);
   });
+});
+
+/**
+ * POST /api/admin/deploy - Trigger Render deploy hook
+ */
+app.post('/api/admin/deploy', requireAdmin, async (req, res) => {
+  try {
+    const response = await fetch('https://api.render.com/deploy/srv-d7qvgf7lk1mc73cri1ng?key=X88S-SyFKag', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    });
+    const data = await response.json();
+    res.json({ success: true, deploy: data });
+  } catch (err) {
+    console.error('[Admin] Deploy error:', err);
+    res.status(500).json({ error: 'Deploy failed', message: err.message });
+  }
 });
 
 app.get('/api/admin/earnings', requireAdmin, (req, res) => {
