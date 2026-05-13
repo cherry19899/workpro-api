@@ -1012,7 +1012,7 @@ app.post('/api/applications/:id/accept', async (req, res) => {
 
         db.run(`UPDATE jobs SET status = 'in_progress' WHERE id = ?`, [row.job_id]);
 
-        const roomId = 'job_' + row.job_id + '_' + row.job_owner + '_' + row.user_id;
+        const roomId = 'job_' + row.job_id + '_' + row.job_owner + '_' + row.user_id + '_' + Date.now();
         const now = new Date().toISOString();
         db.run(
           `INSERT OR IGNORE INTO chat_rooms (id, job_id, user1_id, user2_id, created_at) VALUES (?, ?, ?, ?, ?)`,
