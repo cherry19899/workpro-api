@@ -1,21 +1,23 @@
 {
   "name": "workpro-backend",
-  "version": "1.1.0",
-  "description": "Work Pro Backend API for Pi Network Freelance Marketplace",
+  "version": "2.0.0",
+  "description": "Work Pro - Pi Network Freelance Marketplace Backend",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node server.js",
-    "lint": "node --check server.js"
+    "dev": "nodemon server.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
-    "dotenv": "^16.4.5",
-    "express": "^4.19.2",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
     "node-fetch": "^2.7.0",
-    "sqlite3": "^5.1.7"
+    "sqlite3": "^5.1.6"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=16.0.0"
   }
 }
