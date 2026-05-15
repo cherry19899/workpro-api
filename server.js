@@ -28,17 +28,23 @@ const NODE_ENV = process.env.NODE_ENV || 'production';
 const rateLimitMap = new Map();
 const RATE_LIMIT_WINDOW = 60 * 1000;
 const RATE_LIMIT_MAX = 100;
-const PAYMENT_RATE_LIMIT_MAX = 10;
+const PAYMENT_RATE_LIMIT_MAX = 30; // increased for sandbox testing
 
-function rateLimit(req, res, next) {
-  const key = req.ip || 'unknown';
+// Cleanup old entries every 5 minutes
+setInterval(() => {
   const now = Date.now();
-  const isPaymentEndpoint = req.path && (req.path.includes('/payments') || req.path.includes('/connects'));
-  const limit = isPaymentEndpoint ? PAYMENT_RATE_LIMIT_MAX : RATE_LIMIT_MAX;
-
   for (const [k, v] of rateLimitMap.entries()) {
     if (now > v.resetTime) rateLimitMap.delete(k);
   }
+}, 5 * 60 * 1000);
+
+function rateLimit(req, res, next) {
+  // Use x-forwarded-for for Render proxy, fallback to connection remoteAddress
+  const forwarded = req.headers['x-forwarded-for'];
+  const key = (forwarded ? forwarded.split(',')[0].trim() : null) || req.connection?.remoteAddress || req.ip || 'unknown';
+  const now = Date.now();
+  const isPaymentEndpoint = req.path && (req.path.includes('/payments') || req.path.includes('/connects'));
+  const limit = isPaymentEndpoint ? PAYMENT_RATE_LIMIT_MAX : RATE_LIMIT_MAX;
 
   const entry = rateLimitMap.get(key) || { count: 0, resetTime: now + RATE_LIMIT_WINDOW };
   if (now > entry.resetTime) {
@@ -88,6 +94,10 @@ if (!fs.existsSync(dbDir)) {
 }
 
 const db = new sqlite3.Database(dbPath);
+// NOTE: db.serialize() REMOVED — it serializes ALL operations causing massive
+// bottlenecks under concurrent load. WAL mode + busy_timeout handles concurrency.
+db.run('PRAGMA busy_timeout = 15000'); // 15s wait before returning BUSY
+db.run('PRAGMA journal_mode = WAL'); // Write-Ahead Logging for better concurrency
 
 // ─── ALL CREATE TABLE STATEMENTS (from schema.sql) ──────────────
 const SCHEMA_SQL = `
@@ -536,7 +546,7 @@ function updateUserBalance(userId, connectsDelta, piDelta, callback) {
 }
 
 function getJob(jobId, callback) {
-  db.get(`SELECT * FROM jobs WHERE id = ?`, [jobId], (err, row) => {
+  db.get(`SELECT j.*, (SELECT COUNT(*) FROM applications WHERE job_id = j.id) as applications_count FROM jobs j WHERE j.id = ?`, [jobId], (err, row) => {
     if (err) return callback(err, null);
     if (row) {
       if (row.images) try { row.images = JSON.parse(row.images); } catch(e) {}
@@ -575,7 +585,7 @@ app.get('/health', (req, res) => {
       uptime: process.uptime(),
       memory: { rss: mem.rss, heapUsed: mem.heapUsed },
       database: err ? 'error' : 'connected',
-      version: '2.0.0',
+      version: '2.0.7 (v117)',
       timestamp: new Date().toISOString(),
     });
   });
@@ -616,7 +626,7 @@ app.get('/api/me', async (req, res) => {
   db.get(`SELECT * FROM users WHERE id = ?`, [userId], (err, user) => {
     if (err) return res.status(500).json({ error: 'Database error' });
     if (!user) return res.status(404).json({ error: 'User not found' });
-    const isAdmin = user.role === 'admin' || user.username === 'cherry19899' || user.username === 'admin';
+    const isAdmin = user.role === 'admin' || user.id === 'cherry19899' || (user.username && user.username.toLowerCase() === 'cherry19899') || user.username === 'admin';
     res.json({ success: true, user: { ...user, is_admin: isAdmin } });
   });
 });
@@ -630,8 +640,10 @@ app.get('/api/me', async (req, res) => {
  * Query: ?category=&q=&page=&limit=
  */
 app.get('/api/jobs', (req, res) => {
-  const { category, q, page = 1, limit = 20 } = req.query;
-  let whereSql = `WHERE status = 'open'`;
+  const { category, q, page = 1, limit = 20, all, min_budget, max_budget, sort } = req.query;
+  // If ?all=1 is passed, show all statuses (for admin/management)
+  // Otherwise default to 'open' for public job feed
+  let whereSql = (all === '1') ? `WHERE 1=1` : `WHERE status = 'open'`;
   let whereParams = [];
   let countParams = [];
 
@@ -646,21 +658,42 @@ app.get('/api/jobs', (req, res) => {
     whereParams.push(`%${safeSearch}%`, `%${safeSearch}%`);
     countParams.push(`%${safeSearch}%`, `%${safeSearch}%`);
   }
+  if (min_budget) {
+    whereSql += ` AND budget >= ?`;
+    whereParams.push(parseInt(min_budget));
+    countParams.push(parseInt(min_budget));
+  }
+  if (max_budget) {
+    whereSql += ` AND budget <= ?`;
+    whereParams.push(parseInt(max_budget));
+    countParams.push(parseInt(max_budget));
+  }
 
   const pageInt = Math.max(1, parseInt(page) || 1);
   const limitInt = Math.min(100, Math.max(1, parseInt(limit) || 20));
   const offset = (pageInt - 1) * limitInt;
+
+  // Sort order
+  let orderBy = 'created_at DESC';
+  if (sort === 'budget_asc') orderBy = 'budget ASC';
+  else if (sort === 'budget_desc') orderBy = 'budget DESC';
+  else if (sort === 'oldest') orderBy = 'created_at ASC';
 
   db.get(`SELECT COUNT(*) as total FROM jobs ${whereSql}`, countParams, (err, countRow) => {
     if (err) return res.status(500).json({ error: 'Database error' });
     const total = countRow ? countRow.total : 0;
     const totalPages = Math.ceil(total / limitInt);
 
-    const sql = `SELECT * FROM jobs ${whereSql} ORDER BY created_at DESC LIMIT ? OFFSET ?`;
+    const sql = `SELECT j.*, 
+                   (SELECT COUNT(*) FROM applications WHERE job_id = j.id) as applications_count 
+                 FROM jobs j 
+                 ${whereSql} 
+                 ORDER BY ${orderBy} 
+                 LIMIT ? OFFSET ?`;
     const params = [...whereParams, limitInt, offset];
 
     db.all(sql, params, (err, rows) => {
-      if (err) return res.status(500).json({ error: 'Database error' });
+      if (err) return res.status(500).json({ error: 'Database error', details: err.message });
       rows.forEach(row => {
         if (row.images) try { row.images = JSON.parse(row.images); } catch(e) {}
         row.apply_cost = Math.ceil((row.budget || 0) / 50) || 1;
@@ -700,13 +733,29 @@ app.get('/api/jobs/me', async (req, res) => {
   const userId = req.headers['x-user-id'];
   if (!userId) return res.status(401).json({ error: 'Authentication required' });
 
-  db.all(`SELECT * FROM jobs WHERE posted_by = ? ORDER BY created_at DESC`, [userId], (err, rows) => {
+  const page = parseInt(req.query.page) || 1;
+  const limit = Math.min(parseInt(req.query.limit) || 20, 100);
+  const offset = (page - 1) * limit;
+
+  db.get(`SELECT COUNT(*) as total FROM jobs WHERE posted_by = ?`, [userId], (err, countRow) => {
     if (err) return res.status(500).json({ error: 'Database error' });
-    rows.forEach(row => {
-      if (row.images) try { row.images = JSON.parse(row.images); } catch(e) {}
-      row.apply_cost = Math.ceil((row.budget || 0) / 50) || 1;
+    const total = countRow ? countRow.total : 0;
+
+    db.all(`SELECT * FROM jobs WHERE posted_by = ? ORDER BY created_at DESC LIMIT ? OFFSET ?`, 
+      [userId, limit, offset], (err, rows) => {
+      if (err) return res.status(500).json({ error: 'Database error' });
+      rows.forEach(row => {
+        if (row.images) try { row.images = JSON.parse(row.images); } catch(e) {}
+        row.apply_cost = Math.ceil((row.budget || 0) / 50) || 1;
+      });
+      res.json({ 
+        jobs: rows, 
+        total: total, 
+        page: page, 
+        limit: limit, 
+        total_pages: Math.ceil(total / limit) 
+      });
     });
-    res.json({ jobs: rows });
   });
 });
 
@@ -718,6 +767,80 @@ app.get('/api/jobs/:id', (req, res) => {
     if (err) return res.status(500).json({ error: 'Database error' });
     if (!row) return res.status(404).json({ error: 'Job not found' });
     res.json(row);
+  });
+});
+
+/**
+ * POST /api/jobs/:id/apply - Apply to a job (deducts 1 connect)
+ */
+app.post('/api/jobs/:id/apply', async (req, res) => {
+  const userId = req.headers['x-user-id'];
+  const piToken = req.headers['x-pi-token'];
+  const job_id = req.params.id;
+  if (!userId) return res.status(401).json({ error: 'Authentication required' });
+
+  if (piToken && PI_API_KEY) {
+    const result = await verifyAccessTokenWithPi(piToken);
+    if (!result.valid) return res.status(401).json({ error: 'Invalid token' });
+    if (result.uid !== userId) return res.status(403).json({ error: 'User ID mismatch' });
+  }
+
+  const { message, username } = req.body;
+
+  db.get(`SELECT * FROM jobs WHERE id = ? AND status = 'open'`, [job_id], (err, job) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    if (!job) return res.status(404).json({ error: 'Job not found or not open' });
+    if (job.posted_by === userId) return res.status(403).json({ error: 'Cannot apply to your own job' });
+
+    // Check if already applied
+    db.get(`SELECT * FROM applications WHERE job_id = ? AND user_id = ?`, [job_id, userId], (err, existing) => {
+      if (err) return res.status(500).json({ error: 'Database error' });
+      if (existing) return res.status(409).json({ error: 'Already applied to this job' });
+
+      getUser(userId, (err, user) => {
+        if (err) return res.status(500).json({ error: 'Database error' });
+        if (!user) return res.status(404).json({ error: 'User not found' });
+        if ((user.balance_connects || 0) < 1) {
+          return res.status(400).json({ error: 'Not enough connects to apply', required: 1, current: user.balance_connects || 0 });
+        }
+
+        const safeMessage = sanitizeString(message, 2000) || '';
+        const safeBid = job.budget || 0;
+        const newConnects = (user.balance_connects || 0) - 1;
+        const applicantName = username || user.username || 'User';
+
+        db.run(`UPDATE users SET balance_connects = ? WHERE id = ?`, [newConnects, userId], (err) => {
+          if (err) console.warn('[DB] Connect deduction warning:', err.message);
+
+          db.run(
+            `INSERT INTO applications (job_id, user_id, username, message, bid_amount, status) VALUES (?, ?, ?, ?, ?, 'pending')`,
+            [job_id, userId, applicantName, safeMessage, safeBid],
+            function(err) {
+              if (err) return res.status(500).json({ error: 'Failed to create application' });
+
+              // Increment application count on job
+              db.run(`UPDATE jobs SET applications = applications + 1 WHERE id = ?`, [job_id]);
+
+              // Notify job owner
+              createNotification(job.posted_by, 'application', 'New Application', `${applicantName} applied to "${job.title}"`, String(this.lastID), 'application');
+
+              res.json({
+                success: true,
+                id: this.lastID,
+                job_id,
+                user_id: userId,
+                status: 'pending',
+                message: safeMessage,
+                bid_amount: safeBid,
+                connects_deducted: 1,
+                remaining_connects: newConnects,
+                created_at: new Date().toISOString()
+              });
+            }
+          );
+        });
+      });
+    });
   });
 });
 
@@ -1017,20 +1140,30 @@ app.post('/api/applications/:id/accept', async (req, res) => {
       db.run(`UPDATE applications SET status = 'accepted' WHERE id = ?`, [id], function(err) {
         if (err) return res.status(500).json({ error: 'Failed to accept' });
 
-        db.run(`UPDATE jobs SET status = 'in_progress' WHERE id = ?`, [row.job_id]);
+        db.run(`UPDATE jobs SET status = 'in_progress' WHERE id = ?`, [row.job_id], function(err) {
+          if (err) console.warn('[DB] Job status update warning:', err.message);
 
-        const roomId = 'job_' + row.job_id + '_' + row.job_owner + '_' + row.user_id + '_' + Date.now();
-        const now = new Date().toISOString();
-        db.run(
-          `INSERT OR IGNORE INTO chat_rooms (id, job_id, user1_id, user2_id, created_at) VALUES (?, ?, ?, ?, ?)`,
-          [roomId, row.job_id, row.job_owner, row.user_id, now],
-          (err) => { if (err) console.warn('[DB] Chat room creation warning:', err.message); }
-        );
+          const roomId = 'job_' + row.job_id + '_' + row.job_owner + '_' + row.user_id + '_' + Date.now();
+          const now = new Date().toISOString();
+          // NOTE: production DB chat_rooms table may not have job_id column (older schema)
+          // Use INSERT without job_id for compatibility
+          db.run(
+            `INSERT INTO chat_rooms (id, user1_id, user2_id, created_at) VALUES (?, ?, ?, ?)`,
+            [roomId, row.job_owner, row.user_id, now],
+            function(err) {
+              if (err) {
+                console.error('[DB] Chat room creation ERROR:', err.message);
+                return res.json({ success: true, status: 'accepted', chat_room_id: null, job_status: 'in_progress', warning: 'Chat room creation failed: ' + err.message });
+              }
+              console.log('[DB] Chat room created:', roomId);
 
-        // Notify freelancer
-        createNotification(row.user_id, 'application_accepted', 'Application Accepted', `Your application was accepted! Chat room created.`, row.job_id, 'job');
+              // Notify freelancer
+              createNotification(row.user_id, 'application_accepted', 'Application Accepted', `Your application was accepted! Chat room created.`, row.job_id, 'job');
 
-        res.json({ success: true, status: 'accepted', chat_room_id: roomId, job_status: 'in_progress' });
+              res.json({ success: true, status: 'accepted', chat_room_id: roomId, job_status: 'in_progress' });
+            }
+          );
+        });
       });
     }
   );
@@ -1062,6 +1195,48 @@ app.post('/api/applications/:id/reject', async (req, res) => {
   );
 });
 
+/**
+ * GET /api/applications/me - Get my applications (as freelancer)
+ */
+app.get('/api/applications/me', async (req, res) => {
+  const userId = req.headers['x-user-id'];
+  if (!userId) return res.status(401).json({ error: 'Authentication required' });
+
+  const page = parseInt(req.query.page) || 1;
+  const limit = Math.min(parseInt(req.query.limit) || 20, 100); // max 100
+  const offset = (page - 1) * limit;
+
+  try {
+    db.get(`SELECT COUNT(*) as total FROM applications WHERE user_id = ?`, [userId], (err, countRow) => {
+      if (err) return res.status(500).json({ error: 'Database error' });
+      const total = countRow ? countRow.total : 0;
+
+      db.all(
+        `SELECT a.*, j.title as job_title, j.status as job_status, j.budget, j.posted_by_name, j.category
+         FROM applications a
+         JOIN jobs j ON a.job_id = j.id
+         WHERE a.user_id = ?
+         ORDER BY a.created_at DESC
+         LIMIT ? OFFSET ?`,
+        [userId, limit, offset],
+        (err, rows) => {
+          if (err) return res.status(500).json({ error: 'Database error' });
+          res.json({
+            applications: rows || [],
+            total: total,
+            page: page,
+            limit: limit,
+            total_pages: Math.ceil(total / limit)
+          });
+        }
+      );
+    });
+  } catch (err) {
+    console.error('[Applications/Me] Error:', err);
+    res.status(500).json({ error: 'Failed to fetch applications' });
+  }
+});
+
 // ════════════════════════════════════════════════════════════════
 //  CHAT
 // ════════════════════════════════════════════════════════════════
@@ -1087,12 +1262,18 @@ app.get('/api/chat/rooms', async (req, res) => {
 
 /**
  * GET /api/chat/:roomId/messages - Get messages for a room
+ * Query params:
+ *   since — ISO timestamp to get only messages after this time (for real-time polling)
+ *   limit — max messages (default 200, max 500)
  */
 app.get('/api/chat/:roomId/messages', async (req, res) => {
   const userId = req.headers['x-user-id'];
   if (!userId) return res.status(401).json({ error: 'Authentication required' });
 
   const { roomId } = req.params;
+  const since = req.query.since; // ISO timestamp for real-time polling
+  const limit = Math.min(parseInt(req.query.limit) || 200, 500);
+
   db.get(
     `SELECT * FROM chat_rooms WHERE id = ? AND (user1_id = ? OR user2_id = ?)`,
     [roomId, userId, userId],
@@ -1100,14 +1281,21 @@ app.get('/api/chat/:roomId/messages', async (req, res) => {
       if (err) return res.status(500).json({ error: 'Database error' });
       if (!room) return res.status(403).json({ error: 'Access denied to this chat room' });
 
-      db.all(
-        `SELECT * FROM chat_messages WHERE room_id = ? ORDER BY created_at ASC LIMIT 200`,
-        [roomId],
-        (err, rows) => {
-          if (err) return res.status(500).json({ error: 'Database error' });
-          res.json(rows || []);
-        }
-      );
+      let sql = `SELECT * FROM chat_messages WHERE room_id = ?`;
+      let params = [roomId];
+
+      if (since) {
+        sql += ` AND created_at > ?`;
+        params.push(since);
+      }
+
+      sql += ` ORDER BY created_at ASC LIMIT ?`;
+      params.push(limit);
+
+      db.all(sql, params, (err, rows) => {
+        if (err) return res.status(500).json({ error: 'Database error' });
+        res.json(rows || []);
+      });
     }
   );
 });
@@ -1316,8 +1504,37 @@ app.post('/api/escrows', async (req, res) => {
       [id, job_id, client_id, freelancer_id, amount],
       function(err) {
         if (err) return res.status(500).json({ error: 'Failed to create escrow' });
-        db.run(`UPDATE jobs SET status = 'in_progress' WHERE id = ?`, [job_id]);
-        res.json({ id, success: true, status: 'pending' });
+        db.run(`UPDATE jobs SET status = 'in_progress' WHERE id = ?`, [job_id], function(err) {
+          if (err) console.warn('[DB] Job status update warning:', err.message);
+          res.json({ id, success: true, status: 'pending' });
+        });
+      }
+    );
+  });
+});
+
+/**
+ * GET /api/escrows/me - Get my escrows (convenience alias)
+ * NOTE: Must be BEFORE /api/escrows/:id to avoid 'me' being treated as id
+ */
+app.get('/api/escrows/me', async (req, res) => {
+  const userId = req.headers['x-user-id'];
+  if (!userId) return res.status(401).json({ error: 'Authentication required' });
+
+  const page = parseInt(req.query.page) || 1;
+  const limit = Math.min(parseInt(req.query.limit) || 20, 100); // max 100
+  const offset = (page - 1) * limit;
+
+  db.get(`SELECT COUNT(*) as total FROM escrows WHERE client_id = ? OR freelancer_id = ?`, [userId, userId], (err, countRow) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    const total = countRow ? countRow.total : 0;
+
+    db.all(
+      `SELECT * FROM escrows WHERE client_id = ? OR freelancer_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?`,
+      [userId, userId, limit, offset],
+      (err, rows) => {
+        if (err) return res.status(500).json({ error: 'Database error' });
+        res.json({ escrows: rows || [], total, page, limit, total_pages: Math.ceil(total / limit) });
       }
     );
   });
@@ -1543,7 +1760,18 @@ app.put('/api/users/:id', async (req, res) => {
   if (username !== undefined) { updates.push('username = ?'); values.push(sanitizeString(username, 50)); }
   if (role !== undefined && ['freelancer', 'client', 'admin'].includes(role)) { updates.push('role = ?'); values.push(role); }
   if (bio !== undefined) { updates.push('bio = ?'); values.push(sanitizeString(bio, 2000)); }
-  if (skills !== undefined) { updates.push('skills = ?'); values.push(skills ? JSON.stringify(sanitizeArray(skills)) : null); }
+  if (skills !== undefined) {
+    let safeSkills = null;
+    if (skills) {
+      if (Array.isArray(skills)) {
+        safeSkills = JSON.stringify(sanitizeArray(skills));
+      } else if (typeof skills === 'string') {
+        // Accept comma-separated string like "js,react,node"
+        safeSkills = JSON.stringify(skills.split(',').map(s => s.trim()).filter(Boolean));
+      }
+    }
+    updates.push('skills = ?'); values.push(safeSkills);
+  }
   if (availability !== undefined && ['available', 'busy'].includes(availability)) { updates.push('availability = ?'); values.push(availability); }
 
   if (updates.length === 0) return res.status(400).json({ error: 'No valid fields to update' });
@@ -2009,6 +2237,38 @@ app.get('/api/admin/jobs/all', requireAdmin, (req, res) => {
 });
 
 /**
+ * GET /api/admin/backup - Export database as JSON
+ */
+app.get('/api/admin/backup', requireAdmin, async (req, res) => {
+  try {
+    const tables = ['users', 'jobs', 'applications', 'chat_rooms', 'chat_messages', 'escrows', 'notifications', 'payments', 'reviews', 'categories'];
+    const backup = {};
+
+    for (const table of tables) {
+      const rows = await new Promise((resolve, reject) => {
+        db.all(`SELECT * FROM ${table}`, [], (err, rows) => {
+          if (err) resolve([]);
+          else resolve(rows || []);
+        });
+      });
+      backup[table] = rows;
+    }
+
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Disposition', `attachment; filename="workpro-backup-${timestamp}.json"`);
+    res.json({
+      exported_at: new Date().toISOString(),
+      version: '2.0.7 (v117)',
+      tables: backup
+    });
+  } catch (err) {
+    console.error('[Admin] Backup error:', err);
+    res.status(500).json({ error: 'Backup failed', message: err.message });
+  }
+});
+
+/**
  * POST /api/admin/deploy - Trigger Render deploy hook
  */
 app.post('/api/admin/deploy', requireAdmin, async (req, res) => {
@@ -2017,8 +2277,11 @@ app.post('/api/admin/deploy', requireAdmin, async (req, res) => {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
     });
-    const data = await response.json();
-    res.json({ success: true, deploy: data });
+    // Render may return plain text or JSON
+    const text = await response.text();
+    let data;
+    try { data = JSON.parse(text); } catch (e) { data = { raw: text }; }
+    res.json({ success: true, status: response.status, deploy: data });
   } catch (err) {
     console.error('[Admin] Deploy error:', err);
     res.status(500).json({ error: 'Deploy failed', message: err.message });
