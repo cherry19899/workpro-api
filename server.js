@@ -85,6 +85,14 @@ app.use((req, res, next) => {
   next();
 });
 
+// ─── Static Assets (CORS-enabled for GitHub Pages) ─────────────
+app.use('/assets', (req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+  res.setHeader('Cache-Control', 'public, max-age=300');
+  next();
+}, express.static(path.join(__dirname, 'assets')));
+
 // ─── SQLite Database ────────────────────────────────────────────
 const dbPath = process.env.DB_PATH || '/var/data/workpro.db';
 const dbDir = path.dirname(dbPath);
@@ -585,7 +593,7 @@ const FRONTEND_HTML = `<!DOCTYPE html>
     <link rel="apple-touch-icon" href="/vite.svg?v=95" />
     <link rel="manifest" href="/manifest.json?v=95" />
     <title>Work Pro</title>
-    <script>window.WORKPRO_VERSION='v148';window.__piSandbox=true;</script>
+    <script>window.WORKPRO_VERSION='v149';window.__piSandbox=true;</script>
     <script src="https://sdk.minepi.com/pi-sdk.js"></script>
     <script>
       (function(){
@@ -640,7 +648,7 @@ app.get('/health', (req, res) => {
       uptime: process.uptime(),
       memory: { rss: mem.rss, heapUsed: mem.heapUsed },
       database: err ? 'error' : 'connected',
-      version: '2.2.2 (v146)',
+      version: '2.2.3 (v149)',
       timestamp: new Date().toISOString(),
     });
   });
