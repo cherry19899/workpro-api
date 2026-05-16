@@ -572,9 +572,45 @@ if (!PI_API_KEY) {
 //  ENDPOINTS
 // ════════════════════════════════════════════════════════════════
 
-// ─── Health Check ───────────────────────────────────────────────
+// ─── Frontend HTML (served from same domain to avoid CDN issues) ──
+// Inline bundle + CSS — no external dependencies, no CORS, no CDN cache issues
+const FRONTEND_HTML = `<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg?v=95" />
+    <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no" />
+    <meta name="theme-color" content="#000000" />
+    <meta name="description" content="Hire and work in Pi cryptocurrency" />
+    <link rel="apple-touch-icon" href="/vite.svg?v=95" />
+    <link rel="manifest" href="/manifest.json?v=95" />
+    <title>Work Pro</title>
+    <script>window.WORKPRO_VERSION='v146';window.__piSandbox=true;</script>
+    <script src="https://sdk.minepi.com/pi-sdk.js"></script>
+    <script>
+      (function(){
+        window.__piSandbox = /github\.io|localhost|onrender/.test(location.hostname);
+        if(typeof Pi!=='undefined'&&Pi.init){
+          try{Pi.init({version:"2.0",sandbox:window.__piSandbox});console.log('[Pi] ok');}
+          catch(e){console.error('[Pi]',e.message);}
+        }else{
+          window.Pi=window.Pi||{};
+          window.Pi.authenticate=function(){return Promise.reject('Pi SDK not loaded');};
+        }
+      })();
+    </script>
+    <style>${require('fs').readFileSync('./assets/index.css','utf8')}</style>
+  </head>
+  <body>
+    <noscript>You need to enable JavaScript to run this app.</noscript>
+    <div id="root"></div>
+    <script type="module">${require('fs').readFileSync('./assets/index-v95.js','utf8')}</script>
+  </body>
+</html>`;
+
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', message: 'Work Pro Backend Running', pi_api_configured: !!PI_API_KEY, admin_configured: !!ADMIN_API_KEY, env: NODE_ENV });
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(FRONTEND_HTML);
 });
 
 app.get('/health', (req, res) => {
@@ -585,7 +621,7 @@ app.get('/health', (req, res) => {
       uptime: process.uptime(),
       memory: { rss: mem.rss, heapUsed: mem.heapUsed },
       database: err ? 'error' : 'connected',
-      version: '2.0.7 (v117)',
+      version: '2.2.2 (v146)',
       timestamp: new Date().toISOString(),
     });
   });
@@ -625,9 +661,29 @@ app.get('/api/me', async (req, res) => {
 
   db.get(`SELECT * FROM users WHERE id = ?`, [userId], (err, user) => {
     if (err) return res.status(500).json({ error: 'Database error' });
-    if (!user) return res.status(404).json({ error: 'User not found' });
+    if (!user) {
+      // Auto-create user with trial connects
+      const newUser = {
+        id: userId,
+        username: 'User_' + userId.slice(-8),
+        name: 'User_' + userId.slice(-8),
+        role: 'freelancer',
+        balance_connects: 3,  // Trial connects for new users
+        balance_pi: 0,
+        created_at: new Date().toISOString()
+      };
+      db.run(
+        `INSERT INTO users (id, username, role, balance_connects, balance_pi) VALUES (?, ?, ?, ?, ?)`,
+        [newUser.id, newUser.username, newUser.role, newUser.balance_connects, newUser.balance_pi],
+        (err) => {
+          if (err) return res.status(500).json({ error: 'Failed to create user' });
+          res.json({ success: true, exists: false, user: { ...newUser, is_admin: false } });
+        }
+      );
+      return;
+    }
     const isAdmin = user.role === 'admin' || user.id === 'cherry19899' || (user.username && user.username.toLowerCase() === 'cherry19899') || user.username === 'admin';
-    res.json({ success: true, user: { ...user, is_admin: isAdmin } });
+    res.json({ success: true, exists: true, user: { ...user, is_admin: isAdmin } });
   });
 });
 
@@ -760,6 +816,31 @@ app.get('/api/jobs/me', async (req, res) => {
 });
 
 /**
+ * GET /api/jobs/user/:username - Get jobs by username (frontend compatibility)
+ */
+app.get('/api/jobs/user/:username', async (req, res) => {
+  const authUserId = req.headers['x-user-id'];
+  if (!authUserId) return res.status(401).json({ error: 'Authentication required' });
+
+  const username = req.params.username;
+
+  // Find user by username (case-insensitive)
+  db.get(`SELECT id FROM users WHERE username = ? COLLATE NOCASE`, [username], (err, user) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    db.all(`SELECT * FROM jobs WHERE posted_by = ? ORDER BY created_at DESC`, [user.id], (err, rows) => {
+      if (err) return res.status(500).json({ error: 'Database error' });
+      rows.forEach(row => {
+        if (row.images) try { row.images = JSON.parse(row.images); } catch(e) {}
+        row.apply_cost = Math.ceil((row.budget || 0) / 50) || 1;
+      });
+      res.json(rows || []);
+    });
+  });
+});
+
+/**
  * GET /api/jobs/:id - Get single job
  */
 app.get('/api/jobs/:id', (req, res) => {
@@ -774,7 +855,7 @@ app.get('/api/jobs/:id', (req, res) => {
  * POST /api/jobs/:id/apply - Apply to a job (deducts 1 connect)
  */
 app.post('/api/jobs/:id/apply', async (req, res) => {
-  const userId = req.headers['x-user-id'];
+  const userId = req.headers['x-user-id'] || req.body?.user_id;
   const piToken = req.headers['x-pi-token'];
   const job_id = req.params.id;
   if (!userId) return res.status(401).json({ error: 'Authentication required' });
@@ -797,48 +878,47 @@ app.post('/api/jobs/:id/apply', async (req, res) => {
       if (err) return res.status(500).json({ error: 'Database error' });
       if (existing) return res.status(409).json({ error: 'Already applied to this job' });
 
-      getUser(userId, (err, user) => {
+      // Ensure user exists (auto-create if missing)
+      db.get(`SELECT * FROM users WHERE id = ?`, [userId], (err, user) => {
         if (err) return res.status(500).json({ error: 'Database error' });
-        if (!user) return res.status(404).json({ error: 'User not found' });
-        if ((user.balance_connects || 0) < 1) {
-          return res.status(400).json({ error: 'Not enough connects to apply', required: 1, current: user.balance_connects || 0 });
-        }
-
-        const safeMessage = sanitizeString(message, 2000) || '';
-        const safeBid = job.budget || 0;
-        const newConnects = (user.balance_connects || 0) - 1;
-        const applicantName = username || user.username || 'User';
-
-        db.run(`UPDATE users SET balance_connects = ? WHERE id = ?`, [newConnects, userId], (err) => {
-          if (err) console.warn('[DB] Connect deduction warning:', err.message);
-
-          db.run(
-            `INSERT INTO applications (job_id, user_id, username, message, bid_amount, status) VALUES (?, ?, ?, ?, ?, 'pending')`,
-            [job_id, userId, applicantName, safeMessage, safeBid],
-            function(err) {
-              if (err) return res.status(500).json({ error: 'Failed to create application' });
-
-              // Increment application count on job
-              db.run(`UPDATE jobs SET applications = applications + 1 WHERE id = ?`, [job_id]);
-
-              // Notify job owner
-              createNotification(job.posted_by, 'application', 'New Application', `${applicantName} applied to "${job.title}"`, String(this.lastID), 'application');
-
-              res.json({
-                success: true,
-                id: this.lastID,
-                job_id,
-                user_id: userId,
-                status: 'pending',
-                message: safeMessage,
-                bid_amount: safeBid,
-                connects_deducted: 1,
-                remaining_connects: newConnects,
-                created_at: new Date().toISOString()
-              });
+        
+        const doApply = (u) => {
+          if ((u.balance_connects || 0) < 1) {
+            return res.status(400).json({ error: 'Not enough connects to apply', required: 1, current: u.balance_connects || 0 });
+          }
+          const safeMessage = sanitizeString(message, 2000) || '';
+          const safeBid = job.budget || 0;
+          const newConnects = (u.balance_connects || 0) - 1;
+          const applicantName = username || u.username || 'User';
+          
+          db.run(`UPDATE users SET balance_connects = ? WHERE id = ?`, [newConnects, userId], (err) => {
+            if (err) console.warn('[DB] Connect deduction warning:', err.message);
+            db.run(
+              `INSERT INTO applications (job_id, user_id, username, message, bid_amount, status) VALUES (?, ?, ?, ?, ?, 'pending')`,
+              [job_id, userId, applicantName, safeMessage, safeBid],
+              function(err) {
+                if (err) return res.status(500).json({ error: 'Failed to create application' });
+                db.run(`UPDATE jobs SET applications = applications + 1 WHERE id = ?`, [job_id]);
+                createNotification(job.posted_by, 'application', 'New Application', `${applicantName} applied to "${job.title}"`, String(this.lastID), 'application');
+                res.json({ success: true, id: this.lastID, job_id, user_id: userId, status: 'pending', message: safeMessage, bid_amount: safeBid, connects_deducted: 1, remaining_connects: newConnects, created_at: new Date().toISOString() });
+              }
+            );
+          });
+        };
+        
+        if (!user) {
+          // Auto-create user with trial connects
+          const newUser = { id: userId, username: 'User_' + userId.slice(-8), role: 'freelancer', balance_connects: 3, balance_pi: 0 };
+          db.run(`INSERT INTO users (id, username, role, balance_connects, balance_pi) VALUES (?, ?, ?, ?, ?)`,
+            [newUser.id, newUser.username, newUser.role, newUser.balance_connects, newUser.balance_pi],
+            (err) => {
+              if (err) return res.status(500).json({ error: 'Failed to create user' });
+              doApply(newUser);
             }
           );
-        });
+        } else {
+          doApply(user);
+        }
       });
     });
   });
@@ -1044,7 +1124,7 @@ app.get('/api/jobs/:id/applications', (req, res) => {
       [id],
       (err, rows) => {
         if (err) return res.status(500).json({ error: 'Database error' });
-        res.json({ applications: rows || [], count: (rows || []).length });
+        res.json(rows || []);
       }
     );
   });
@@ -1075,9 +1155,11 @@ app.post('/api/applications', async (req, res) => {
       if (existing) return res.status(409).json({ error: 'Already applied to this job' });
 
       getUser(userId, (err, user) => {
+        console.log(`[APPLY] getUser(${userId}): found=${!!user} balance=${user?.balance_connects}`);
         if (err) return res.status(500).json({ error: 'Database error' });
         if (!user) return res.status(404).json({ error: 'User not found' });
         if ((user.balance_connects || 0) < 1) {
+          console.log(`[APPLY] REJECT: ${userId} has ${user.balance_connects} connects`);
           return res.status(400).json({ error: 'Not enough connects to apply', required: 1, current: user.balance_connects || 0 });
         }
 
@@ -1196,6 +1278,103 @@ app.post('/api/applications/:id/reject', async (req, res) => {
 });
 
 /**
+ * POST /api/applications/:id/view - Mark application as viewed by client
+ */
+app.post('/api/applications/:id/view', async (req, res) => {
+  const userId = req.headers['x-user-id'];
+  if (!userId) return res.status(401).json({ error: 'Authentication required' });
+
+  const { id } = req.params;
+  db.get(
+    `SELECT a.*, j.posted_by as job_owner FROM applications a JOIN jobs j ON a.job_id = j.id WHERE a.id = ?`,
+    [id],
+    (err, row) => {
+      if (err) return res.status(500).json({ error: 'Database error' });
+      if (!row) return res.status(404).json({ error: 'Application not found' });
+      if (row.job_owner !== userId) return res.status(403).json({ error: 'Only the job owner can mark as viewed' });
+
+      db.run(`UPDATE applications SET status = 'viewed' WHERE id = ? AND status = 'pending'`, [id], function(err) {
+        if (err) return res.status(500).json({ error: 'Failed to update' });
+        res.json({ success: true, status: 'viewed' });
+      });
+    }
+  );
+});
+
+// ════════════════════════════════════════════════════════════════
+//  OFFERS — direct offers between client and freelancer
+// ════════════════════════════════════════════════════════════════
+
+/**
+ * GET /api/offers/:jobId - Get all offers for a job (as client)
+ */
+app.get('/api/offers/:jobId', async (req, res) => {
+  const userId = req.headers['x-user-id'];
+  if (!userId) return res.status(401).json({ error: 'Authentication required' });
+
+  const { jobId } = req.params;
+
+  db.get(`SELECT * FROM jobs WHERE id = ?`, [jobId], (err, job) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    if (!job) return res.status(404).json({ error: 'Job not found' });
+    if (job.posted_by !== userId) return res.status(403).json({ error: 'Only job owner can view offers' });
+
+    db.all(
+      `SELECT o.*, u.username as freelancer_name FROM offers o LEFT JOIN users u ON o.freelancer_id = u.id WHERE o.job_id = ? ORDER BY o.created_at DESC`,
+      [jobId],
+      (err, rows) => {
+        if (err) return res.status(500).json({ error: 'Database error' });
+        res.json(rows || []);
+      }
+    );
+  });
+});
+
+/**
+ * POST /api/offers/:id/accept - Accept a direct offer
+ */
+app.post('/api/offers/:id/accept', async (req, res) => {
+  const userId = req.headers['x-user-id'];
+  if (!userId) return res.status(401).json({ error: 'Authentication required' });
+
+  const { id } = req.params;
+  db.get(`SELECT * FROM offers WHERE id = ?`, [id], (err, offer) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    if (!offer) return res.status(404).json({ error: 'Offer not found' });
+    if (offer.client_id !== userId) return res.status(403).json({ error: 'Only the offer recipient can accept' });
+    if (offer.status !== 'pending') return res.status(400).json({ error: 'Offer already processed' });
+
+    db.run(`UPDATE offers SET status = 'accepted' WHERE id = ?`, [id], function(err) {
+      if (err) return res.status(500).json({ error: 'Failed to accept' });
+      createNotification(offer.freelancer_id, 'offer_accepted', 'Offer Accepted', `Your offer for job #${offer.job_id} was accepted!`, offer.job_id, 'job');
+      res.json({ success: true, status: 'accepted' });
+    });
+  });
+});
+
+/**
+ * POST /api/offers/:id/decline - Decline a direct offer
+ */
+app.post('/api/offers/:id/decline', async (req, res) => {
+  const userId = req.headers['x-user-id'];
+  if (!userId) return res.status(401).json({ error: 'Authentication required' });
+
+  const { id } = req.params;
+  db.get(`SELECT * FROM offers WHERE id = ?`, [id], (err, offer) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    if (!offer) return res.status(404).json({ error: 'Offer not found' });
+    if (offer.client_id !== userId) return res.status(403).json({ error: 'Only the offer recipient can decline' });
+    if (offer.status !== 'pending') return res.status(400).json({ error: 'Offer already processed' });
+
+    db.run(`UPDATE offers SET status = 'declined' WHERE id = ?`, [id], function(err) {
+      if (err) return res.status(500).json({ error: 'Failed to decline' });
+      createNotification(offer.freelancer_id, 'offer_declined', 'Offer Declined', `Your offer for job #${offer.job_id} was declined.`, offer.job_id, 'job');
+      res.json({ success: true, status: 'declined' });
+    });
+  });
+});
+
+/**
  * GET /api/applications/me - Get my applications (as freelancer)
  */
 app.get('/api/applications/me', async (req, res) => {
@@ -1235,6 +1414,30 @@ app.get('/api/applications/me', async (req, res) => {
     console.error('[Applications/Me] Error:', err);
     res.status(500).json({ error: 'Failed to fetch applications' });
   }
+});
+
+/**
+ * GET /api/applications/user/:userId - Get applications for a user (returns ARRAY for frontend compatibility)
+ */
+app.get('/api/applications/user/:userId', async (req, res) => {
+  const authUserId = req.headers['x-user-id'];
+  if (!authUserId) return res.status(401).json({ error: 'Authentication required' });
+  // Use x-user-id from headers for security (frontend injects it via interceptor)
+  // URL param is ignored — user can only view their own applications
+
+  db.all(
+    `SELECT a.*, j.title as job_title, j.status as job_status, j.budget, j.posted_by_name, j.category
+     FROM applications a
+     JOIN jobs j ON a.job_id = j.id
+     WHERE a.user_id = ?
+     ORDER BY a.created_at DESC`,
+    [authUserId],
+    (err, rows) => {
+      if (err) return res.status(500).json({ error: 'Database error' });
+      // Return ARRAY (not object) — frontend expects this
+      res.json(rows || []);
+    }
+  );
 });
 
 // ════════════════════════════════════════════════════════════════
@@ -1642,6 +1845,38 @@ app.post('/api/escrows/:id/cancel', async (req, res) => {
         if (err) console.warn('[DB] Job status update warning:', err.message);
         res.json({ success: true, status: 'cancelled' });
       });
+    });
+  });
+});
+
+/**
+ * POST /api/escrows/:id/dispute - Dispute an escrow (client or freelancer)
+ */
+app.post('/api/escrows/:id/dispute', async (req, res) => {
+  const userId = req.headers['x-user-id'];
+  if (!userId) return res.status(401).json({ error: 'Authentication required' });
+
+  const { id } = req.params;
+  getEscrow(id, (err, escrow) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    if (!escrow) return res.status(404).json({ error: 'Escrow not found' });
+    if (escrow.client_id !== userId && escrow.freelancer_id !== userId) {
+      return res.status(403).json({ error: 'Only escrow parties can dispute' });
+    }
+    if (escrow.status !== 'funded') {
+      return res.status(400).json({ error: `Escrow is ${escrow.status}, only funded can be disputed` });
+    }
+
+    const reason = sanitizeString(req.body.reason, 500);
+
+    db.run(`UPDATE escrows SET status = 'disputed', disputed_at = CURRENT_TIMESTAMP WHERE id = ?`, [id], function(err) {
+      if (err) return res.status(500).json({ error: 'Failed to dispute' });
+
+      const otherParty = (escrow.client_id === userId) ? escrow.freelancer_id : escrow.client_id;
+      createNotification(otherParty, 'escrow_disputed', 'Escrow Disputed',
+        `Escrow for job #${escrow.job_id} has been disputed${reason ? ': ' + reason : ''}.`, escrow.id, 'escrow');
+
+      res.json({ success: true, status: 'disputed', reason });
     });
   });
 });
@@ -2259,7 +2494,7 @@ app.get('/api/admin/backup', requireAdmin, async (req, res) => {
     res.setHeader('Content-Disposition', `attachment; filename="workpro-backup-${timestamp}.json"`);
     res.json({
       exported_at: new Date().toISOString(),
-      version: '2.0.7 (v117)',
+      version: '2.2.2 (v146)',
       tables: backup
     });
   } catch (err) {
@@ -2294,6 +2529,19 @@ app.get('/api/admin/earnings', requireAdmin, (req, res) => {
     db.get(`SELECT COALESCE(SUM(amount), 0) as total FROM payments WHERE status = 'completed'`, [], (err, sumRow) => {
       if (err) return res.status(500).json({ error: 'Database error' });
       res.json({ payments: rows, total: sumRow?.total || 0 });
+    });
+  });
+});
+
+/**
+ * GET /api/admin/escrows - List all escrows (admin)
+ */
+app.get('/api/admin/escrows', requireAdmin, (req, res) => {
+  db.all(`SELECT * FROM escrows ORDER BY created_at DESC`, [], (err, rows) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    db.get(`SELECT COUNT(*) as total, SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) as pending_count, SUM(CASE WHEN status='funded' THEN 1 ELSE 0 END) as funded_count, SUM(CASE WHEN status='released' THEN 1 ELSE 0 END) as released_count, SUM(CASE WHEN status='disputed' THEN 1 ELSE 0 END) as disputed_count, SUM(CASE WHEN status='cancelled' THEN 1 ELSE 0 END) as cancelled_count, COALESCE(SUM(amount), 0) as total_volume FROM escrows`, [], (err, statsRow) => {
+      if (err) return res.status(500).json({ error: 'Database error' });
+      res.json({ escrows: rows || [], stats: statsRow || {} });
     });
   });
 });
