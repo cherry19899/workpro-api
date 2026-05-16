@@ -89,7 +89,7 @@ app.use((req, res, next) => {
 app.use('/assets', (req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
-  res.setHeader('Cache-Control', 'public, max-age=300');
+  res.setHeader('Cache-Control', 'public, max-age=60');
   next();
 }, express.static(path.join(__dirname, 'assets')));
 
