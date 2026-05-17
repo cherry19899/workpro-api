@@ -23,6 +23,7 @@ const PI_API_KEY = process.env.PI_API_KEY;
 const ADMIN_API_KEY = process.env.ADMIN_API_KEY || process.env.WORKPRO_API_ACCESS;
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://cherry19899.github.io';
 const NODE_ENV = process.env.NODE_ENV || 'production';
+const IS_SANDBOX = process.env.PI_SANDBOX === 'true' || !PI_API_KEY;
 
 // ─── Rate Limiting ──────────────────────────────────────────────
 const rateLimitMap = new Map();
@@ -458,7 +459,8 @@ async function fetchWithRetry(url, options, retries = 2, delay = 1000) {
 
 async function verifyPaymentWithPi(paymentId) {
   try {
-    const response = await fetchWithRetry(`https://api.minepi.com/v2/payments/${paymentId}`, {
+    const encodedPaymentId = encodeURIComponent(paymentId);
+    const response = await fetchWithRetry(`https://api.minepi.com/v2/payments/${encodedPaymentId}`, {
       method: 'GET',
       headers: { 'Authorization': `Key ${PI_API_KEY}`, 'Content-Type': 'application/json' },
     });
@@ -648,7 +650,7 @@ app.get('/health', (req, res) => {
       uptime: process.uptime(),
       memory: { rss: mem.rss, heapUsed: mem.heapUsed },
       database: err ? 'error' : 'connected',
-      version: '2.2.3 (v149)',
+      version: '2.2.4 (v156)',
       timestamp: new Date().toISOString(),
     });
   });
@@ -2122,6 +2124,8 @@ app.get('/api/categories', (req, res) => {
  * POST /api/payments/:paymentId/approve - Approve payment on Pi Network
  */
 app.post('/api/payments/:paymentId/approve', async (req, res) => {
+  const userId = req.headers['x-user-id'];
+  if (!userId) return res.status(401).json({ error: 'Authentication required' });
   const { paymentId } = req.params;
 
   // Check if this is a sandbox payment (exists in connects_purchases)
@@ -2147,7 +2151,8 @@ app.post('/api/payments/:paymentId/approve', async (req, res) => {
   if (!PI_API_KEY) return res.status(500).json({ error: 'PI_API_KEY not configured' });
 
   try {
-    const response = await fetch(`https://api.minepi.com/v2/payments/${paymentId}/approve`, {
+    const encodedPaymentId = encodeURIComponent(paymentId);
+    const response = await fetch(`https://api.minepi.com/v2/payments/${encodedPaymentId}/approve`, {
       method: 'POST',
       headers: { 'Authorization': `Key ${PI_API_KEY}`, 'Content-Type': 'application/json' },
     });
@@ -2158,10 +2163,10 @@ app.post('/api/payments/:paymentId/approve', async (req, res) => {
       return res.status(response.status).json({ error: data.error || 'Approval failed', details: data });
     }
 
-    const uid = data.user_uid || req.body?.user?.uid || req.headers['x-user-id'] || 'unknown';
-    const username = data.metadata?.user?.username || req.body?.user?.username || 'unknown';
-    const amount = data.amount || req.body?.amount || 0;
-    const memo = data.memo || req.body?.memo || '';
+    const uid = data.user_uid || req.headers['x-user-id'] || 'unknown';
+    const username = data.metadata?.user?.username || 'unknown';
+    const amount = data.amount || 0;
+    const memo = data.memo || '';
 
     db.run(
       `INSERT OR REPLACE INTO payments (id, user_id, username, amount, memo, status) VALUES (?, ?, ?, ?, ?, 'approved')`,
@@ -2180,7 +2185,8 @@ app.post('/api/payments/:paymentId/approve', async (req, res) => {
  * POST /api/payments/:paymentId/complete - Complete payment on Pi Network
  */
 app.post('/api/payments/:paymentId/complete', async (req, res) => {
-  const userId = req.headers['x-user-id'] || req.body.user_id || 'unknown';
+  const userId = req.headers['x-user-id'];
+  if (!userId) return res.status(401).json({ error: 'Authentication required' });
   const { paymentId } = req.params;
   const { txid } = req.body;
   if (!txid) return res.status(400).json({ error: 'txid is required' });
@@ -2190,7 +2196,8 @@ app.post('/api/payments/:paymentId/complete', async (req, res) => {
   if (!isValidTxid(txid)) return res.status(400).json({ error: 'Invalid txid format' });
 
   try {
-    const response = await fetch(`https://api.minepi.com/v2/payments/${paymentId}/complete`, {
+    const encodedPaymentId = encodeURIComponent(paymentId);
+    const response = await fetch(`https://api.minepi.com/v2/payments/${encodedPaymentId}/complete`, {
       method: 'POST',
       headers: { 'Authorization': `Key ${PI_API_KEY}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ txid }),
@@ -2199,9 +2206,8 @@ app.post('/api/payments/:paymentId/complete', async (req, res) => {
 
     if (!response.ok) {
       console.error('[Pi API] Complete failed:', data);
-      // Don't update local DB on 404 — payment may not exist on Pi Network
       if (response.status === 404) {
-        return res.json({ success: true, warning: 'Payment not found on Pi Network, assuming sandbox', payment: { id: paymentId, status: 'completed' } });
+        return res.status(404).json({ error: 'Payment not found on Pi Network' });
       }
       return res.status(response.status).json({ error: data.error || 'Completion failed', details: data });
     }
@@ -2223,12 +2229,14 @@ app.post('/api/payments/:paymentId/complete', async (req, res) => {
  * POST /api/payments/:paymentId/cancelled - Cancel payment
  */
 app.post('/api/payments/:paymentId/cancelled', async (req, res) => {
+  const userId = req.headers['x-user-id'];
+  if (!userId) return res.status(401).json({ error: 'Authentication required' });
   const { paymentId } = req.params;
-  const userId = req.headers['x-user-id'] || req.body?.user_id || 'unknown';
 
   if (PI_API_KEY) {
     try {
-      const piRes = await fetch(`https://api.minepi.com/v2/payments/${paymentId}/cancel`, {
+      const encodedPaymentId = encodeURIComponent(paymentId);
+      const piRes = await fetch(`https://api.minepi.com/v2/payments/${encodedPaymentId}/cancel`, {
         method: 'POST',
         headers: { 'Authorization': `Key ${PI_API_KEY}`, 'Content-Type': 'application/json' }
       });
@@ -2272,7 +2280,8 @@ app.post('/api/payments/cancel-all-pending', async (req, res) => {
       const paymentId = row.payment_id;
       if (PI_API_KEY && paymentId) {
         try {
-          const piRes = await fetch(`https://api.minepi.com/v2/payments/${paymentId}/cancel`, {
+          const encodedPaymentId = encodeURIComponent(paymentId);
+          const piRes = await fetch(`https://api.minepi.com/v2/payments/${encodedPaymentId}/cancel`, {
             method: 'POST',
             headers: { 'Authorization': `Key ${PI_API_KEY}`, 'Content-Type': 'application/json' }
           });
@@ -2367,7 +2376,8 @@ app.post('/api/connects/complete', async (req, res) => {
   if (user_id !== userId) return res.status(403).json({ error: 'user_id mismatch' });
 
   try {
-    const piRes = await fetch(`https://api.minepi.com/v2/payments/${payment_id}/complete`, {
+    const encodedPaymentId = encodeURIComponent(payment_id);
+    const piRes = await fetch(`https://api.minepi.com/v2/payments/${encodedPaymentId}/complete`, {
       method: 'POST',
       headers: { 'Authorization': `Key ${PI_API_KEY}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ txid }),
@@ -2405,7 +2415,7 @@ app.post('/api/connects/buy', async (req, res) => {
   const { payment_id, txid, user_id, package_amount, action } = req.body;
   if (user_id !== userId) return res.status(403).json({ error: 'user_id mismatch' });
 
-  const isSandbox = req.body.sandbox === true;
+  const isSandbox = IS_SANDBOX;
 
   if (action === 'approve' && payment_id) {
     // Sandbox mode: skip Pi API call
@@ -2415,7 +2425,8 @@ app.post('/api/connects/buy', async (req, res) => {
     // Proxy to /api/payments/:id/approve
     if (!PI_API_KEY) return res.status(500).json({ error: 'PI_API_KEY not configured' });
     try {
-      const response = await fetch(`https://api.minepi.com/v2/payments/${payment_id}/approve`, {
+      const encodedPaymentId = encodeURIComponent(payment_id);
+      const response = await fetch(`https://api.minepi.com/v2/payments/${encodedPaymentId}/approve`, {
         method: 'POST',
         headers: { 'Authorization': `Key ${PI_API_KEY}`, 'Content-Type': 'application/json' },
       });
@@ -2439,7 +2450,8 @@ app.post('/api/connects/buy', async (req, res) => {
     // Proxy to /api/payments/:id/complete
     if (!PI_API_KEY || !isValidTxid(txid)) return res.status(400).json({ error: 'Missing API key or invalid txid' });
     try {
-      const piRes = await fetch(`https://api.minepi.com/v2/payments/${payment_id}/complete`, {
+      const encodedPaymentId = encodeURIComponent(payment_id);
+      const piRes = await fetch(`https://api.minepi.com/v2/payments/${encodedPaymentId}/complete`, {
         method: 'POST',
         headers: { 'Authorization': `Key ${PI_API_KEY}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({ txid }),
@@ -2535,7 +2547,9 @@ app.get('/api/admin/backup', requireAdmin, async (req, res) => {
  */
 app.post('/api/admin/deploy', requireAdmin, async (req, res) => {
   try {
-    const response = await fetch('https://api.render.com/deploy/srv-d7qvgf7lk1mc73cri1ng?key=X88S-SyFKag', {
+    const deployHookUrl = process.env.RENDER_DEPLOY_HOOK;
+    if (!deployHookUrl) return res.status(500).json({ error: 'RENDER_DEPLOY_HOOK not configured' });
+    const response = await fetch(deployHookUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
     });
