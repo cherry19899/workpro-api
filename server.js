@@ -614,15 +614,15 @@ const FRONTEND_HTML = `<!DOCTYPE html>
   <body>
     <noscript>You need to enable JavaScript to run this app.</noscript>
     <div id="root"></div>
-    <script type="module">${require('fs').readFileSync('./assets/index-v95.js','utf8')}</script>
+    <script>${require('fs').readFileSync('./assets/index-v95.js','utf8')}</script>
     <div id="__console" style="position:fixed;bottom:0;left:0;right:0;max-height:200px;overflow-y:auto;background:#000;color:#0f0;font-family:monospace;font-size:11px;line-height:1.4;padding:8px;z-index:99999;border-top:2px solid #0f0;">
-      <div style="color:#0f0;font-weight:bold;margin-bottom:4px;">=== CONSOLE v147 ===</div>
+      <div style="color:#0f0;font-weight:bold;margin-bottom:4px;">=== CONSOLE v156 ===</div>
     </div>
     <script>
       (function(){
         var c=document.getElementById('__console');
         function log(t,m){var d=document.createElement('div');d.style.color=t;d.textContent=m;c.appendChild(d);}
-        log('#0f0','[Boot] v147');
+        log('#0f0','[Boot] v156');
         log('#0f0','[Boot] UA: '+navigator.userAgent.slice(0,40));
         log('#0f0','[Boot] Pi SDK: '+(typeof Pi!=='undefined'?'FOUND':'NOT FOUND'));
         var origLog=console.log,origErr=console.error,origWarn=console.warn;
