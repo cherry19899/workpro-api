@@ -650,7 +650,7 @@ app.get('/health', (req, res) => {
       uptime: process.uptime(),
       memory: { rss: mem.rss, heapUsed: mem.heapUsed },
       database: err ? 'error' : 'connected',
-      version: '2.2.5 (v159)',
+      version: '2.2.5 (v163)',
       timestamp: new Date().toISOString(),
     });
   });
@@ -2127,6 +2127,7 @@ app.post('/api/payments/:paymentId/approve', async (req, res) => {
   const userId = req.headers['x-user-id'];
   if (!userId) return res.status(401).json({ error: 'Authentication required' });
   const { paymentId } = req.params;
+  console.log('[SERVER] Approve request received:', { paymentId, userId });
 
   // Check if this is a sandbox payment (exists in connects_purchases)
   const sandboxPurchase = await new Promise((resolve) => {
@@ -2188,8 +2189,25 @@ app.post('/api/payments/:paymentId/complete', async (req, res) => {
   const userId = req.headers['x-user-id'];
   if (!userId) return res.status(401).json({ error: 'Authentication required' });
   const { paymentId } = req.params;
-  const { txid } = req.body;
-  if (!txid) return res.status(400).json({ error: 'txid is required' });
+  let { txid } = req.body;
+  console.log('[SERVER] Complete request received:', { paymentId, txid, userId });
+
+  // Auto-fetch txid from Pi API if not provided by frontend
+  if (!txid && PI_API_KEY) {
+    try {
+      const encodedPaymentId = encodeURIComponent(paymentId);
+      const piRes = await fetch(`https://api.minepi.com/v2/payments/${encodedPaymentId}`, {
+        headers: { 'Authorization': `Key ${PI_API_KEY}` }
+      });
+      if (piRes.ok) {
+        const piData = await piRes.json();
+        if (piData?.transaction?.txid) {
+          txid = piData.transaction.txid;
+          console.log('[SERVER] Auto-fetched txid from Pi API:', txid);
+        }
+      }
+    } catch (e) { console.error('[SERVER] Auto-fetch txid failed:', e.message); }
+  }
 
   if (!PI_API_KEY) return res.status(500).json({ error: 'PI_API_KEY not configured' });
   if (!txid) return res.status(400).json({ error: 'txid is required' });
