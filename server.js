@@ -1438,7 +1438,7 @@ app.get('/health', (req, res) => {
       uptime: process.uptime(),
       memory: { rss: mem.rss, heapUsed: mem.heapUsed },
       database: err ? 'error' : 'connected',
-      version: '2.2.9 (v209)',
+      version: '2.2.9 (v209-1779142856)',
       timestamp: new Date().toISOString(),
     });
   });
