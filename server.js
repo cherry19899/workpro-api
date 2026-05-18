@@ -641,6 +641,11 @@ const FRONTEND_HTML = `<!DOCTYPE html>
         var c=document.getElementById('__console');
         function log(t,m){var d=document.createElement('div');d.style.color=t;d.textContent=m;c.appendChild(d);}
         log('#0f0','[Boot] v200');
+        // Move console to top
+        setTimeout(function(){
+          var cw = document.getElementById('__cw');
+          if (cw) { cw.style.setProperty('top', '0', 'important'); cw.style.setProperty('bottom', 'auto', 'important'); log('#0f0','[CSS] Console top'); }
+        }, 2000);
         log('#0f0','[Boot] UA: '+navigator.userAgent.slice(0,40));
         log('#0f0','[Boot] Pi SDK: '+(typeof Pi!=='undefined'?'FOUND':'NOT FOUND'));
         var origLog=console.log,origErr=console.error,origWarn=console.warn;
