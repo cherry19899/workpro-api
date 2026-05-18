@@ -637,7 +637,7 @@ const FRONTEND_HTML = `<!DOCTYPE html>
       (function(){
         var c=document.getElementById('__console');
         function log(t,m){var d=document.createElement('div');d.style.color=t;d.textContent=m;c.appendChild(d);}
-        log('#0f0','[Boot] v202');
+        log('#0f0','[Boot] v203');
         // Move console to top
         setTimeout(function(){
           var cw = document.getElementById('__cw');
@@ -670,7 +670,7 @@ app.get('/health', (req, res) => {
       uptime: process.uptime(),
       memory: { rss: mem.rss, heapUsed: mem.heapUsed },
       database: err ? 'error' : 'connected',
-      version: '2.2.9 (v202)',
+      version: '2.2.9 (v203)',
       timestamp: new Date().toISOString(),
     });
   });
