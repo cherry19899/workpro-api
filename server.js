@@ -1958,21 +1958,22 @@ app.post('/api/reviews', async (req, res) => {
   
   // If no target_id provided, try to get it from escrow
   let final_target_id = target_id;
-  if (!final_target_id && escrowId_final) {
-    try {
-      const escrowRow = await new Promise((resolve, reject) => {
-        db.get(`SELECT freelancer_id FROM escrows WHERE id = ?`, [escrowId_final], (err, row) => {
-          if (err) reject(err);
-          else resolve(row);
-        });
+  
+  function doLookupAndProceed() {
+    if (!final_target_id && escrowId_final) {
+      db.get(`SELECT freelancer_id FROM escrows WHERE id = ?`, [escrowId_final], (err, row) => {
+        if (!err && row) final_target_id = row.freelancer_id;
+        proceedWithReview();
       });
-      if (escrowRow) final_target_id = escrowRow.freelancer_id;
-    } catch(e) { console.error('[Review] Escrow lookup failed:', e.message); }
+    } else {
+      proceedWithReview();
+    }
   }
   
-  if (!final_target_id) return res.status(400).json({ error: 'target_id is required (or provide escrow_id)' });
-  if (!rating || rating < 1 || rating > 5) return res.status(400).json({ error: 'Rating must be 1-5' });
-  if (reviewer_id && reviewer_id !== userId) return res.status(403).json({ error: 'Can only review as yourself' });
+  function proceedWithReview() {
+    if (!final_target_id) return res.status(400).json({ error: 'target_id is required (or provide escrow_id)' });
+    if (!rating || rating < 1 || rating > 5) return res.status(400).json({ error: 'Rating must be 1-5' });
+    if (reviewer_id && reviewer_id !== userId) return res.status(403).json({ error: 'Can only review as yourself' });
 
   const safeText = sanitizeString(text, 1000) || '';
   const safeReviewerName = sanitizeString(reviewer_name, 50) || 'User';
@@ -1997,6 +1998,9 @@ app.post('/api/reviews', async (req, res) => {
       res.json({ success: true, id });
     }
   );
+  }
+  
+  doLookupAndProceed();
 });
 
 /**
