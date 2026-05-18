@@ -132,7 +132,7 @@ CREATE TABLE IF NOT EXISTS users (
 );
 
 -- v88: Add avatar column if not exists
-ALTER TABLE users ADD COLUMN avatar TEXT;
+-- This is handled conditionally in code below
 
 -- 2. JOBS
 CREATE TABLE IF NOT EXISTS jobs (
@@ -349,6 +349,23 @@ function initDatabase() {
 }
 
 initDatabase();
+
+// ─── Add avatar column if missing ───────────────────────────────
+db.all(`PRAGMA table_info(users)`, [], (err, columns) => {
+  if (err) {
+    console.warn('[DB Init] Could not check users table:', err.message);
+    return;
+  }
+  const hasAvatar = columns && columns.some(col => col.name === 'avatar');
+  if (!hasAvatar) {
+    db.run(`ALTER TABLE users ADD COLUMN avatar TEXT;`, (err) => {
+      if (err) console.warn('[DB Init] Could not add avatar:', err.message);
+      else console.log('[DB Init] avatar column added');
+    });
+  } else {
+    console.log('[DB Init] avatar column already exists');
+  }
+});
 
 // ─── Auth Middleware ────────────────────────────────────────────
 
@@ -650,7 +667,7 @@ app.get('/health', (req, res) => {
       uptime: process.uptime(),
       memory: { rss: mem.rss, heapUsed: mem.heapUsed },
       database: err ? 'error' : 'connected',
-      version: '2.2.6 (v190)',
+      version: '2.2.7 (v192)',
       timestamp: new Date().toISOString(),
     });
   });
