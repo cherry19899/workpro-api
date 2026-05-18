@@ -619,7 +619,7 @@ const FRONTEND_HTML = `<!DOCTYPE html>
     <link rel="manifest" href="/manifest.json?v=47" />
     <link rel="apple-touch-icon" href="/vite.svg?v=47" />
     <title>Work Pro — Pi Network Freelance Marketplace</title>
-    <script>window.WORKPRO_VERSION='v208';</script>
+    <script>window.WORKPRO_VERSION='v209';</script>
 <script>
 // Fallback: show Sign In button if auto-auth takes too long
 (function(){
@@ -840,7 +840,7 @@ const FRONTEND_HTML = `<!DOCTYPE html>
         };
         window._createPaymentPatched = true;
         console.log('[Pi] createPayment patched for uid:', uid);
-      }/ ---- 6. NOTIFICATION BADGE POLLER ----
+      } // ---- 6. NOTIFICATION BADGE POLLER ----
       (function pollNotifications() {
         try {
           var userStr = localStorage.getItem('workpro_user');
@@ -870,13 +870,13 @@ const FRONTEND_HTML = `<!DOCTYPE html>
     <script>
     (function(){
       var start=Date.now();
-      fetch('https://workpro-api.onrender.com/assets/index-v95.js?v=207')
+      fetch('https://workpro-api.onrender.com/assets/index-v95.js?v=209')
         .then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.text();})
         .then(function(code){
           console.log('[Loader] JS fetched in '+(Date.now()-start)+'ms');
           try{
             var s=document.createElement('script');
-            s.textContent=code+'\n;(function(){try{window.__jsLoaded=true;console.log("[Loader] JS executed");var l=document.getElementById("_loader");if(l){l.style.opacity="0";setTimeout(function(){l.style.display="none"},500)}var cw=document.getElementById("__cw");if(cw){cw.style.top="0";cw.style.bottom="auto";console.log("[CSS] Console top")}}catch(e){}})();';
+            s.textContent=code+'\n;(function(){try{window.__jsLoaded=true;console.log("[Loader] JS executed");var l=document.getElementById("_loader");if(l){l.style.opacity="0";setTimeout(function(){l.style.display="none"},500)}}catch(e){}})();';
             document.body.appendChild(s);
           }catch(e){
             console.error('[Loader] exec error:',e.message);
@@ -896,18 +896,8 @@ const FRONTEND_HTML = `<!DOCTYPE html>
 <script>
 (function(){var c=document.getElementById('__c'),cnt=0;
 function lg(t,m){if(!c)return;cnt++;if(cnt>50)return;c.style.display='block';var d=document.createElement('div');d.style.color=t;d.textContent=m;c.appendChild(d);}
-lg('#0f0','[WP] v207 start');
-var o=console.log,oe=console.error,ow=console.warn;
-console.log=function(){var a=Array.prototype.slice.call(arguments).join(' ');o.apply(console,arguments);lg('#0f0','[L] '+a);};
-console.error=function(){var a=Array.prototype.slice.call(arguments).join(' ');oe.apply(console,arguments);lg('#f00','[E] '+a);};
-console.warn=function(){var a=Array.prototype.slice.call(arguments).join(' ');if(a.indexOf('already initialized')>-1)return;ow.apply(console,arguments);lg('#ff0','[W] '+a);};
-window.onerror=function(m,u,l,co,err){lg('#f00','[ERR] '+m+' @'+l+':'+co);return true;};
-window.onunhandledrejection=function(e){var r=e.reason||e,msg=r&&r.message?r.message:String(r);lg('#f00','[REJ] '+msg);};
-})();
-</script>
-
     <link rel="stylesheet" href="/assets/app-v196.css">
-<!-- Console stays at bottom (default) -->
+<!-- Console at bottom -->
   <script>
 // ===== WORK PRO PATCH v53 =====
 (function() {
@@ -1337,9 +1327,9 @@ window.onunhandledrejection=function(e){var r=e.reason||e,msg=r&&r.message?r.mes
     </script>
     <div id="root"></div>
     <!-- DEBUG CONSOLE -->
-    <div id="__cw" style="position:fixed;top:0;left:0;right:0;z-index:99998;display:none;"><div id="__ct" style="background:#0d9488;color:#fff;font-size:10px;padding:2px 6px;cursor:pointer;font-family:monospace;text-align:center;" onclick="var c=document.getElementById('__c'),t=document.getElementById('__ct');if(c.style.display==='none'){c.style.display='block';t.textContent='▼ Console'}else{c.style.display='none';t.textContent='▲ Console'}">▼ Console</div><div id="__c" style="max-height:100px;overflow-y:auto;background:rgba(0,0,0,.85);color:#0f0;font-family:monospace;font-size:10px;line-height:1.4;padding:6px;display:block;border-top:2px solid #0f0;"></div></div>
+    <div id="__cw" style="position:fixed;bottom:0;left:0;right:0;z-index:99998;display:none;"><div id="__ct" style="background:#0d9488;color:#fff;font-size:10px;padding:2px 6px;cursor:pointer;font-family:monospace;text-align:center;" onclick="var c=document.getElementById('__c'),t=document.getElementById('__ct');if(c.style.display==='none'){c.style.display='block';t.textContent='▼ Console'}else{c.style.display='none';t.textContent='▲ Console'}">▼ Console</div><div id="__c" style="max-height:100px;overflow-y:auto;background:rgba(0,0,0,.85);color:#0f0;font-family:monospace;font-size:10px;line-height:1.4;padding:6px;display:block;border-top:2px solid #0f0;"></div></div>
     <script>
-    (function(){var c=document.getElementById('__c'),cw=document.getElementById('__cw'),cnt=0;function lg(t,m){if(!c||!cw)return;cnt++;if(cnt>80)return;cw.style.display='block';c.style.display='block';var d=document.createElement('div');d.style.color=t;d.textContent=m;c.appendChild(d);}lg('#0f0','[WP] v207 start');var o=console.log,oe=console.error,ow=console.warn;console.log=function(){var a=Array.prototype.slice.call(arguments).join(' ');o.apply(console,arguments);lg('#0f0','[L] '+a);};console.error=function(){var a=Array.prototype.slice.call(arguments).join(' ');oe.apply(console,arguments);lg('#f00','[E] '+a);};console.warn=function(){var a=Array.prototype.slice.call(arguments).join(' ');if(a.indexOf('already initialized')>-1)return;ow.apply(console,arguments);lg('#ff0','[W] '+a);};window.onerror=function(m,u,l,co,err){lg('#f00','[ERR] '+m+' @'+l+':'+co);return true;};window.onunhandledrejection=function(e){var r=e.reason||e,msg=r&&r.message?r.message:String(r);lg('#f00','[REJ] '+msg);};})();
+    (function(){var c=document.getElementById('__c'),cw=document.getElementById('__cw'),cnt=0;function lg(t,m){if(!c||!cw)return;cnt++;if(cnt>80)return;cw.style.display='block';c.style.display='block';var d=document.createElement('div');d.style.color=t;d.textContent=m;c.appendChild(d);}lg('#0f0','[WP] v209 start');var o=console.log,oe=console.error,ow=console.warn;console.log=function(){var a=Array.prototype.slice.call(arguments).join(' ');o.apply(console,arguments);lg('#0f0','[L] '+a);};console.error=function(){var a=Array.prototype.slice.call(arguments).join(' ');oe.apply(console,arguments);lg('#f00','[E] '+a);};console.warn=function(){var a=Array.prototype.slice.call(arguments).join(' ');if(a.indexOf('already initialized')>-1)return;ow.apply(console,arguments);lg('#ff0','[W] '+a);};window.onerror=function(m,u,l,co,err){lg('#f00','[ERR] '+m+' @'+l+':'+co);return true;};window.onunhandledrejection=function(e){var r=e.reason||e,msg=r&&r.message?r.message:String(r);lg('#f00','[REJ] '+msg);};})();
     </script>
     <!-- MENU PATCH: Show both client and freelancer menus regardless of role -->
     <script>
@@ -1448,7 +1438,7 @@ app.get('/health', (req, res) => {
       uptime: process.uptime(),
       memory: { rss: mem.rss, heapUsed: mem.heapUsed },
       database: err ? 'error' : 'connected',
-      version: '2.2.9 (v208)',
+      version: '2.2.9 (v209)',
       timestamp: new Date().toISOString(),
     });
   });
