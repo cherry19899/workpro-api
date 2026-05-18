@@ -7,6 +7,7 @@
  *  Tech Stack: Express.js, SQLite3, node-fetch, cors
  *  Auth: Pi Network accessToken verification via api.minepi.com/v2/me
  */
+console.log('[Server] v203 boot starting...');
 
 require('dotenv').config();
 const express = require('express');
