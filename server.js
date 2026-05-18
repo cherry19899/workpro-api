@@ -3486,8 +3486,3 @@ const server = app.listen(PORT, () => {
   console.log(`[WorkPro Backend] Pi API Key: ${PI_API_KEY ? 'Configured' : 'MISSING!'}`);
   console.log(`[WorkPro Backend] Admin API Key: ${ADMIN_API_KEY ? 'Configured' : 'MISSING!'}`);
   console.log(`[WorkPro Backend] Database: ${dbPath}`);
-});
-// DEPLOY TEST ENDPOINT - v209 verification
-app.get('/api/deploy-test', (req, res) => {
-  res.json({ version: 'v209', timestamp: Date.now(), deploy: 'test' });
-});
