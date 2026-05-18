@@ -612,7 +612,7 @@ const FRONTEND_HTML = `<!DOCTYPE html>
     <link rel="apple-touch-icon" href="/vite.svg?v=95" />
     <link rel="manifest" href="/manifest.json?v=95" />
     <title>Work Pro</title>
-    <script>window.WORKPRO_VERSION='v198';window.__piSandbox=true;</script>
+    <script>window.WORKPRO_VERSION='v199';window.__piSandbox=true;</script>
     <script src="https://sdk.minepi.com/pi-sdk.js"></script>
     <script>
       (function(){
