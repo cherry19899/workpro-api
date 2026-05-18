@@ -650,7 +650,7 @@ app.get('/health', (req, res) => {
       uptime: process.uptime(),
       memory: { rss: mem.rss, heapUsed: mem.heapUsed },
       database: err ? 'error' : 'connected',
-      version: '2.2.5 (v165)',
+      version: '2.2.6 (v190)',
       timestamp: new Date().toISOString(),
     });
   });
@@ -1346,16 +1346,24 @@ app.get('/api/offers/:jobId', async (req, res) => {
   db.get(`SELECT * FROM jobs WHERE id = ?`, [jobId], (err, job) => {
     if (err) return res.status(500).json({ error: 'Database error' });
     if (!job) return res.status(404).json({ error: 'Job not found' });
-    if (job.posted_by !== userId) return res.status(403).json({ error: 'Only job owner can view offers' });
+    
+    // Allow both job owner and offer recipients to view offers
+    const isOwner = job.posted_by === userId;
+    
+    let sql, params;
+    if (isOwner) {
+      sql = `SELECT o.*, u.username as freelancer_name FROM offers o LEFT JOIN users u ON o.freelancer_id = u.id WHERE o.job_id = ? ORDER BY o.created_at DESC`;
+      params = [jobId];
+    } else {
+      // Freelancer sees only their own offers for this job
+      sql = `SELECT o.*, u.username as client_name FROM offers o LEFT JOIN users u ON o.client_id = u.id WHERE o.job_id = ? AND o.freelancer_id = ? ORDER BY o.created_at DESC`;
+      params = [jobId, userId];
+    }
 
-    db.all(
-      `SELECT o.*, u.username as freelancer_name FROM offers o LEFT JOIN users u ON o.freelancer_id = u.id WHERE o.job_id = ? ORDER BY o.created_at DESC`,
-      [jobId],
-      (err, rows) => {
-        if (err) return res.status(500).json({ error: 'Database error' });
-        res.json(rows || []);
-      }
-    );
+    db.all(sql, params, (err, rows) => {
+      if (err) return res.status(500).json({ error: 'Database error' });
+      res.json(rows || []);
+    });
   });
 });
 
@@ -1718,7 +1726,11 @@ app.post('/api/escrows', async (req, res) => {
   const userId = req.headers['x-user-id'];
   if (!userId) return res.status(401).json({ error: 'Authentication required' });
 
-  let { job_id, client_id, freelancer_id, amount } = req.body;
+  let { job_id, jobId, client_id, clientId, freelancer_id, freelancerId, amount } = req.body;
+  // Support both snake_case and camelCase
+  if (!job_id && jobId) job_id = jobId;
+  if (!client_id && clientId) client_id = clientId;
+  if (!freelancer_id && freelancerId) freelancer_id = freelancerId;
   if (!client_id) client_id = userId;
   if (!job_id || !freelancer_id || !amount) {
     return res.status(400).json({ error: 'Missing required fields: job_id, freelancer_id, amount' });
@@ -1801,7 +1813,7 @@ app.post('/api/escrows/:id/fund', async (req, res) => {
   getEscrow(id, (err, escrow) => {
     if (err) return res.status(500).json({ error: 'Database error' });
     if (!escrow) return res.status(404).json({ error: 'Escrow not found' });
-    if (escrow.client_id !== userId) return res.status(403).json({ error: 'Only the client can fund escrow' });
+    if (escrow.client_id !== userId && escrow.freelancer_id !== userId) return res.status(403).json({ error: 'Only client or freelancer can fund escrow' });
     if (escrow.status !== 'pending') return res.status(400).json({ error: `Escrow is ${escrow.status}, not pending` });
 
     db.run(
@@ -1939,8 +1951,26 @@ app.post('/api/reviews', async (req, res) => {
   const userId = req.headers['x-user-id'];
   if (!userId) return res.status(401).json({ error: 'Authentication required' });
 
-  const { reviewer_id, reviewer_name, target_id, target_name, job_id, job_title, rating, text } = req.body;
-  if (!target_id) return res.status(400).json({ error: 'target_id is required' });
+  const { reviewer_id, reviewer_name, target_id, target_name, job_id, job_title, rating, text, escrow_id, escrowId } = req.body;
+  
+  // Support both snake_case and camelCase
+  const escrowId_final = escrow_id || escrowId;
+  
+  // If no target_id provided, try to get it from escrow
+  let final_target_id = target_id;
+  if (!final_target_id && escrowId_final) {
+    try {
+      const escrowRow = await new Promise((resolve, reject) => {
+        db.get(`SELECT freelancer_id FROM escrows WHERE id = ?`, [escrowId_final], (err, row) => {
+          if (err) reject(err);
+          else resolve(row);
+        });
+      });
+      if (escrowRow) final_target_id = escrowRow.freelancer_id;
+    } catch(e) { console.error('[Review] Escrow lookup failed:', e.message); }
+  }
+  
+  if (!final_target_id) return res.status(400).json({ error: 'target_id is required (or provide escrow_id)' });
   if (!rating || rating < 1 || rating > 5) return res.status(400).json({ error: 'Rating must be 1-5' });
   if (reviewer_id && reviewer_id !== userId) return res.status(403).json({ error: 'Can only review as yourself' });
 
@@ -1952,7 +1982,7 @@ app.post('/api/reviews', async (req, res) => {
 
   db.run(
     `INSERT INTO reviews (id, reviewer_id, reviewer_name, target_id, target_name, job_id, job_title, rating, text) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [id, userId, safeReviewerName, target_id, safeTargetName, job_id || null, safeJobTitle, rating, safeText],
+    [id, userId, safeReviewerName, final_target_id, safeTargetName, job_id || null, safeJobTitle, rating, safeText],
     function(err) {
       if (err) return res.status(500).json({ error: 'Failed to submit review' });
 
