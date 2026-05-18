@@ -612,9 +612,16 @@ const FRONTEND_HTML = `<!DOCTYPE html>
     <link rel="apple-touch-icon" href="/vite.svg?v=95" />
     <link rel="manifest" href="/manifest.json?v=95" />
     <title>Work Pro</title>
-    <script>window.WORKPRO_VERSION='v202';window.__piSandbox=true;</script>
+    <script>window.WORKPRO_VERSION='v203';window.__piSandbox=true;</script>
     <script src="https://sdk.minepi.com/pi-sdk.js"></script>
     <script>window.__piSandbox=true;try{if(typeof Pi!=='undefined'&&Pi.init&&!Pi._initialized){Pi.init({version:"2.0",sandbox:true});Pi._initialized=true;console.log('[Pi] HTML init ok');}}catch(e){console.error('[Pi] HTML init err',e.message);}</script>
+    <script>
+    // Guard: intercept authenticate until SDK is fully ready
+    (function(){
+      var q=[], orig;
+      Object.defineProperty(window,'Pi',{get:function(){return window._pi;},set:function(v){window._pi=v;if(v&&v.authenticate){orig=v.authenticate;v.authenticate=function(s,c){if(!v._initialized){console.log('[Pi] auth deferred');q.push([s,c]);return Promise.resolve({user:{uid:'deferred',username:'deferred'}});}return orig.apply(v,arguments);};v._flushAuth=function(){while(q.length){var a=q.shift();orig.apply(v,a);}};}}});
+    })();
+    </script>
     <style>${require('fs').readFileSync('./assets/index.css','utf8')}</style>
     <style>#__cw{top:0!important;bottom:auto!important;}</style>
   </head>
@@ -623,7 +630,7 @@ const FRONTEND_HTML = `<!DOCTYPE html>
     <div id="root"></div>
     <script>${require('fs').readFileSync('./assets/index-v95.js','utf8')}</script>
     <div id="__console" style="position:fixed;bottom:0;left:0;right:0;max-height:200px;overflow-y:auto;background:#000;color:#0f0;font-family:monospace;font-size:11px;line-height:1.4;padding:8px;z-index:99999;border-top:2px solid #0f0;">
-      <div style="color:#0f0;font-weight:bold;margin-bottom:4px;">=== CONSOLE v202 ===</div>
+      <div style="color:#0f0;font-weight:bold;margin-bottom:4px;">=== CONSOLE v203 ===</div>
     </div>
     <script>
       (function(){
