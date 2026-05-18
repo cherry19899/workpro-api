@@ -612,20 +612,9 @@ const FRONTEND_HTML = `<!DOCTYPE html>
     <link rel="apple-touch-icon" href="/vite.svg?v=95" />
     <link rel="manifest" href="/manifest.json?v=95" />
     <title>Work Pro</title>
-    <script>window.WORKPRO_VERSION='v200';window.__piSandbox=true;</script>
+    <script>window.WORKPRO_VERSION='v201';window.__piSandbox=true;</script>
     <script src="https://sdk.minepi.com/pi-sdk.js"></script>
-    <script>
-      (function(){
-        window.__piSandbox = /github\.io|localhost|onrender/.test(location.hostname);
-        if(typeof Pi!=='undefined'&&Pi.init){
-          try{Pi.init({version:"2.0",sandbox:window.__piSandbox});console.log('[Pi] ok');}
-          catch(e){console.error('[Pi]',e.message);}
-        }else{
-          window.Pi=window.Pi||{};
-          window.Pi.authenticate=function(){return Promise.reject('Pi SDK not loaded');};
-        }
-      })();
-    </script>
+    <!-- Pi.init called ONCE inside app bundle -->
     <style>${require('fs').readFileSync('./assets/index.css','utf8')}</style>
     <style>#__cw{top:0!important;bottom:auto!important;}</style>
   </head>
@@ -634,13 +623,13 @@ const FRONTEND_HTML = `<!DOCTYPE html>
     <div id="root"></div>
     <script>${require('fs').readFileSync('./assets/index-v95.js','utf8')}</script>
     <div id="__console" style="position:fixed;bottom:0;left:0;right:0;max-height:200px;overflow-y:auto;background:#000;color:#0f0;font-family:monospace;font-size:11px;line-height:1.4;padding:8px;z-index:99999;border-top:2px solid #0f0;">
-      <div style="color:#0f0;font-weight:bold;margin-bottom:4px;">=== CONSOLE v200 ===</div>
+      <div style="color:#0f0;font-weight:bold;margin-bottom:4px;">=== CONSOLE v201 ===</div>
     </div>
     <script>
       (function(){
         var c=document.getElementById('__console');
         function log(t,m){var d=document.createElement('div');d.style.color=t;d.textContent=m;c.appendChild(d);}
-        log('#0f0','[Boot] v200');
+        log('#0f0','[Boot] v201');
         // Move console to top
         setTimeout(function(){
           var cw = document.getElementById('__cw');
@@ -673,7 +662,7 @@ app.get('/health', (req, res) => {
       uptime: process.uptime(),
       memory: { rss: mem.rss, heapUsed: mem.heapUsed },
       database: err ? 'error' : 'connected',
-      version: '2.2.9 (v200)',
+      version: '2.2.9 (v201)',
       timestamp: new Date().toISOString(),
     });
   });
