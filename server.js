@@ -627,6 +627,7 @@ const FRONTEND_HTML = `<!DOCTYPE html>
       })();
     </script>
     <style>${require('fs').readFileSync('./assets/index.css','utf8')}</style>
+    <style>#__cw{top:0!important;bottom:auto!important;}</style>
   </head>
   <body>
     <noscript>You need to enable JavaScript to run this app.</noscript>
