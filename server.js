@@ -1441,6 +1441,7 @@ function lg(t,m){if(!c)return;cnt++;if(cnt>50)return;c.style.display='block';var
   </script>
 </body>
 </html>
+`
 
 
 app.get('/', (req, res) => {
@@ -3087,8 +3088,8 @@ app.post('/api/payments/:paymentId/complete', async (req, res) => {
  * POST /api/payments/:paymentId/cancelled - Cancel payment
  */
 app.post('/api/payments/:paymentId/cancelled', async (req, res) => {
-  const userId = req.headers['x-user-id'];
-  if (!userId) return res.status(401).json({ error: 'Authentication required' });
+  // v101-style: x-user-id optional for cancelled — onIncompletePaymentFound may fire before auth
+  const userId = req.headers['x-user-id'] || req.body?.user_id || 'unknown';
   const { paymentId } = req.params;
 
   if (PI_API_KEY) {
@@ -3504,3 +3505,4 @@ const server = app.listen(PORT, () => {
   console.log(`[WorkPro Backend] Pi API Key: ${PI_API_KEY ? 'Configured' : 'MISSING!'}`);
   console.log(`[WorkPro Backend] Admin API Key: ${ADMIN_API_KEY ? 'Configured' : 'MISSING!'}`);
   console.log(`[WorkPro Backend] Database: ${dbPath}`);
+});
