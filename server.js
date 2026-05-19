@@ -619,7 +619,7 @@ const FRONTEND_HTML = `<!DOCTYPE html>
     <link rel="manifest" href="/manifest.json?v=47" />
     <link rel="apple-touch-icon" href="/vite.svg?v=47" />
     <title>Work Pro — Pi Network Freelance Marketplace</title>
-    <script>window.WORKPRO_VERSION='v212';</script>
+    <script>window.WORKPRO_VERSION='v213';</script>
 <script>
 // Fallback: show Sign In button if auto-auth takes too long
 (function(){
@@ -801,11 +801,14 @@ const FRONTEND_HTML = `<!DOCTYPE html>
         if (!uid) { console.log('[Pi] patch: waiting for auth'); return; }
         if (!window.Pi || !window.Pi.createPayment) { console.log('[Pi] patch: Pi.createPayment not ready'); return; }
 
-        function wrapCallback(cb) {
+        function wrapCallback(cb, endpoint) {
           if (typeof cb !== 'function') return cb;
           return function(data) {
+            console.log('[Pi] callback ' + endpoint + ' called with:', data && data.identifier || data);
+            var didFetch = false;
             var origFetch2 = window.fetch;
             window.fetch = function(url, opts) {
+              didFetch = true;
               if (typeof url === 'string' && (url.indexOf('/api/') !== -1 || url.indexOf('workpro-api') !== -1)) {
                 if (!opts) opts = {};
                 if (!opts.headers) opts.headers = {};
@@ -826,19 +829,31 @@ const FRONTEND_HTML = `<!DOCTYPE html>
               console.error('[Pi] Callback error:', e && e.message); 
               throw e; 
             }
+            var fallback = function() {
+              window.fetch = origFetch2;
+              if (!didFetch && endpoint && safeData && safeData.identifier) {
+                var apiUrl = 'https://workpro-api.onrender.com/api/payments/' + safeData.identifier + endpoint;
+                var body = endpoint === '/complete' && safeData.transaction ? JSON.stringify({ txid: safeData.transaction.txid }) : '{}';
+                console.log('[Pi] Fallback fetch to', apiUrl, 'body:', body);
+                fetch(apiUrl, { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-user-id': uid }, body: body })
+                  .then(function(r) { return r.json(); })
+                  .then(function(d) { console.log('[Pi] Fallback success:', JSON.stringify(d)); })
+                  .catch(function(e) { console.error('[Pi] Fallback failed:', e && e.message); });
+              }
+            };
             if (result && typeof result.then === 'function') {
-              result.then(function() { window.fetch = origFetch2; }).catch(function() { window.fetch = origFetch2; });
-            } else { window.fetch = origFetch2; }
+              result.then(fallback).catch(fallback);
+            } else { fallback(); }
             return result;
           };
         }
 
         var origCreatePayment = window.Pi.createPayment;
         window.Pi.createPayment = function(paymentData, callbacks) {
-          if (callbacks.onReadyForServerApproval) callbacks.onReadyForServerApproval = wrapCallback(callbacks.onReadyForServerApproval);
-          if (callbacks.onReadyForServerCompletion) callbacks.onReadyForServerCompletion = wrapCallback(callbacks.onReadyForServerCompletion);
-          if (callbacks.onCancel) callbacks.onCancel = wrapCallback(callbacks.onCancel);
-          if (callbacks.onError) callbacks.onError = wrapCallback(callbacks.onError);
+          if (callbacks.onReadyForServerApproval) callbacks.onReadyForServerApproval = wrapCallback(callbacks.onReadyForServerApproval, '/approve');
+          if (callbacks.onReadyForServerCompletion) callbacks.onReadyForServerCompletion = wrapCallback(callbacks.onReadyForServerCompletion, '/complete');
+          if (callbacks.onCancel) callbacks.onCancel = wrapCallback(callbacks.onCancel, '/cancelled');
+          if (callbacks.onError) callbacks.onError = wrapCallback(callbacks.onError, '');
           return origCreatePayment.call(window.Pi, paymentData, callbacks);
         };
         window._createPaymentPatched = true;
@@ -1332,7 +1347,7 @@ function lg(t,m){if(!c)return;cnt++;if(cnt>50)return;c.style.display='block';var
     <!-- DEBUG CONSOLE -->
     <div id="__cw" style="position:fixed;bottom:0;left:0;right:0;z-index:99998;display:none;"><div id="__ct" style="background:#0d9488;color:#fff;font-size:10px;padding:2px 6px;cursor:pointer;font-family:monospace;text-align:center;" onclick="var c=document.getElementById('__c'),t=document.getElementById('__ct');if(c.style.display==='none'){c.style.display='block';t.textContent='▼ Console'}else{c.style.display='none';t.textContent='▲ Console'}">▼ Console</div><div id="__c" style="max-height:100px;overflow-y:auto;background:rgba(0,0,0,.85);color:#0f0;font-family:monospace;font-size:10px;line-height:1.4;padding:6px;display:block;border-top:2px solid #0f0;"></div></div>
     <script>
-    (function(){var c=document.getElementById('__c'),cw=document.getElementById('__cw'),cnt=0;function lg(t,m){if(!c||!cw)return;cnt++;if(cnt>80)return;cw.style.display='block';c.style.display='block';var d=document.createElement('div');d.style.color=t;d.textContent=m;c.appendChild(d);}lg('#0f0','[WP] v212 start');var o=console.log,oe=console.error,ow=console.warn;console.log=function(){var a=Array.prototype.slice.call(arguments).join(' ');o.apply(console,arguments);lg('#0f0','[L] '+a);};console.error=function(){var a=Array.prototype.slice.call(arguments).join(' ');oe.apply(console,arguments);lg('#f00','[E] '+a);};console.warn=function(){var a=Array.prototype.slice.call(arguments).join(' ');if(a.indexOf('already initialized')>-1)return;ow.apply(console,arguments);lg('#ff0','[W] '+a);};window.onerror=function(m,u,l,co,err){lg('#f00','[ERR] '+m+' @'+l+':'+co);return true;};window.onunhandledrejection=function(e){var r=e.reason||e,msg=r&&r.message?r.message:String(r);lg('#f00','[REJ] '+msg);};})();
+    (function(){var c=document.getElementById('__c'),cw=document.getElementById('__cw'),cnt=0;function lg(t,m){if(!c||!cw)return;cnt++;if(cnt>80)return;cw.style.display='block';c.style.display='block';var d=document.createElement('div');d.style.color=t;d.textContent=m;c.appendChild(d);}lg('#0f0','[WP] v213 start');var o=console.log,oe=console.error,ow=console.warn;console.log=function(){var a=Array.prototype.slice.call(arguments).join(' ');o.apply(console,arguments);lg('#0f0','[L] '+a);};console.error=function(){var a=Array.prototype.slice.call(arguments).join(' ');oe.apply(console,arguments);lg('#f00','[E] '+a);};console.warn=function(){var a=Array.prototype.slice.call(arguments).join(' ');if(a.indexOf('already initialized')>-1)return;ow.apply(console,arguments);lg('#ff0','[W] '+a);};window.onerror=function(m,u,l,co,err){lg('#f00','[ERR] '+m+' @'+l+':'+co);return true;};window.onunhandledrejection=function(e){var r=e.reason||e,msg=r&&r.message?r.message:String(r);lg('#f00','[REJ] '+msg);};})();
     </script>
     <!-- MENU PATCH: Show both client and freelancer menus regardless of role -->
     <script>
@@ -1441,7 +1456,7 @@ app.get('/health', (req, res) => {
       uptime: process.uptime(),
       memory: { rss: mem.rss, heapUsed: mem.heapUsed },
       database: err ? 'error' : 'connected',
-      version: '2.2.9 (v212)',
+      version: '2.2.9 (v213)',
       timestamp: new Date().toISOString(),
     });
   });
