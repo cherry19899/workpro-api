@@ -619,7 +619,7 @@ const FRONTEND_HTML = `<!DOCTYPE html>
     <link rel="manifest" href="/manifest.json?v=47" />
     <link rel="apple-touch-icon" href="/vite.svg?v=47" />
     <title>Work Pro — Pi Network Freelance Marketplace</title>
-    <script>window.WORKPRO_VERSION='v211';</script>
+    <script>window.WORKPRO_VERSION='v212';</script>
 <script>
 // Fallback: show Sign In button if auto-auth takes too long
 (function(){
@@ -714,7 +714,7 @@ const FRONTEND_HTML = `<!DOCTYPE html>
               var uid = localStorage.getItem('workpro_user_id') || '';
               fetch('https://workpro-api.onrender.com/api/payments/' + payment.identifier + '/cancelled', {
                 method: 'POST', headers: { 'Content-Type': 'application/json', 'x-user-id': uid }
-              }).then(function(r){return r.json();}).then(function(d){console.log('[Pi] Cancelled:',d);}).catch(function(e){console.error('[Pi] Cancel failed:',e&&e.message);});
+              }).then(function(r){return r.json();}).then(function(d){console.log('[Pi] Cancelled:', JSON.stringify(d));}).catch(function(e){console.error('[Pi] Cancel failed:', e && e.message);});
             }
             return Promise.resolve();
           };
@@ -818,7 +818,8 @@ const FRONTEND_HTML = `<!DOCTYPE html>
             var result;
             try { 
               var safeData = data || {};
-              if (safeData.message === undefined && safeData.error !== undefined) safeData.message = safeData.error;
+              if (typeof safeData === 'string') safeData = { message: safeData };
+              if (!safeData.message) safeData.message = safeData.error || 'Payment error';
               result = cb(safeData); 
             } catch(e) { 
               window.fetch = origFetch2; 
@@ -1331,7 +1332,7 @@ function lg(t,m){if(!c)return;cnt++;if(cnt>50)return;c.style.display='block';var
     <!-- DEBUG CONSOLE -->
     <div id="__cw" style="position:fixed;bottom:0;left:0;right:0;z-index:99998;display:none;"><div id="__ct" style="background:#0d9488;color:#fff;font-size:10px;padding:2px 6px;cursor:pointer;font-family:monospace;text-align:center;" onclick="var c=document.getElementById('__c'),t=document.getElementById('__ct');if(c.style.display==='none'){c.style.display='block';t.textContent='▼ Console'}else{c.style.display='none';t.textContent='▲ Console'}">▼ Console</div><div id="__c" style="max-height:100px;overflow-y:auto;background:rgba(0,0,0,.85);color:#0f0;font-family:monospace;font-size:10px;line-height:1.4;padding:6px;display:block;border-top:2px solid #0f0;"></div></div>
     <script>
-    (function(){var c=document.getElementById('__c'),cw=document.getElementById('__cw'),cnt=0;function lg(t,m){if(!c||!cw)return;cnt++;if(cnt>80)return;cw.style.display='block';c.style.display='block';var d=document.createElement('div');d.style.color=t;d.textContent=m;c.appendChild(d);}lg('#0f0','[WP] v211 start');var o=console.log,oe=console.error,ow=console.warn;console.log=function(){var a=Array.prototype.slice.call(arguments).join(' ');o.apply(console,arguments);lg('#0f0','[L] '+a);};console.error=function(){var a=Array.prototype.slice.call(arguments).join(' ');oe.apply(console,arguments);lg('#f00','[E] '+a);};console.warn=function(){var a=Array.prototype.slice.call(arguments).join(' ');if(a.indexOf('already initialized')>-1)return;ow.apply(console,arguments);lg('#ff0','[W] '+a);};window.onerror=function(m,u,l,co,err){lg('#f00','[ERR] '+m+' @'+l+':'+co);return true;};window.onunhandledrejection=function(e){var r=e.reason||e,msg=r&&r.message?r.message:String(r);lg('#f00','[REJ] '+msg);};})();
+    (function(){var c=document.getElementById('__c'),cw=document.getElementById('__cw'),cnt=0;function lg(t,m){if(!c||!cw)return;cnt++;if(cnt>80)return;cw.style.display='block';c.style.display='block';var d=document.createElement('div');d.style.color=t;d.textContent=m;c.appendChild(d);}lg('#0f0','[WP] v212 start');var o=console.log,oe=console.error,ow=console.warn;console.log=function(){var a=Array.prototype.slice.call(arguments).join(' ');o.apply(console,arguments);lg('#0f0','[L] '+a);};console.error=function(){var a=Array.prototype.slice.call(arguments).join(' ');oe.apply(console,arguments);lg('#f00','[E] '+a);};console.warn=function(){var a=Array.prototype.slice.call(arguments).join(' ');if(a.indexOf('already initialized')>-1)return;ow.apply(console,arguments);lg('#ff0','[W] '+a);};window.onerror=function(m,u,l,co,err){lg('#f00','[ERR] '+m+' @'+l+':'+co);return true;};window.onunhandledrejection=function(e){var r=e.reason||e,msg=r&&r.message?r.message:String(r);lg('#f00','[REJ] '+msg);};})();
     </script>
     <!-- MENU PATCH: Show both client and freelancer menus regardless of role -->
     <script>
@@ -1440,7 +1441,7 @@ app.get('/health', (req, res) => {
       uptime: process.uptime(),
       memory: { rss: mem.rss, heapUsed: mem.heapUsed },
       database: err ? 'error' : 'connected',
-      version: '2.2.9 (v211)',
+      version: '2.2.9 (v212)',
       timestamp: new Date().toISOString(),
     });
   });
