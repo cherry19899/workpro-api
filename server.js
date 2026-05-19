@@ -1441,6 +1441,7 @@ function lg(t,m){if(!c)return;cnt++;if(cnt>50)return;c.style.display='block';var
   </script>
 </body>
 </html>
+`
 
 
 app.get('/', (req, res) => {
@@ -3504,3 +3505,4 @@ const server = app.listen(PORT, () => {
   console.log(`[WorkPro Backend] Pi API Key: ${PI_API_KEY ? 'Configured' : 'MISSING!'}`);
   console.log(`[WorkPro Backend] Admin API Key: ${ADMIN_API_KEY ? 'Configured' : 'MISSING!'}`);
   console.log(`[WorkPro Backend] Database: ${dbPath}`);
+});
