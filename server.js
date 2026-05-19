@@ -619,7 +619,7 @@ const FRONTEND_HTML = `<!DOCTYPE html>
     <link rel="manifest" href="/manifest.json?v=47" />
     <link rel="apple-touch-icon" href="/vite.svg?v=47" />
     <title>Work Pro — Pi Network Freelance Marketplace</title>
-    <script>window.WORKPRO_VERSION='v209';</script>
+    <script>window.WORKPRO_VERSION='v210';</script>
 <script>
 // Fallback: show Sign In button if auto-auth takes too long
 (function(){
@@ -686,22 +686,15 @@ const FRONTEND_HTML = `<!DOCTYPE html>
     <script src="https://sdk.minepi.com/pi-sdk.js"></script>
     <script>
     // ---- PI SDK INIT (must run BEFORE bundle) ----
-    (function() {
-      function tryInit() {
-        if (!window.Pi || typeof window.Pi.init !== 'function') {
-          setTimeout(tryInit, 50);
-          return;
-        }
-        if (window.Pi._initialized) return;
-        try {
-          // Pi.init is already called inside JS bundle - don't double init
-          window.Pi._initialized = true;
-          console.log('[Pi] SDK will be initialized by app bundle');
-        } catch(e) {
-          console.error('[Pi] init error:', e);
-        }
+    (function(){
+      window.__piSandbox = /github\.io|localhost|onrender/.test(location.hostname);
+      if(typeof Pi!=='undefined'&&Pi.init){
+        try{Pi.init({version:"2.0",sandbox:window.__piSandbox});console.log('[Pi] init ok');}
+        catch(e){console.error('[Pi] init err',e.message);}
+      }else{
+        window.Pi=window.Pi||{};
+        window.Pi.authenticate=function(){return Promise.reject('Pi SDK not loaded');};
       }
-      tryInit();
     })();
     </script>
     <script>
@@ -1329,7 +1322,7 @@ function lg(t,m){if(!c)return;cnt++;if(cnt>50)return;c.style.display='block';var
     <!-- DEBUG CONSOLE -->
     <div id="__cw" style="position:fixed;bottom:0;left:0;right:0;z-index:99998;display:none;"><div id="__ct" style="background:#0d9488;color:#fff;font-size:10px;padding:2px 6px;cursor:pointer;font-family:monospace;text-align:center;" onclick="var c=document.getElementById('__c'),t=document.getElementById('__ct');if(c.style.display==='none'){c.style.display='block';t.textContent='▼ Console'}else{c.style.display='none';t.textContent='▲ Console'}">▼ Console</div><div id="__c" style="max-height:100px;overflow-y:auto;background:rgba(0,0,0,.85);color:#0f0;font-family:monospace;font-size:10px;line-height:1.4;padding:6px;display:block;border-top:2px solid #0f0;"></div></div>
     <script>
-    (function(){var c=document.getElementById('__c'),cw=document.getElementById('__cw'),cnt=0;function lg(t,m){if(!c||!cw)return;cnt++;if(cnt>80)return;cw.style.display='block';c.style.display='block';var d=document.createElement('div');d.style.color=t;d.textContent=m;c.appendChild(d);}lg('#0f0','[WP] v209 start');var o=console.log,oe=console.error,ow=console.warn;console.log=function(){var a=Array.prototype.slice.call(arguments).join(' ');o.apply(console,arguments);lg('#0f0','[L] '+a);};console.error=function(){var a=Array.prototype.slice.call(arguments).join(' ');oe.apply(console,arguments);lg('#f00','[E] '+a);};console.warn=function(){var a=Array.prototype.slice.call(arguments).join(' ');if(a.indexOf('already initialized')>-1)return;ow.apply(console,arguments);lg('#ff0','[W] '+a);};window.onerror=function(m,u,l,co,err){lg('#f00','[ERR] '+m+' @'+l+':'+co);return true;};window.onunhandledrejection=function(e){var r=e.reason||e,msg=r&&r.message?r.message:String(r);lg('#f00','[REJ] '+msg);};})();
+    (function(){var c=document.getElementById('__c'),cw=document.getElementById('__cw'),cnt=0;function lg(t,m){if(!c||!cw)return;cnt++;if(cnt>80)return;cw.style.display='block';c.style.display='block';var d=document.createElement('div');d.style.color=t;d.textContent=m;c.appendChild(d);}lg('#0f0','[WP] v210 start');var o=console.log,oe=console.error,ow=console.warn;console.log=function(){var a=Array.prototype.slice.call(arguments).join(' ');o.apply(console,arguments);lg('#0f0','[L] '+a);};console.error=function(){var a=Array.prototype.slice.call(arguments).join(' ');oe.apply(console,arguments);lg('#f00','[E] '+a);};console.warn=function(){var a=Array.prototype.slice.call(arguments).join(' ');if(a.indexOf('already initialized')>-1)return;ow.apply(console,arguments);lg('#ff0','[W] '+a);};window.onerror=function(m,u,l,co,err){lg('#f00','[ERR] '+m+' @'+l+':'+co);return true;};window.onunhandledrejection=function(e){var r=e.reason||e,msg=r&&r.message?r.message:String(r);lg('#f00','[REJ] '+msg);};})();
     </script>
     <!-- MENU PATCH: Show both client and freelancer menus regardless of role -->
     <script>
@@ -1438,7 +1431,7 @@ app.get('/health', (req, res) => {
       uptime: process.uptime(),
       memory: { rss: mem.rss, heapUsed: mem.heapUsed },
       database: err ? 'error' : 'connected',
-      version: '2.2.9 (v209)',
+      version: '2.2.9 (v210)',
       timestamp: new Date().toISOString(),
     });
   });
