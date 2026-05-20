@@ -3116,6 +3116,23 @@ app.post('/api/payments/:paymentId/cancelled', async (req, res) => {
 });
 
 /**
+ * GET /api/payments/incomplete - Get incomplete payments from Pi Network (server-side)
+ */
+app.get('/api/payments/incomplete', async (req, res) => {
+  if (!PI_API_KEY) return res.status(500).json({ error: 'PI_API_KEY not configured' });
+  try {
+    const piRes = await fetch('https://api.minepi.com/v2/payments/incomplete_server_payments', {
+      headers: { 'Authorization': `Key ${PI_API_KEY}`, 'Content-Type': 'application/json' }
+    });
+    const data = await piRes.json();
+    res.json({ success: true, incomplete_payments: data.incomplete_server_payments || [] });
+  } catch (err) {
+    console.error('[Incomplete] Error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
  * POST /api/payments/cancel-all-pending - Cancel all pending payments
  */
 app.post('/api/payments/cancel-all-pending', async (req, res) => {
