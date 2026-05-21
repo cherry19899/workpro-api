@@ -2967,6 +2967,12 @@ app.post('/api/users/:id/availability', async (req, res) => {
 app.get('/api/users/:id/portfolio', async (req, res) => {
   const { id } = req.params;
   try {
+    const owner = await new Promise((resolve, reject) => {
+      db.get(`SELECT uid, username, name FROM users WHERE uid = ? OR id = ?`, [id, id], (err, row) => {
+        if (err) return reject(err);
+        resolve(row || { uid: id, username: 'Pi User', name: 'Pi User' });
+      });
+    });
     const portfolio = await new Promise((resolve, reject) => {
       db.get(`SELECT * FROM user_portfolios WHERE user_id = ?`, [id], (err, row) => {
         if (err) return reject(err);
@@ -2990,7 +2996,7 @@ app.get('/api/users/:id/portfolio', async (req, res) => {
         resolve(row || { jobs_posted: 0, jobs_completed: 0, rating: 0 });
       });
     });
-    res.json({ portfolio, items, stats });
+    res.json({ owner, portfolio, items, stats });
   } catch (err) {
     console.error('[Portfolio] Error:', err);
     res.status(500).json({ error: err.message });
