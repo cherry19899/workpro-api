@@ -11,7 +11,3 @@ services:
         value: nzfwvq0xw4ep2mvlallq9baoyc1jjywvke8bz7trwpxfzgiafgobmjbeanlebs4j
       - key: FRONTEND_URL
         value: https://cherry19899.github.io
-      - key: PI_API_KEY
-        value: nzfwvq0xw4ep2mvlallq9baoyc1jjywvke8bz7trwpxfzgiafgobmjbeanlebs4j
-      - key: FRONTEND_URL
-        value: https://cherry19899.github.io
