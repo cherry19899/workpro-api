@@ -2983,7 +2983,7 @@ app.get('/api/users/:id/portfolio', async (req, res) => {
       db.get(`
         SELECT 
           (SELECT COUNT(*) FROM jobs WHERE posted_by = ? AND status = 'completed') as jobs_posted,
-          (SELECT COUNT(*) FROM jobs WHERE assigned_to = ? AND status = 'completed') as jobs_completed,
+          (SELECT COUNT(*) FROM escrows WHERE freelancer_id = ? AND status = 'completed') as jobs_completed,
           (SELECT AVG(rating) FROM reviews WHERE target_id = ?) as rating
       `, [id, id, id], (err, row) => {
         if (err) return reject(err);
