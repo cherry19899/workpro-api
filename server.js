@@ -2968,9 +2968,9 @@ app.get('/api/users/:id/portfolio', async (req, res) => {
   const { id } = req.params;
   try {
     const owner = await new Promise((resolve, reject) => {
-      db.get(`SELECT id, username, name FROM users WHERE id = ?`, [id], (err, row) => {
+      db.get(`SELECT id, username FROM users WHERE id = ?`, [id], (err, row) => {
         if (err) return reject(err);
-        resolve(row || { id: id, username: 'Pi User', name: 'Pi User' });
+        resolve(row || { id: id, username: 'Pi User' });
       });
     });
     const portfolio = await new Promise((resolve, reject) => {
