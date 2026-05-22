@@ -294,6 +294,32 @@ CREATE TABLE IF NOT EXISTS notifications (
   created_at        DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
+-- 13. PORTFOLIO ITEMS
+CREATE TABLE IF NOT EXISTS portfolio_items (
+  id                TEXT PRIMARY KEY,
+  user_id           TEXT NOT NULL,
+  title             TEXT NOT NULL,
+  description       TEXT,
+  image_url         TEXT,
+  category          TEXT,
+  tags              TEXT,
+  created_at        DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+-- 14. USER PORTFOLIO METADATA
+CREATE TABLE IF NOT EXISTS user_portfolios (
+  user_id           TEXT PRIMARY KEY,
+  headline          TEXT,
+  summary           TEXT,
+  experience_years  INTEGER DEFAULT 0,
+  website           TEXT,
+  github            TEXT,
+  linkedin          TEXT,
+  updated_at        DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
 CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, is_read, created_at DESC);
 
 -- INDEXES
@@ -332,6 +358,8 @@ CREATE INDEX IF NOT EXISTS idx_connects_status ON connects_purchases(status);
 CREATE INDEX IF NOT EXISTS idx_offers_client ON offers(client_id);
 CREATE INDEX IF NOT EXISTS idx_offers_freelancer ON offers(freelancer_id);
 CREATE INDEX IF NOT EXISTS idx_offers_status ON offers(status);
+CREATE INDEX IF NOT EXISTS idx_portfolio_user ON portfolio_items(user_id);
+CREATE INDEX IF NOT EXISTS idx_portfolio_category ON portfolio_items(category);
 `;
 
 // ─── Initialize Database ────────────────────────────────────────
@@ -2930,6 +2958,129 @@ app.post('/api/users/:id/availability', async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════
+//  PORTFOLIO
+// ════════════════════════════════════════════════════════════════
+
+/**
+ * GET /api/users/:id/portfolio - Get user portfolio
+ */
+app.get('/api/users/:id/portfolio', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const owner = await new Promise((resolve, reject) => {
+      db.get(`SELECT id, username FROM users WHERE id = ?`, [id], (err, row) => {
+        if (err) return reject(err);
+        resolve(row || { id: id, username: 'Pi User' });
+      });
+    });
+    const portfolio = await new Promise((resolve, reject) => {
+      db.get(`SELECT * FROM user_portfolios WHERE user_id = ?`, [id], (err, row) => {
+        if (err) return reject(err);
+        resolve(row || { user_id: id, headline: '', summary: '', experience_years: 0, website: '', github: '', linkedin: '' });
+      });
+    });
+    const items = await new Promise((resolve, reject) => {
+      db.all(`SELECT * FROM portfolio_items WHERE user_id = ? ORDER BY created_at DESC`, [id], (err, rows) => {
+        if (err) return reject(err);
+        resolve(rows || []);
+      });
+    });
+    const stats = await new Promise((resolve, reject) => {
+      db.get(`
+        SELECT 
+          (SELECT COUNT(*) FROM jobs WHERE posted_by = ? AND status = 'completed') as jobs_posted,
+          (SELECT COUNT(*) FROM escrows WHERE freelancer_id = ? AND status = 'completed') as jobs_completed,
+          (SELECT AVG(rating) FROM reviews WHERE target_id = ?) as rating
+      `, [id, id, id], (err, row) => {
+        if (err) return reject(err);
+        resolve(row || { jobs_posted: 0, jobs_completed: 0, rating: 0 });
+      });
+    });
+    res.json({ owner, portfolio, items, stats });
+  } catch (err) {
+    console.error('[Portfolio] Error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * PUT /api/users/me/portfolio - Update own portfolio metadata
+ */
+app.put('/api/users/me/portfolio', async (req, res) => {
+  const userId = req.headers['x-user-id'];
+  if (!userId) return res.status(401).json({ error: 'Authentication required' });
+  const { headline, summary, experience_years, website, github, linkedin } = req.body;
+  try {
+    await new Promise((resolve, reject) => {
+      db.run(`
+        INSERT INTO user_portfolios (user_id, headline, summary, experience_years, website, github, linkedin, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(user_id) DO UPDATE SET
+          headline = excluded.headline,
+          summary = excluded.summary,
+          experience_years = excluded.experience_years,
+          website = excluded.website,
+          github = excluded.github,
+          linkedin = excluded.linkedin,
+          updated_at = CURRENT_TIMESTAMP
+      `, [userId, headline || '', summary || '', experience_years || 0, website || '', github || '', linkedin || ''], function(err) {
+        if (err) return reject(err);
+        resolve(this);
+      });
+    });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[Portfolio] Update error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /api/users/me/portfolio/items - Add portfolio item
+ */
+app.post('/api/users/me/portfolio/items', async (req, res) => {
+  const userId = req.headers['x-user-id'];
+  if (!userId) return res.status(401).json({ error: 'Authentication required' });
+  const { title, description, image_url, category, tags } = req.body;
+  if (!title) return res.status(400).json({ error: 'Title is required' });
+  const id = crypto.randomUUID();
+  try {
+    await new Promise((resolve, reject) => {
+      db.run(`INSERT INTO portfolio_items (id, user_id, title, description, image_url, category, tags) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [id, userId, title, description || '', image_url || '', category || '', Array.isArray(tags) ? tags.join(',') : (tags || '')], function(err) {
+        if (err) return reject(err);
+        resolve(this);
+      });
+    });
+    res.json({ success: true, id });
+  } catch (err) {
+    console.error('[Portfolio] Add item error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * DELETE /api/users/me/portfolio/items/:itemId - Remove portfolio item
+ */
+app.delete('/api/users/me/portfolio/items/:itemId', async (req, res) => {
+  const userId = req.headers['x-user-id'];
+  if (!userId) return res.status(401).json({ error: 'Authentication required' });
+  const { itemId } = req.params;
+  try {
+    await new Promise((resolve, reject) => {
+      db.run(`DELETE FROM portfolio_items WHERE id = ? AND user_id = ?`, [itemId, userId], function(err) {
+        if (err) return reject(err);
+        resolve(this);
+      });
+    });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[Portfolio] Delete item error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════
 //  CATEGORIES
 // ════════════════════════════════════════════════════════════════
 
@@ -3354,6 +3505,17 @@ app.post('/api/connects/buy', async (req, res) => {
 // ════════════════════════════════════════════════════════════════
 //  ADMIN (Protected)
 // ════════════════════════════════════════════════════════════════
+
+// Debug: check Pi API key configuration (safe, no key exposure)
+app.get('/api/debug/pi-status', (req, res) => {
+  res.json({ 
+    pi_api_configured: !!PI_API_KEY, 
+    sandbox_mode: IS_SANDBOX,
+    frontend_url: FRONTEND_URL,
+    node_env: NODE_ENV,
+    server_time: new Date().toISOString()
+  });
+});
 
 app.get('/api/admin/stats', requireAdmin, (req, res) => {
   db.get(`SELECT COUNT(*) as total_users FROM users`, [], (err, usersRow) => {
