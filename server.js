@@ -2937,11 +2937,6 @@ app.get('/api/reviews/stats/:user_id', (req, res) => {
 
 // ════════════════════════════════════════════════════════════════
 //  USERS
-// ════════════════════════════════════════════════════════════════
-
-/**
- * GET /api/users/:id - User profile
- */
 app.get('/api/users/:id', (req, res) => {
   db.get(`SELECT * FROM users WHERE id = ?`, [req.params.id], (err, user) => {
     if (err) return res.status(500).json({ error: 'Database error' });
@@ -2950,19 +2945,7 @@ app.get('/api/users/:id', (req, res) => {
   });
 });
 
-/**
- * GET /api/users/me - Get current user profile
- */
-app.get('/api/users/me', (req, res) => {
-  const userId = req.headers['x-user-id'];
-  if (!userId) return res.status(401).json({ error: 'Authentication required' });
 
-  db.get(`SELECT * FROM users WHERE id = ?`, [userId], (err, user) => {
-    if (err) return res.status(500).json({ error: 'Database error' });
-    if (!user) return res.status(404).json({ error: 'User not found' });
-    res.json(user);
-  });
-});
 
 /**
  * PUT /api/users/:id - Update profile
@@ -3045,6 +3028,20 @@ app.post('/api/users/:id/availability', async (req, res) => {
 
 // ════════════════════════════════════════════════════════════════
 //  PORTFOLIO
+/**
+ * GET /api/users/me - Get current user profile
+ */
+app.get('/api/users/me', (req, res) => {
+  const userId = req.headers['x-user-id'];
+  if (!userId) return res.status(401).json({ error: 'Authentication required' });
+
+  db.get(`SELECT * FROM users WHERE id = ?`, [userId], (err, user) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    res.json(user);
+  });
+});
+
 // ════════════════════════════════════════════════════════════════
 
 /**
