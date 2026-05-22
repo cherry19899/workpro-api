@@ -1612,14 +1612,19 @@ app.get('/api/jobs', (req, res) => {
                  LIMIT ? OFFSET ?`;
     const params = [...whereParams, limitInt, offset];
 
-    db.all(sql, params, (err, rows) => {
-      if (err) return res.status(500).json({ error: 'Database error', details: err.message });
       rows.forEach(row => {
         if (row.images) try { row.images = JSON.parse(row.images); } catch(e) {}
+        // Normalize skills to array
+        if (row.skills) {
+          if (typeof row.skills === 'string') {
+            try { row.skills = JSON.parse(row.skills); } catch(e) { row.skills = row.skills.split(',').map(s => s.trim()).filter(Boolean); }
+          }
+          if (!Array.isArray(row.skills)) row.skills = [];
+        } else {
+          row.skills = [];
+        }
         row.apply_cost = Math.ceil((row.budget || 0) / 50) || 1;
       });
-      res.json({ jobs: rows, page: pageInt, limit: limitInt, total, total_pages: totalPages });
-    });
   });
 });
 
