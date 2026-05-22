@@ -606,6 +606,15 @@ function getJob(jobId, callback) {
     if (err) return callback(err, null);
     if (row) {
       if (row.images) try { row.images = JSON.parse(row.images); } catch(e) {}
+      // Normalize skills to array
+      if (row.skills) {
+        if (typeof row.skills === 'string') {
+          try { row.skills = JSON.parse(row.skills); } catch(e) { row.skills = row.skills.split(',').map(s => s.trim()).filter(Boolean); }
+        }
+        if (!Array.isArray(row.skills)) row.skills = [];
+      } else {
+        row.skills = [];
+      }
       row.apply_cost = Math.ceil((row.budget || 0) / 50) || 1;
     }
     callback(err, row);
@@ -1647,6 +1656,15 @@ app.get('/api/jobs/search', (req, res) => {
       if (err) return res.status(500).json({ error: 'Database error' });
       rows.forEach(row => {
         if (row.images) try { row.images = JSON.parse(row.images); } catch(e) {}
+        // Normalize skills to array
+        if (row.skills) {
+          if (typeof row.skills === 'string') {
+            try { row.skills = JSON.parse(row.skills); } catch(e) { row.skills = row.skills.split(',').map(s => s.trim()).filter(Boolean); }
+          }
+          if (!Array.isArray(row.skills)) row.skills = [];
+        } else {
+          row.skills = [];
+        }
         row.apply_cost = Math.ceil((row.budget || 0) / 50) || 1;
       });
       res.json({ jobs: rows, query: q });
@@ -1674,6 +1692,15 @@ app.get('/api/jobs/me', async (req, res) => {
       if (err) return res.status(500).json({ error: 'Database error' });
       rows.forEach(row => {
         if (row.images) try { row.images = JSON.parse(row.images); } catch(e) {}
+        // Normalize skills to array
+        if (row.skills) {
+          if (typeof row.skills === 'string') {
+            try { row.skills = JSON.parse(row.skills); } catch(e) { row.skills = row.skills.split(',').map(s => s.trim()).filter(Boolean); }
+          }
+          if (!Array.isArray(row.skills)) row.skills = [];
+        } else {
+          row.skills = [];
+        }
         row.apply_cost = Math.ceil((row.budget || 0) / 50) || 1;
       });
       res.json({ 
@@ -1705,6 +1732,15 @@ app.get('/api/jobs/user/:username', async (req, res) => {
       if (err) return res.status(500).json({ error: 'Database error' });
       rows.forEach(row => {
         if (row.images) try { row.images = JSON.parse(row.images); } catch(e) {}
+        // Normalize skills to array
+        if (row.skills) {
+          if (typeof row.skills === 'string') {
+            try { row.skills = JSON.parse(row.skills); } catch(e) { row.skills = row.skills.split(',').map(s => s.trim()).filter(Boolean); }
+          }
+          if (!Array.isArray(row.skills)) row.skills = [];
+        } else {
+          row.skills = [];
+        }
         row.apply_cost = Math.ceil((row.budget || 0) / 50) || 1;
       });
       res.json(rows || []);
