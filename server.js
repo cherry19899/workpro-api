@@ -3362,6 +3362,110 @@ app.get('/api/payments/incomplete', async (req, res) => {
   }
 });
 
+
+/**
+ * POST /api/payments/incomplete - Handle a single incomplete payment
+ */
+app.post('/api/payments/incomplete', async (req, res) => {
+  const userId = req.headers['x-user-id'];
+  if (!userId) return res.status(401).json({ error: 'Authentication required' });
+
+  const { payment } = req.body;
+  if (!payment || !payment.identifier) {
+    return res.status(400).json({ error: 'Payment identifier required' });
+  }
+
+  const paymentId = payment.identifier;
+  const txid = payment.transaction && payment.transaction.txid;
+
+  try {
+    // Check if payment exists in our DB
+    const localPayment = await new Promise((resolve, reject) => {
+      db.get(
+        'SELECT * FROM payments WHERE id = ?',
+        [paymentId],
+        (err, row) => {
+          if (err) return reject(err);
+          resolve(row);
+        }
+      );
+    });
+
+    if (!localPayment) {
+      // Payment not in our DB - just cancel it on Pi side
+      if (PI_API_KEY) {
+        try {
+          const encodedPaymentId = encodeURIComponent(paymentId);
+          await fetch('https://api.minepi.com/v2/payments/' + encodedPaymentId + '/cancel', {
+            method: 'POST',
+            headers: { 'Authorization': 'Key ' + PI_API_KEY, 'Content-Type': 'application/json' }
+          });
+        } catch (e) {
+          console.warn('[Incomplete] Cancel failed:', e.message);
+        }
+      }
+      return res.json({ success: true, action: 'cancelled', reason: 'Payment not found in local DB' });
+    }
+
+    // If payment has txid, try to complete it
+    if (txid && PI_API_KEY) {
+      try {
+        const encodedPaymentId = encodeURIComponent(paymentId);
+        const piRes = await fetch('https://api.minepi.com/v2/payments/' + encodedPaymentId + '/complete', {
+          method: 'POST',
+          headers: { 'Authorization': 'Key ' + PI_API_KEY, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ txid })
+        });
+        
+        if (piRes.ok) {
+          // Update local DB
+          db.run('UPDATE payments SET status = "completed", txid = ?, completed_at = datetime("now") WHERE id = ?', [txid, paymentId]);
+          
+          // If it's a connects purchase, update balance
+          const connectsPurchase = await new Promise((resolve, reject) => {
+            db.get('SELECT * FROM connects_purchases WHERE payment_id = ?', [paymentId], (err, row) => {
+              if (err) return reject(err);
+              resolve(row);
+            });
+          });
+          
+          if (connectsPurchase) {
+            updateUserBalance(connectsPurchase.user_id, connectsPurchase.quantity || 0, 0, (err) => {
+              if (err) console.warn('[Incomplete] Balance update failed:', err.message);
+            });
+            db.run('UPDATE connects_purchases SET status = "completed" WHERE payment_id = ?', [paymentId]);
+          }
+          
+          return res.json({ success: true, action: 'completed', txid });
+        }
+      } catch (e) {
+        console.warn('[Incomplete] Complete failed:', e.message);
+      }
+    }
+
+    // Otherwise cancel it
+    if (PI_API_KEY) {
+      try {
+        const encodedPaymentId = encodeURIComponent(paymentId);
+        await fetch('https://api.minepi.com/v2/payments/' + encodedPaymentId + '/cancel', {
+          method: 'POST',
+          headers: { 'Authorization': 'Key ' + PI_API_KEY, 'Content-Type': 'application/json' }
+        });
+      } catch (e) {
+        console.warn('[Incomplete] Cancel failed:', e.message);
+      }
+    }
+    
+    db.run('UPDATE payments SET status = "cancelled" WHERE id = ?', [paymentId]);
+    db.run('UPDATE connects_purchases SET status = "cancelled" WHERE payment_id = ?', [paymentId]);
+    
+    res.json({ success: true, action: 'cancelled' });
+  } catch (err) {
+    console.error('[Incomplete] Error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 /**
  * POST /api/payments/cancel-all-pending - Cancel all pending payments
  */
