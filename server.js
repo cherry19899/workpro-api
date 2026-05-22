@@ -3463,6 +3463,23 @@ app.get('/api/admin/escrows', requireAdmin, (req, res) => {
   });
 });
 
+/**
+ * DELETE /api/admin/jobs/:id - Admin delete any job
+ */
+app.delete('/api/admin/jobs/:id', requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  db.run(`DELETE FROM jobs WHERE id = ?`, [id], function(err) {
+    if (err) {
+      console.error('[Admin] Delete job error:', err);
+      return res.status(500).json({ error: 'Failed to delete job' });
+    }
+    if (this.changes === 0) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+    res.json({ success: true, deleted: this.changes });
+  });
+});
+
 // ════════════════════════════════════════════════════════════════
 //  GRACEFUL SHUTDOWN
 // ════════════════════════════════════════════════════════════════
