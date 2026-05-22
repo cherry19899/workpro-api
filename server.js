@@ -2927,16 +2927,43 @@ app.get('/api/reviews', (req, res) => {
  * GET /api/reviews/stats/:user_id - Get review stats
  */
 app.get('/api/reviews/stats/:user_id', (req, res) => {
-  db.all(`SELECT rating FROM reviews WHERE target_id = ?`, [req.params.user_id], (err, rows) => {
-    if (err) return res.status(500).json({ error: 'Database error' });
-    const count = rows.length;
-    const average_rating = count > 0 ? (rows.reduce((sum, r) => sum + r.rating, 0) / count).toFixed(1) : 0;
-    res.json({ count, average_rating: parseFloat(average_rating) });
+  const userId = req.headers['x-user-id'];
+  if (!userId) return res.status(401).json({ error: 'Authentication required' });
+  if (userId !== req.params.id) return res.status(403).json({ error: 'Can only update your own profile' });
+
+  const { availability } = req.body;
+  if (!availability || !['available', 'busy'].includes(availability)) {
+    return res.status(400).json({ error: 'Invalid availability. Use "available" or "busy"' });
+  }
+
+  db.run(`UPDATE users SET availability = ? WHERE id = ?`, [availability, req.params.id], function(err) {
+    if (err) return res.status(500).json({ error: 'Failed to update availability' });
+    res.json({ success: true, availability });
   });
 });
 
 // ════════════════════════════════════════════════════════════════
-//  USERS
+//  PORTFOLIO
+/**
+ * GET /api/users/me - Get current user profile
+ */
+app.get('/api/users/me', (req, res) => {
+  const userId = req.headers['x-user-id'];
+  if (!userId) return res.status(401).json({ error: 'Authentication required' });
+
+  db.get(`SELECT * FROM users WHERE id = ?`, [userId], (err, user) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    res.json(user);
+  });
+
+});
+
+
+
+/**
+ * GET /api/users/:id - Get public profile
+ */
 app.get('/api/users/:id', (req, res) => {
   db.get(`SELECT * FROM users WHERE id = ?`, [req.params.id], (err, user) => {
     if (err) return res.status(500).json({ error: 'Database error' });
@@ -2944,8 +2971,6 @@ app.get('/api/users/:id', (req, res) => {
     res.json(user);
   });
 });
-
-
 
 /**
  * PUT /api/users/:id - Update profile
@@ -3011,35 +3036,6 @@ app.put('/api/users/:id/avatar', (req, res) => {
  * POST /api/users/:id/availability - Update availability (frontend compatibility)
  */
 app.post('/api/users/:id/availability', async (req, res) => {
-  const userId = req.headers['x-user-id'];
-  if (!userId) return res.status(401).json({ error: 'Authentication required' });
-  if (userId !== req.params.id) return res.status(403).json({ error: 'Can only update your own profile' });
-
-  const { availability } = req.body;
-  if (!availability || !['available', 'busy'].includes(availability)) {
-    return res.status(400).json({ error: 'Invalid availability. Use "available" or "busy"' });
-  }
-
-  db.run(`UPDATE users SET availability = ? WHERE id = ?`, [availability, req.params.id], function(err) {
-    if (err) return res.status(500).json({ error: 'Failed to update availability' });
-    res.json({ success: true, availability });
-  });
-});
-
-// ════════════════════════════════════════════════════════════════
-//  PORTFOLIO
-/**
- * GET /api/users/me - Get current user profile
- */
-app.get('/api/users/me', (req, res) => {
-  const userId = req.headers['x-user-id'];
-  if (!userId) return res.status(401).json({ error: 'Authentication required' });
-
-  db.get(`SELECT * FROM users WHERE id = ?`, [userId], (err, user) => {
-    if (err) return res.status(500).json({ error: 'Database error' });
-    if (!user) return res.status(404).json({ error: 'User not found' });
-    res.json(user);
-  });
 });
 
 // ════════════════════════════════════════════════════════════════
