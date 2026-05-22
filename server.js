@@ -2425,8 +2425,50 @@ app.post('/api/chat/:roomId/messages', async (req, res) => {
 });
 
 /**
- * POST /api/chat/start - Start a new chat with a user
+ * GET /api/chat/unread - Get total unread messages across all rooms for current user
  */
+app.get('/api/chat/unread', async (req, res) => {
+  const userId = req.headers['x-user-id'];
+  if (!userId) return res.status(401).json({ error: 'Authentication required' });
+
+  try {
+    // Get all rooms for this user
+    const rooms = await new Promise((resolve, reject) => {
+      db.all(`SELECT id FROM chat_rooms WHERE user1_id = ? OR user2_id = ?`, [userId, userId], (err, rows) => {
+        if (err) reject(err);
+        else resolve(rows || []);
+      });
+    });
+
+    if (rooms.length === 0) {
+      return res.json({ unread_count: 0, unread_by_room: [] });
+    }
+
+    // Count unread messages in each room (messages where sender_id != userId and no read tracking)
+    // Since chat_messages doesn't have a read flag, we use a simple approach:
+    // Count messages from others in rooms where user is a participant
+    const roomIds = rooms.map(r => r.id);
+    const placeholders = roomIds.map(() => '?').join(',');
+
+    db.get(
+      `SELECT COUNT(*) as unread_count FROM chat_messages 
+       WHERE room_id IN (${placeholders}) AND sender_id != ?`,
+      [...roomIds, userId],
+      (err, row) => {
+        if (err) {
+          console.error('[Chat/Unread] Error:', err);
+          return res.status(500).json({ error: 'Database error' });
+        }
+        res.json({ unread_count: row ? row.unread_count : 0 });
+      }
+    );
+  } catch (err) {
+    console.error('[Chat/Unread] Error:', err);
+    res.status(500).json({ error: 'Failed to fetch unread count' });
+  }
+});
+
+
 app.post('/api/chat/start', async (req, res) => {
   const userId = req.headers['x-user-id'];
   if (!userId) return res.status(401).json({ error: 'Authentication required' });
