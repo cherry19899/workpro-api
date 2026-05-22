@@ -1612,6 +1612,8 @@ app.get('/api/jobs', (req, res) => {
                  LIMIT ? OFFSET ?`;
     const params = [...whereParams, limitInt, offset];
 
+    db.all(sql, params, (err, rows) => {
+      if (err) return res.status(500).json({ error: 'Database error' });
       rows.forEach(row => {
         if (row.images) try { row.images = JSON.parse(row.images); } catch(e) {}
         // Normalize skills to array
@@ -1625,7 +1627,8 @@ app.get('/api/jobs', (req, res) => {
         }
         row.apply_cost = Math.ceil((row.budget || 0) / 50) || 1;
       });
-  });
+      res.json({ jobs: rows, page: pageInt, limit: limitInt, total, total_pages: totalPages });
+    });
 });
 
 /**
