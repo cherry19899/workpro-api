@@ -2289,6 +2289,14 @@ app.get('/api/applications/me', async (req, res) => {
 });
 
 /**
+ * GET /api/applications/my - Alias for /api/applications/me (frontend compatibility)
+ */
+app.get('/api/applications/my', async (req, res) => {
+  req.url = '/api/applications/me';
+  app._router.handle(req, res);
+});
+
+/**
  * GET /api/applications/user/:userId - Get applications for a user (returns ARRAY for frontend compatibility)
  */
 app.get('/api/applications/user/:userId', async (req, res) => {
@@ -2662,6 +2670,28 @@ app.get('/api/escrows/me', async (req, res) => {
 });
 
 /**
+ * GET /api/escrow - Alias for /api/escrows/me (frontend compatibility)
+ */
+app.get('/api/escrow', async (req, res) => {
+  const userId = req.headers['x-user-id'];
+  if (!userId) return res.status(401).json({ error: 'Authentication required' });
+
+  db.get(`SELECT COUNT(*) as total FROM escrows WHERE client_id = ? OR freelancer_id = ?`, [userId, userId], (err, countRow) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    const total = countRow ? countRow.total : 0;
+
+    db.all(
+      `SELECT * FROM escrows WHERE client_id = ? OR freelancer_id = ? ORDER BY created_at DESC`,
+      [userId, userId],
+      (err, rows) => {
+        if (err) return res.status(500).json({ error: 'Database error' });
+        res.json({ escrows: rows || [], total, page: 1, limit: 20, total_pages: Math.ceil(total / 20) });
+      }
+    );
+  });
+});
+
+/**
  * GET /api/escrows/:id - Get escrow
  */
 app.get('/api/escrows/:id', async (req, res) => {
@@ -2914,6 +2944,20 @@ app.get('/api/reviews/stats/:user_id', (req, res) => {
  */
 app.get('/api/users/:id', (req, res) => {
   db.get(`SELECT * FROM users WHERE id = ?`, [req.params.id], (err, user) => {
+    if (err) return res.status(500).json({ error: 'Database error' });
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    res.json(user);
+  });
+});
+
+/**
+ * GET /api/users/me - Get current user profile
+ */
+app.get('/api/users/me', (req, res) => {
+  const userId = req.headers['x-user-id'];
+  if (!userId) return res.status(401).json({ error: 'Authentication required' });
+
+  db.get(`SELECT * FROM users WHERE id = ?`, [userId], (err, user) => {
     if (err) return res.status(500).json({ error: 'Database error' });
     if (!user) return res.status(404).json({ error: 'User not found' });
     res.json(user);
