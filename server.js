@@ -7,7 +7,7 @@
  *  Tech Stack: Express.js, SQLite3, node-fetch, cors
  *  Auth: Pi Network accessToken verification via api.minepi.com/v2/me
  */
-console.log('[Server] v265 boot starting...');
+console.log('[Server] v203 boot starting...');
 
 require('dotenv').config();
 const express = require('express');
@@ -606,15 +606,6 @@ function getJob(jobId, callback) {
     if (err) return callback(err, null);
     if (row) {
       if (row.images) try { row.images = JSON.parse(row.images); } catch(e) {}
-      // Normalize skills to array
-      if (row.skills) {
-        if (typeof row.skills === 'string') {
-          try { row.skills = JSON.parse(row.skills); } catch(e) { row.skills = row.skills.split(',').map(s => s.trim()).filter(Boolean); }
-        }
-        if (!Array.isArray(row.skills)) row.skills = [];
-      } else {
-        row.skills = [];
-      }
       row.apply_cost = Math.ceil((row.budget || 0) / 50) || 1;
     }
     callback(err, row);
@@ -1494,7 +1485,7 @@ app.get('/health', (req, res) => {
       uptime: process.uptime(),
       memory: { rss: mem.rss, heapUsed: mem.heapUsed },
       database: err ? 'error' : 'connected',
-      version: '2.2.9 (v265)',
+      version: '2.2.9 (v213)',
       timestamp: new Date().toISOString(),
     });
   });
@@ -1621,8 +1612,6 @@ app.get('/api/jobs', (req, res) => {
                  LIMIT ? OFFSET ?`;
     const params = [...whereParams, limitInt, offset];
 
-    db.all(sql, params, (err, rows) => {
-      if (err) return res.status(500).json({ error: 'Database error' });
       rows.forEach(row => {
         if (row.images) try { row.images = JSON.parse(row.images); } catch(e) {}
         // Normalize skills to array
@@ -1636,8 +1625,7 @@ app.get('/api/jobs', (req, res) => {
         }
         row.apply_cost = Math.ceil((row.budget || 0) / 50) || 1;
       });
-      res.json({ jobs: rows, page: pageInt, limit: limitInt, total, total_pages: totalPages });
-    });
+  });
 });
 
 /**
@@ -1656,15 +1644,6 @@ app.get('/api/jobs/search', (req, res) => {
       if (err) return res.status(500).json({ error: 'Database error' });
       rows.forEach(row => {
         if (row.images) try { row.images = JSON.parse(row.images); } catch(e) {}
-        // Normalize skills to array
-        if (row.skills) {
-          if (typeof row.skills === 'string') {
-            try { row.skills = JSON.parse(row.skills); } catch(e) { row.skills = row.skills.split(',').map(s => s.trim()).filter(Boolean); }
-          }
-          if (!Array.isArray(row.skills)) row.skills = [];
-        } else {
-          row.skills = [];
-        }
         row.apply_cost = Math.ceil((row.budget || 0) / 50) || 1;
       });
       res.json({ jobs: rows, query: q });
@@ -1692,15 +1671,6 @@ app.get('/api/jobs/me', async (req, res) => {
       if (err) return res.status(500).json({ error: 'Database error' });
       rows.forEach(row => {
         if (row.images) try { row.images = JSON.parse(row.images); } catch(e) {}
-        // Normalize skills to array
-        if (row.skills) {
-          if (typeof row.skills === 'string') {
-            try { row.skills = JSON.parse(row.skills); } catch(e) { row.skills = row.skills.split(',').map(s => s.trim()).filter(Boolean); }
-          }
-          if (!Array.isArray(row.skills)) row.skills = [];
-        } else {
-          row.skills = [];
-        }
         row.apply_cost = Math.ceil((row.budget || 0) / 50) || 1;
       });
       res.json({ 
@@ -1732,15 +1702,6 @@ app.get('/api/jobs/user/:username', async (req, res) => {
       if (err) return res.status(500).json({ error: 'Database error' });
       rows.forEach(row => {
         if (row.images) try { row.images = JSON.parse(row.images); } catch(e) {}
-        // Normalize skills to array
-        if (row.skills) {
-          if (typeof row.skills === 'string') {
-            try { row.skills = JSON.parse(row.skills); } catch(e) { row.skills = row.skills.split(',').map(s => s.trim()).filter(Boolean); }
-          }
-          if (!Array.isArray(row.skills)) row.skills = [];
-        } else {
-          row.skills = [];
-        }
         row.apply_cost = Math.ceil((row.budget || 0) / 50) || 1;
       });
       res.json(rows || []);
@@ -3798,7 +3759,7 @@ app.get('/api/admin/backup', requireAdmin, async (req, res) => {
     res.setHeader('Content-Disposition', `attachment; filename="workpro-backup-${timestamp}.json"`);
     res.json({
       exported_at: new Date().toISOString(),
-      version: '2.2.2 (v265)',
+      version: '2.2.2 (v146)',
       tables: backup
     });
   } catch (err) {
