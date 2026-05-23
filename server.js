@@ -7,7 +7,7 @@
  *  Tech Stack: Express.js, SQLite3, node-fetch, cors
  *  Auth: Pi Network accessToken verification via api.minepi.com/v2/me
  */
-console.log('[Server] v203 boot starting...');
+console.log('[Server] v265 boot starting...');
 
 require('dotenv').config();
 const express = require('express');
@@ -1494,7 +1494,7 @@ app.get('/health', (req, res) => {
       uptime: process.uptime(),
       memory: { rss: mem.rss, heapUsed: mem.heapUsed },
       database: err ? 'error' : 'connected',
-      version: '2.2.9 (v213)',
+      version: '2.2.9 (v265)',
       timestamp: new Date().toISOString(),
     });
   });
@@ -3798,7 +3798,7 @@ app.get('/api/admin/backup', requireAdmin, async (req, res) => {
     res.setHeader('Content-Disposition', `attachment; filename="workpro-backup-${timestamp}.json"`);
     res.json({
       exported_at: new Date().toISOString(),
-      version: '2.2.2 (v146)',
+      version: '2.2.2 (v265)',
       tables: backup
     });
   } catch (err) {
