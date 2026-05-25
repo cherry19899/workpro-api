@@ -448,10 +448,12 @@ async function requireUser(req, res, next) {
 /**
  * Admin auth middleware
  */
+const ADMIN_USER_IDS = (process.env.ADMIN_USER_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
+
 function requireAdmin(req, res, next) {
-  // Allow cherry19899 owner access via x-user-id (Pi Browser auth)
+  // Allow configured admin user IDs via x-user-id (Pi Browser auth)
   const userId = req.headers['x-user-id'];
-  if (userId === 'cherry19899' || userId === 'admin') {
+  if (userId && ADMIN_USER_IDS.includes(userId)) {
     return next();
   }
 
@@ -606,6 +608,15 @@ function getJob(jobId, callback) {
     if (err) return callback(err, null);
     if (row) {
       if (row.images) try { row.images = JSON.parse(row.images); } catch(e) {}
+      // Normalize skills to array
+      if (row.skills) {
+        if (typeof row.skills === 'string') {
+          try { row.skills = JSON.parse(row.skills); } catch(e) { row.skills = row.skills.split(',').map(s => s.trim()).filter(Boolean); }
+        }
+        if (!Array.isArray(row.skills)) row.skills = [];
+      } else {
+        row.skills = [];
+      }
       row.apply_cost = Math.ceil((row.budget || 0) / 50) || 1;
     }
     callback(err, row);
@@ -966,7 +977,6 @@ function lg(t,m){if(!c)return;cnt++;if(cnt>50)return;c.style.display='block';var
           var storedC = parseInt(sc || '0', 10);
           var userC = user.balance_connects || user.connects || 0;
           if (storedC >= 0 && storedC !== userC) {
-            console.log('[WorkPro] GET: restoring connects', storedC, 'over', userC);
             user.balance_connects = storedC;
             user.connects = storedC;
           }
