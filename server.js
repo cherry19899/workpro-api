@@ -41,6 +41,32 @@ if (DATABASE_URL) {
   
   // SQLite wrapper that mimics pg Pool
   pool = {
+    query: async (sql, params = []) => {
+      const lower = sql.trim().toLowerCase();
+      if (lower === 'begin' || lower === 'commit' || lower === 'rollback') {
+        return new Promise((resolve, reject) => {
+          db.run(sql, (err) => {
+            if (err) reject(err);
+            else resolve({ rows: [] });
+          });
+        });
+      }
+      const sqliteSql = sql.replace(/\$(\d+)/g, '?');
+      return new Promise((resolve, reject) => {
+        const isSelect = sqliteSql.trim().toLowerCase().startsWith('select');
+        if (isSelect) {
+          db.all(sqliteSql, params, (err, rows) => {
+            if (err) reject(err);
+            else resolve({ rows });
+          });
+        } else {
+          db.run(sqliteSql, params, function(err) {
+            if (err) reject(err);
+            else resolve({ rows: [], lastID: this.lastID, changes: this.changes });
+          });
+        }
+      });
+    },
     connect: async () => {
       return {
         query: async (sql, params = []) => {
