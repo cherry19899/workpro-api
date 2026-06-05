@@ -96,7 +96,15 @@ function auth(req, res, next) {
 
 function adminAuth(req, res, next) {
   const apiKey = req.headers['x-admin-key'] || req.headers['authorization'] || req.query.admin_key;
-  if (apiKey !== `Bearer ${ADMIN_API_KEY}` && apiKey !== ADMIN_API_KEY) {
+  if (!apiKey) return res.status(403).json({ error: 'Admin access required' });
+  
+  // Extract Bearer token if present
+  let token = apiKey;
+  if (apiKey.startsWith('Bearer ')) {
+    token = apiKey.substring(7);
+  }
+  
+  if (token !== ADMIN_API_KEY) {
     return res.status(403).json({ error: 'Admin access required' });
   }
   next();
