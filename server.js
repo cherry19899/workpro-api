@@ -20,14 +20,64 @@ const ADMIN_API_KEY = process.env.ADMIN_API_KEY || 'dev';
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://cherry19899.github.io';
 const DATABASE_URL = process.env.DATABASE_URL || process.env.POSTGRES_URL;
 
-// ─── PostgreSQL Pool ──────────────────────────────────────────
-const pool = new Pool({
-  connectionString: DATABASE_URL,
-  ssl: NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
-  max: 20,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 2000,
-});
+// ─── Database Layer (PostgreSQL or SQLite) ──────────────────
+let pool;
+let db;
+
+if (DATABASE_URL) {
+  pool = new Pool({
+    connectionString: DATABASE_URL,
+    ssl: NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+    max: 20,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 2000,
+  });
+} else {
+  console.log('DATABASE_URL not set, using SQLite fallback');
+  const sqlite3 = require('sqlite3').verbose();
+  db = new sqlite3.Database('./workpro.db');
+  db.run('PRAGMA journal_mode = WAL');
+  db.run('PRAGMA busy_timeout = 15000');
+  
+  // SQLite wrapper that mimics pg Pool
+  pool = {
+    connect: async () => {
+      return {
+        query: async (sql, params = []) => {
+          const lower = sql.trim().toLowerCase();
+          if (lower === 'begin' || lower === 'commit' || lower === 'rollback') {
+            return new Promise((resolve, reject) => {
+              db.run(sql, (err) => {
+                if (err) reject(err);
+                else resolve({ rows: [] });
+              });
+            });
+          }
+          // Convert PostgreSQL $1, $2 to SQLite ?
+          const sqliteSql = sql.replace(/\$(\d+)/g, '?');
+          return new Promise((resolve, reject) => {
+            const isSelect = sqliteSql.trim().toLowerCase().startsWith('select');
+            if (isSelect) {
+              db.all(sqliteSql, params, (err, rows) => {
+                if (err) reject(err);
+                else resolve({ rows });
+              });
+            } else {
+              db.run(sqliteSql, params, function(err) {
+                if (err) reject(err);
+                else resolve({ rows: [], lastID: this.lastID, changes: this.changes });
+              });
+            }
+          });
+        },
+        release: () => {},
+        queryBegin: async () => { db.run('BEGIN'); },
+        queryCommit: async () => { db.run('COMMIT'); },
+        queryRollback: async () => { db.run('ROLLBACK'); }
+      };
+    }
+  };
+}
 
 pool.on('error', (err) => {
   console.error('PostgreSQL pool error:', err);
@@ -806,7 +856,29 @@ app.get('/api/admin/audit-logs', authenticateToken, requireAdmin, async (req, re
   }
 });
 
-// ─── Error Handling ───────────────────────────────────────────
+app.post('/api/payments/complete', authenticateToken, paymentLimiter, async (req, res) => {
+  const { txid, payment_id } = req.body;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    
+    const payment = await client.query('SELECT * FROM payments WHERE id = $1 OR pi_payment_id = $2', [payment_id, payment_id]).then(r => r.rows[0]);
+    if (!payment) return res.status(404).json({ error: 'Payment not found' });
+    
+    await client.query('UPDATE payments SET status = $1, txid = $2, completed_at = CURRENT_TIMESTAMP WHERE id = $3',
+      ['completed', txid, payment.id]);
+    await client.query('UPDATE escrows SET status = $1, completed_at = CURRENT_TIMESTAMP WHERE id = $2',
+      ['completed', payment.escrow_id]);
+    
+    await client.query('COMMIT');
+    res.json({ success: true });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+});
 app.use((err, req, res, next) => {
   console.error('Error:', err);
   res.status(500).json({ error: 'Internal server error', message: NODE_ENV === 'development' ? err.message : 'Something went wrong' });
