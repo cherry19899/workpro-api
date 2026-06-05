@@ -161,15 +161,27 @@ app.get('/api/users/:id', async (req, res) => {
 app.post('/api/users/:id', auth, async (req, res) => {
   const user = db.users[req.params.id];
   if (!user) return res.status(404).json({ error: 'User not found' });
-  const { username, email, bio, skills, availability } = req.body;
+  const { username, email, bio, skills, availability, avatar } = req.body;
   if (username) user.username = username;
   if (email !== undefined) user.email = email;
   if (bio !== undefined) user.bio = bio;
   if (skills !== undefined) user.skills = skills;
   if (availability) user.availability = availability;
+  if (avatar !== undefined) user.avatar = avatar;
   user.updated_at = now();
   await saveDb();
   res.json(user);
+});
+
+app.post('/api/users/:id/avatar', auth, async (req, res) => {
+  const user = db.users[req.params.id];
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  const { avatar } = req.body;
+  if (!avatar) return res.status(400).json({ error: 'Avatar data required' });
+  user.avatar = avatar;
+  user.updated_at = now();
+  await saveDb();
+  res.json({ user, success: true });
 });
 
 app.get('/api/users/:id/ratings', async (req, res) => {
