@@ -1,27 +1,24 @@
 services:
   - type: web
     name: workpro-api
-    runtime: node
+    env: node
     buildCommand: npm install
     startCommand: node server.js
     envVars:
       - key: NODE_ENV
         value: production
-      - key: PORT
-        value: 3000
+      - key: PI_API_KEY
+        value: nzfwvq0xw4ep2mvlallq9baoyc1jjywvke8bz7trwpxfzgiafgobmjbeanlebs4j
+      - key: FRONTEND_URL
+        value: https://cherry19899.github.io
       - key: DATABASE_URL
         fromDatabase:
           name: workpro-db
           property: connectionString
+      - key: ADMIN_API_KEY
+        generateValue: true
       - key: JWT_SECRET
         generateValue: true
-      - key: FRONTEND_URL
-        value: https://cherry19899.github.io
-      - key: ADMIN_API_KEY
-        value: dev
-    plan: free
-    autoDeploy: true
-    healthCheckPath: /api/health
 
 databases:
   - name: workpro-db
