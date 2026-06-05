@@ -1,13 +1,14 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const { Pool } = require('pg');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
 const fetch = require('node-fetch');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -16,22 +17,46 @@ const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(64).toString('he
 const PI_API_KEY = process.env.PI_API_KEY;
 const ADMIN_API_KEY = process.env.ADMIN_API_KEY || 'dev';
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://cherry19899.github.io';
-const DATABASE_URL = process.env.DATABASE_URL || process.env.POSTGRES_URL;
+const DATA_DIR = process.env.DATA_DIR || './data';
 
-if (!DATABASE_URL) {
-  console.error('FATAL: DATABASE_URL or POSTGRES_URL not set');
-  process.exit(1);
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+
+const TABLES = ['users', 'jobs', 'applications', 'chat_rooms', 'chat_messages', 'escrows', 'payments', 'ratings', 'connects_transactions', 'audit_logs'];
+
+function loadTable(name) {
+  const file = path.join(DATA_DIR, `${name}.json`);
+  if (!fs.existsSync(file)) return [];
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { return []; }
+}
+function saveTable(name, data) {
+  fs.writeFileSync(path.join(DATA_DIR, `${name}.json`), JSON.stringify(data, null, 2));
+}
+function loadAll() {
+  const db = {};
+  TABLES.forEach(t => db[t] = loadTable(t));
+  return db;
+}
+function saveAll(db) {
+  TABLES.forEach(t => saveTable(t, db[t]));
 }
 
-const pool = new Pool({
-  connectionString: DATABASE_URL,
-  ssl: NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
-  max: 20,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 5000,
-});
+let db = loadAll();
 
-pool.on('error', (err) => console.error('PG pool error:', err));
+function getNextId(table) {
+  const items = db[table];
+  if (!items.length) return 1;
+  return Math.max(...items.map(i => parseInt(i.id) || 0)) + 1;
+}
+function generateId(prefix) {
+  return `${prefix}_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+}
+
+function initDb() {
+  if (!db.users.length) {
+    console.log('JSON database initialized at', DATA_DIR);
+  }
+}
+initDb();
 
 app.use(helmet());
 app.use(express.json({ limit: '10mb' }));
@@ -89,86 +114,15 @@ async function verifyPiToken(accessToken) {
   }
 }
 
-async function initDb() {
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    await client.query(`CREATE TABLE IF NOT EXISTS users (
-      id TEXT PRIMARY KEY, username TEXT NOT NULL, email TEXT UNIQUE,
-      role TEXT DEFAULT 'freelancer', balance_connects INTEGER DEFAULT 0,
-      balance_pi REAL DEFAULT 0, rating REAL DEFAULT 0,
-      total_jobs_posted INTEGER DEFAULT 0, total_jobs_completed INTEGER DEFAULT 0,
-      bio TEXT, skills TEXT, kyc_verified BOOLEAN DEFAULT FALSE,
-      availability TEXT DEFAULT 'available',
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
-    await client.query(`CREATE TABLE IF NOT EXISTS jobs (
-      id SERIAL PRIMARY KEY, title TEXT NOT NULL, description TEXT,
-      category TEXT DEFAULT 'other', budget REAL DEFAULT 0,
-      connects_spent INTEGER DEFAULT 0, skills TEXT, images TEXT, deadline TEXT,
-      status TEXT DEFAULT 'open', posted_by TEXT NOT NULL,
-      posted_by_name TEXT, applications INTEGER DEFAULT 0,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
-    await client.query(`CREATE TABLE IF NOT EXISTS applications (
-      id SERIAL PRIMARY KEY, job_id INTEGER NOT NULL, user_id TEXT NOT NULL,
-      username TEXT, message TEXT, bid_amount REAL, status TEXT DEFAULT 'pending',
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
-    await client.query(`CREATE TABLE IF NOT EXISTS chat_rooms (
-      id TEXT PRIMARY KEY, job_id INTEGER, user1_id TEXT NOT NULL, user2_id TEXT NOT NULL,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
-    await client.query(`CREATE TABLE IF NOT EXISTS chat_messages (
-      id SERIAL PRIMARY KEY, room_id TEXT NOT NULL, sender_id TEXT NOT NULL,
-      sender_name TEXT, message TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
-    await client.query(`CREATE TABLE IF NOT EXISTS escrows (
-      id TEXT PRIMARY KEY, job_id INTEGER NOT NULL, client_id TEXT NOT NULL,
-      freelancer_id TEXT NOT NULL, amount_pi REAL DEFAULT 0, amount_usd REAL DEFAULT 0,
-      status TEXT DEFAULT 'pending', payment_id TEXT, txid TEXT,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, released_at TIMESTAMP, completed_at TIMESTAMP)`);
-    await client.query(`CREATE TABLE IF NOT EXISTS payments (
-      id TEXT PRIMARY KEY, escrow_id TEXT, payer_id TEXT NOT NULL, payee_id TEXT NOT NULL,
-      amount_pi REAL NOT NULL, amount_usd REAL, status TEXT DEFAULT 'pending',
-      txid TEXT, pi_payment_id TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, completed_at TIMESTAMP)`);
-    await client.query(`CREATE TABLE IF NOT EXISTS ratings (
-      id SERIAL PRIMARY KEY, from_user_id TEXT NOT NULL, to_user_id TEXT NOT NULL,
-      job_id INTEGER, rating INTEGER NOT NULL, comment TEXT,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
-    await client.query(`CREATE TABLE IF NOT EXISTS connects_transactions (
-      id SERIAL PRIMARY KEY, user_id TEXT NOT NULL, amount INTEGER NOT NULL,
-      type TEXT NOT NULL, description TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
-    await client.query(`CREATE TABLE IF NOT EXISTS audit_logs (
-      id SERIAL PRIMARY KEY, user_id TEXT, action TEXT NOT NULL, details TEXT,
-      ip_address TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
-    await client.query('COMMIT');
-    console.log('Database initialized');
-  } catch (e) {
-    await client.query('ROLLBACK').catch(() => {});
-    console.error('Database init error:', e);
-    throw e;
-  } finally {
-    client.release();
-  }
-}
-
-initDb().catch(e => { console.error('Fatal init error:', e); process.exit(1); });
-
-function generateId(prefix) {
-  return `${prefix}_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
-}
-
 async function logAudit(userId, action, details, req) {
   const ip = req.headers['x-forwarded-for'] || req.connection?.remoteAddress || 'unknown';
-  await pool.query('INSERT INTO audit_logs (user_id, action, details, ip_address) VALUES ($1,$2,$3,$4)',
-    [userId, action, JSON.stringify(details), ip]);
+  db.audit_logs.unshift({ id: getNextId('audit_logs'), user_id: userId, action, details: JSON.stringify(details), ip_address: ip, created_at: new Date().toISOString() });
+  if (db.audit_logs.length > 10000) db.audit_logs = db.audit_logs.slice(0, 10000);
+  saveTable('audit_logs', db.audit_logs);
 }
 
 app.get('/api/health', async (req, res) => {
-  try {
-    await pool.query('SELECT 1');
-    res.json({ status: 'ok', database: 'connected', timestamp: new Date().toISOString() });
-  } catch (e) {
-    res.status(500).json({ status: 'error', database: 'disconnected', error: e.message });
-  }
+  res.json({ status: 'ok', database: 'connected', storage: 'json', timestamp: new Date().toISOString() });
 });
 
 app.post('/api/auth/login', authLimiter, async (req, res) => {
@@ -176,382 +130,318 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
   if (!userId) return res.status(400).json({ error: 'userId required' });
   let piUser = null;
   if (accessToken) piUser = await verifyPiToken(accessToken);
-  const client = await pool.connect();
-  try {
-    let user = (await client.query('SELECT * FROM users WHERE id = $1', [userId])).rows[0];
-    if (!user) {
-      const username = piUser?.username || userId;
-      await client.query('INSERT INTO users (id, username, role) VALUES ($1,$2,$3)', [userId, username, 'freelancer']);
-      user = { id: userId, username, role: 'freelancer', balance_connects: 0, balance_pi: 0 };
-    }
-    const token = jwt.sign({ id: user.id, username: user.username, role: user.role }, JWT_SECRET, { expiresIn: '7d' });
-    await logAudit(user.id, 'login', { method: accessToken ? 'pi' : 'direct' }, req);
-    res.json({ token, user: { id: user.id, username: user.username, role: user.role, rating: user.rating, balance_connects: user.balance_connects, balance_pi: user.balance_pi } });
-  } finally { client.release(); }
+  let user = db.users.find(u => u.id === userId);
+  if (!user) {
+    const username = piUser?.username || userId;
+    user = { id: userId, username, email: null, role: 'freelancer', balance_connects: 0, balance_pi: 0, rating: 0, total_jobs_posted: 0, total_jobs_completed: 0, bio: null, skills: null, kyc_verified: false, availability: 'available', created_at: new Date().toISOString(), updated_at: new Date().toISOString() };
+    db.users.push(user);
+    saveTable('users', db.users);
+  }
+  const token = jwt.sign({ id: user.id, username: user.username, role: user.role }, JWT_SECRET, { expiresIn: '7d' });
+  await logAudit(user.id, 'login', { method: accessToken ? 'pi' : 'direct' }, req);
+  res.json({ token, user: { id: user.id, username: user.username, role: user.role, rating: user.rating, balance_connects: user.balance_connects, balance_pi: user.balance_pi } });
 });
 
 app.get('/api/auth/me', authenticateToken, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const user = (await client.query('SELECT * FROM users WHERE id = $1', [req.userId])).rows[0];
-    if (!user) return res.status(404).json({ error: 'User not found' });
-    res.json(user);
-  } finally { client.release(); }
+  const user = db.users.find(u => u.id === req.userId);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  res.json(user);
 });
 
 app.get('/api/users/:id', authenticateToken, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const user = (await client.query(
-      'SELECT id, username, email, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, kyc_verified, availability, created_at FROM users WHERE id = $1',
-      [req.params.id])).rows[0];
-    if (!user) return res.status(404).json({ error: 'User not found' });
-    res.json(user);
-  } finally { client.release(); }
+  const user = db.users.find(u => u.id === req.params.id);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  const { password_hash, ...safe } = user;
+  res.json(safe);
 });
 
 app.put('/api/users/:id', authenticateToken, async (req, res) => {
   if (req.userId !== req.params.id) return res.status(403).json({ error: 'Forbidden' });
+  const user = db.users.find(u => u.id === req.params.id);
+  if (!user) return res.status(404).json({ error: 'User not found' });
   const { username, email, bio, skills, availability } = req.body;
-  const client = await pool.connect();
-  try {
-    await client.query(
-      'UPDATE users SET username = COALESCE($1, username), email = COALESCE($2, email), bio = COALESCE($3, bio), skills = COALESCE($4, skills), availability = COALESCE($5, availability), updated_at = CURRENT_TIMESTAMP WHERE id = $6',
-      [username, email, bio, skills, availability, req.params.id]);
-    res.json({ success: true });
-  } finally { client.release(); }
+  if (username !== undefined) user.username = username;
+  if (email !== undefined) user.email = email;
+  if (bio !== undefined) user.bio = bio;
+  if (skills !== undefined) user.skills = skills;
+  if (availability !== undefined) user.availability = availability;
+  user.updated_at = new Date().toISOString();
+  saveTable('users', db.users);
+  res.json({ success: true });
 });
 
 app.post('/api/jobs', authenticateToken, async (req, res) => {
   const { title, description, category, budget, skills, images, deadline, connects_spent } = req.body;
   if (!title) return res.status(400).json({ error: 'Title required' });
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const user = (await client.query('SELECT * FROM users WHERE id = $1', [req.userId])).rows[0];
-    if (!user) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'User not found' }); }
-    if (connects_spent > 0 && user.balance_connects < connects_spent) {
-      await client.query('ROLLBACK'); return res.status(400).json({ error: 'Insufficient connects' });
-    }
-    const result = await client.query(
-      'INSERT INTO jobs (title, description, category, budget, connects_spent, skills, images, deadline, posted_by, posted_by_name) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *',
-      [title, description, category, budget, connects_spent || 0, skills, images, deadline, req.userId, user.username]);
-    if (connects_spent > 0) {
-      await client.query('UPDATE users SET balance_connects = balance_connects - $1, total_jobs_posted = total_jobs_posted + 1 WHERE id = $2', [connects_spent, req.userId]);
-      await client.query('INSERT INTO connects_transactions (user_id, amount, type, description) VALUES ($1,$2,$3,$4)', [req.userId, -connects_spent, 'spend', `Posted job: ${title}`]);
-    } else {
-      await client.query('UPDATE users SET total_jobs_posted = total_jobs_posted + 1 WHERE id = $1', [req.userId]);
-    }
-    await client.query('COMMIT');
-    await logAudit(req.userId, 'job_posted', { job_id: result.rows[0].id }, req);
-    res.json({ job: result.rows[0] });
-  } catch (e) {
-    await client.query('ROLLBACK').catch(() => {});
-    throw e;
-  } finally { client.release(); }
+  const user = db.users.find(u => u.id === req.userId);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  if (connects_spent > 0 && user.balance_connects < connects_spent) return res.status(400).json({ error: 'Insufficient connects' });
+  const job = {
+    id: getNextId('jobs'), title, description, category: category || 'other', budget: budget || 0,
+    connects_spent: connects_spent || 0, skills, images, deadline, status: 'open',
+    posted_by: req.userId, posted_by_name: user.username, applications: 0,
+    created_at: new Date().toISOString(), updated_at: new Date().toISOString()
+  };
+  db.jobs.push(job);
+  if (connects_spent > 0) {
+    user.balance_connects -= connects_spent;
+    user.total_jobs_posted += 1;
+    db.connects_transactions.unshift({ id: getNextId('connects_transactions'), user_id: req.userId, amount: -connects_spent, type: 'spend', description: `Posted job: ${title}`, created_at: new Date().toISOString() });
+  } else {
+    user.total_jobs_posted += 1;
+  }
+  saveTable('jobs', db.jobs);
+  saveTable('users', db.users);
+  saveTable('connects_transactions', db.connects_transactions);
+  await logAudit(req.userId, 'job_posted', { job_id: job.id }, req);
+  res.json({ job });
 });
 
 app.get('/api/jobs', async (req, res) => {
   const { status, category, posted_by, limit = 50, offset = 0 } = req.query;
-  let sql = 'SELECT * FROM jobs WHERE 1=1';
-  const params = [];
-  let idx = 1;
-  if (status) { sql += ` AND status = $${idx++}`; params.push(status); }
-  if (category) { sql += ` AND category = $${idx++}`; params.push(category); }
-  if (posted_by) { sql += ` AND posted_by = $${idx++}`; params.push(posted_by); }
-  sql += ` ORDER BY created_at DESC LIMIT $${idx++} OFFSET $${idx++}`;
-  params.push(parseInt(limit), parseInt(offset));
-  const client = await pool.connect();
-  try {
-    const jobs = (await client.query(sql, params)).rows;
-    res.json({ jobs, count: jobs.length });
-  } finally { client.release(); }
+  let jobs = db.jobs.slice();
+  if (status) jobs = jobs.filter(j => j.status === status);
+  if (category) jobs = jobs.filter(j => j.category === category);
+  if (posted_by) jobs = jobs.filter(j => j.posted_by === posted_by);
+  jobs.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+  const total = jobs.length;
+  jobs = jobs.slice(parseInt(offset), parseInt(offset) + parseInt(limit));
+  res.json({ jobs, count: jobs.length, total });
 });
 
 app.get('/api/jobs/:id', async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const job = (await client.query('SELECT * FROM jobs WHERE id = $1', [req.params.id])).rows[0];
-    if (!job) return res.status(404).json({ error: 'Job not found' });
-    res.json({ job });
-  } finally { client.release(); }
+  const job = db.jobs.find(j => j.id == req.params.id);
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+  res.json({ job });
 });
 
 app.post('/api/jobs/:id/apply', authenticateToken, async (req, res) => {
   const { message, bid_amount } = req.body;
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const job = (await client.query('SELECT * FROM jobs WHERE id = $1', [req.params.id])).rows[0];
-    if (!job) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Job not found' }); }
-    if (job.status !== 'open') { await client.query('ROLLBACK'); return res.status(400).json({ error: 'Job not open' }); }
-    if (job.posted_by === req.userId) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'Cannot apply to own job' }); }
-    const existing = (await client.query('SELECT * FROM applications WHERE job_id = $1 AND user_id = $2', [req.params.id, req.userId])).rows[0];
-    if (existing) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'Already applied' }); }
-    const user = (await client.query('SELECT * FROM users WHERE id = $1', [req.userId])).rows[0];
-    const result = await client.query(
-      'INSERT INTO applications (job_id, user_id, username, message, bid_amount) VALUES ($1,$2,$3,$4,$5) RETURNING *',
-      [req.params.id, req.userId, user.username, message, bid_amount]);
-    await client.query('UPDATE jobs SET applications = applications + 1 WHERE id = $1', [req.params.id]);
-    await client.query('COMMIT');
-    res.json({ application: result.rows[0] });
-  } catch (e) {
-    await client.query('ROLLBACK').catch(() => {});
-    throw e;
-  } finally { client.release(); }
+  const job = db.jobs.find(j => j.id == req.params.id);
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+  if (job.status !== 'open') return res.status(400).json({ error: 'Job not open' });
+  if (job.posted_by === req.userId) return res.status(400).json({ error: 'Cannot apply to own job' });
+  const existing = db.applications.find(a => a.job_id == req.params.id && a.user_id === req.userId);
+  if (existing) return res.status(409).json({ error: 'Already applied' });
+  const user = db.users.find(u => u.id === req.userId);
+  const application = {
+    id: getNextId('applications'), job_id: parseInt(req.params.id), user_id: req.userId,
+    username: user?.username, message, bid_amount, status: 'pending',
+    created_at: new Date().toISOString()
+  };
+  db.applications.push(application);
+  job.applications += 1;
+  saveTable('applications', db.applications);
+  saveTable('jobs', db.jobs);
+  res.json({ application });
 });
 
 app.get('/api/jobs/:id/applications', authenticateToken, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const job = (await client.query('SELECT * FROM jobs WHERE id = $1', [req.params.id])).rows[0];
-    if (!job) return res.status(404).json({ error: 'Job not found' });
-    if (job.posted_by !== req.userId) return res.status(403).json({ error: 'Forbidden' });
-    const apps = (await client.query('SELECT * FROM applications WHERE job_id = $1 ORDER BY created_at DESC', [req.params.id])).rows;
-    res.json({ applications: apps });
-  } finally { client.release(); }
+  const job = db.jobs.find(j => j.id == req.params.id);
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+  if (job.posted_by !== req.userId) return res.status(403).json({ error: 'Forbidden' });
+  const apps = db.applications.filter(a => a.job_id == req.params.id).sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+  res.json({ applications: apps });
 });
 
 app.post('/api/chat/rooms', authenticateToken, async (req, res) => {
   const { job_id, other_user_id } = req.body;
   const roomId = generateId('room');
-  const client = await pool.connect();
-  try {
-    await client.query('INSERT INTO chat_rooms (id, job_id, user1_id, user2_id) VALUES ($1,$2,$3,$4)', [roomId, job_id, req.userId, other_user_id]);
-    res.json({ room_id: roomId });
-  } finally { client.release(); }
+  db.chat_rooms.push({ id: roomId, job_id, user1_id: req.userId, user2_id: other_user_id, created_at: new Date().toISOString() });
+  saveTable('chat_rooms', db.chat_rooms);
+  res.json({ room_id: roomId });
 });
 
 app.post('/api/chat/rooms/:id/messages', authenticateToken, async (req, res) => {
   const { message } = req.body;
   if (!message?.trim()) return res.status(400).json({ error: 'Message required' });
-  const client = await pool.connect();
-  try {
-    const room = (await client.query('SELECT * FROM chat_rooms WHERE id = $1', [req.params.id])).rows[0];
-    if (!room) return res.status(404).json({ error: 'Room not found' });
-    if (room.user1_id !== req.userId && room.user2_id !== req.userId) return res.status(403).json({ error: 'Forbidden' });
-    const user = (await client.query('SELECT username FROM users WHERE id = $1', [req.userId])).rows[0];
-    const result = await client.query(
-      'INSERT INTO chat_messages (room_id, sender_id, sender_name, message) VALUES ($1,$2,$3,$4) RETURNING *',
-      [req.params.id, req.userId, user?.username, message.trim()]);
-    res.json({ message: result.rows[0] });
-  } finally { client.release(); }
+  const room = db.chat_rooms.find(r => r.id === req.params.id);
+  if (!room) return res.status(404).json({ error: 'Room not found' });
+  if (room.user1_id !== req.userId && room.user2_id !== req.userId) return res.status(403).json({ error: 'Forbidden' });
+  const user = db.users.find(u => u.id === req.userId);
+  const msg = {
+    id: getNextId('chat_messages'), room_id: req.params.id, sender_id: req.userId,
+    sender_name: user?.username, message: message.trim(), created_at: new Date().toISOString()
+  };
+  db.chat_messages.push(msg);
+  saveTable('chat_messages', db.chat_messages);
+  res.json({ message: msg });
 });
 
 app.get('/api/chat/rooms/:id/messages', authenticateToken, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const room = (await client.query('SELECT * FROM chat_rooms WHERE id = $1', [req.params.id])).rows[0];
-    if (!room) return res.status(404).json({ error: 'Room not found' });
-    if (room.user1_id !== req.userId && room.user2_id !== req.userId) return res.status(403).json({ error: 'Forbidden' });
-    const messages = (await client.query('SELECT * FROM chat_messages WHERE room_id = $1 ORDER BY created_at ASC LIMIT 100', [req.params.id])).rows;
-    res.json({ messages });
-  } finally { client.release(); }
+  const room = db.chat_rooms.find(r => r.id === req.params.id);
+  if (!room) return res.status(404).json({ error: 'Room not found' });
+  if (room.user1_id !== req.userId && room.user2_id !== req.userId) return res.status(403).json({ error: 'Forbidden' });
+  const messages = db.chat_messages.filter(m => m.room_id === req.params.id).sort((a, b) => new Date(a.created_at) - new Date(b.created_at)).slice(-100);
+  res.json({ messages });
 });
 
 app.post('/api/escrows', authenticateToken, paymentLimiter, async (req, res) => {
   const { job_id, freelancer_id, amount_pi, amount_usd } = req.body;
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const job = (await client.query('SELECT * FROM jobs WHERE id = $1', [job_id])).rows[0];
-    if (!job) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Job not found' }); }
-    if (job.posted_by !== req.userId) { await client.query('ROLLBACK'); return res.status(403).json({ error: 'Forbidden' }); }
-    const escrowId = generateId('esc');
-    await client.query(
-      'INSERT INTO escrows (id, job_id, client_id, freelancer_id, amount_pi, amount_usd) VALUES ($1,$2,$3,$4,$5,$6)',
-      [escrowId, job_id, req.userId, freelancer_id, amount_pi, amount_usd]);
-    await client.query('UPDATE jobs SET status = $1 WHERE id = $2', ['in_progress', job_id]);
-    await client.query('COMMIT');
-    res.json({ escrow_id: escrowId });
-  } catch (e) {
-    await client.query('ROLLBACK').catch(() => {});
-    throw e;
-  } finally { client.release(); }
+  const job = db.jobs.find(j => j.id == job_id);
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+  if (job.posted_by !== req.userId) return res.status(403).json({ error: 'Forbidden' });
+  const escrowId = generateId('esc');
+  db.escrows.push({
+    id: escrowId, job_id, client_id: req.userId, freelancer_id, amount_pi: amount_pi || 0, amount_usd: amount_usd || 0,
+    status: 'pending', payment_id: null, txid: null, created_at: new Date().toISOString(), released_at: null, completed_at: null
+  });
+  job.status = 'in_progress';
+  saveTable('escrows', db.escrows);
+  saveTable('jobs', db.jobs);
+  res.json({ escrow_id: escrowId });
 });
 
 app.get('/api/escrows', authenticateToken, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const escrows = (await client.query('SELECT * FROM escrows WHERE client_id = $1 OR freelancer_id = $1 ORDER BY created_at DESC', [req.userId])).rows;
-    res.json({ escrows });
-  } finally { client.release(); }
+  const escrows = db.escrows.filter(e => e.client_id === req.userId || e.freelancer_id === req.userId).sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+  res.json({ escrows });
 });
 
 app.post('/api/escrows/:id/release', authenticateToken, paymentLimiter, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const escrow = (await client.query('SELECT * FROM escrows WHERE id = $1', [req.params.id])).rows[0];
-    if (!escrow) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Escrow not found' }); }
-    if (escrow.client_id !== req.userId) { await client.query('ROLLBACK'); return res.status(403).json({ error: 'Forbidden' }); }
-    if (escrow.status !== 'pending') { await client.query('ROLLBACK'); return res.status(400).json({ error: 'Escrow already processed' }); }
-    await client.query('UPDATE escrows SET status = $1, released_at = CURRENT_TIMESTAMP WHERE id = $2', ['released', req.params.id]);
-    await client.query('UPDATE users SET balance_pi = balance_pi + $1 WHERE id = $2', [escrow.amount_pi, escrow.freelancer_id]);
-    await client.query('UPDATE users SET total_jobs_completed = total_jobs_completed + 1 WHERE id = $1', [escrow.freelancer_id]);
-    await client.query('COMMIT');
-    res.json({ success: true });
-  } catch (e) {
-    await client.query('ROLLBACK').catch(() => {});
-    throw e;
-  } finally { client.release(); }
+  const escrow = db.escrows.find(e => e.id === req.params.id);
+  if (!escrow) return res.status(404).json({ error: 'Escrow not found' });
+  if (escrow.client_id !== req.userId) return res.status(403).json({ error: 'Forbidden' });
+  if (escrow.status !== 'pending') return res.status(400).json({ error: 'Escrow already processed' });
+  escrow.status = 'released';
+  escrow.released_at = new Date().toISOString();
+  const freelancer = db.users.find(u => u.id === escrow.freelancer_id);
+  if (freelancer) {
+    freelancer.balance_pi += escrow.amount_pi;
+    freelancer.total_jobs_completed += 1;
+  }
+  saveTable('escrows', db.escrows);
+  saveTable('users', db.users);
+  res.json({ success: true });
 });
 
 app.post('/api/payments', authenticateToken, paymentLimiter, async (req, res) => {
   const { escrow_id, amount_pi, amount_usd, pi_payment_id } = req.body;
-  const client = await pool.connect();
-  try {
-    const escrow = (await client.query('SELECT * FROM escrows WHERE id = $1', [escrow_id])).rows[0];
-    if (!escrow) return res.status(404).json({ error: 'Escrow not found' });
-    const paymentId = generateId('pay');
-    await client.query(
-      'INSERT INTO payments (id, escrow_id, payer_id, payee_id, amount_pi, amount_usd, pi_payment_id) VALUES ($1,$2,$3,$4,$5,$6,$7)',
-      [paymentId, escrow_id, req.userId, escrow.freelancer_id, amount_pi, amount_usd, pi_payment_id]);
-    res.json({ payment_id: paymentId, status: 'pending' });
-  } finally { client.release(); }
+  const escrow = db.escrows.find(e => e.id === escrow_id);
+  if (!escrow) return res.status(404).json({ error: 'Escrow not found' });
+  const paymentId = generateId('pay');
+  db.payments.push({
+    id: paymentId, escrow_id, payer_id: req.userId, payee_id: escrow.freelancer_id,
+    amount_pi, amount_usd, status: 'pending', txid: null, pi_payment_id,
+    created_at: new Date().toISOString(), completed_at: null
+  });
+  saveTable('payments', db.payments);
+  res.json({ payment_id: paymentId, status: 'pending' });
 });
 
 app.get('/api/payments/:id', authenticateToken, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const payment = (await client.query('SELECT * FROM payments WHERE id = $1', [req.params.id])).rows[0];
-    if (!payment) return res.status(404).json({ error: 'Payment not found' });
-    res.json({ payment });
-  } finally { client.release(); }
+  const payment = db.payments.find(p => p.id === req.params.id);
+  if (!payment) return res.status(404).json({ error: 'Payment not found' });
+  res.json({ payment });
 });
 
 app.post('/api/payments/:id/complete', authenticateToken, paymentLimiter, async (req, res) => {
   const { txid } = req.body;
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const payment = (await client.query('SELECT * FROM payments WHERE id = $1', [req.params.id])).rows[0];
-    if (!payment) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Payment not found' }); }
-    if (payment.payer_id !== req.userId) { await client.query('ROLLBACK'); return res.status(403).json({ error: 'Forbidden' }); }
-    await client.query('UPDATE payments SET status = $1, txid = $2, completed_at = CURRENT_TIMESTAMP WHERE id = $3', ['completed', txid, req.params.id]);
-    await client.query('UPDATE escrows SET status = $1, completed_at = CURRENT_TIMESTAMP WHERE id = $2', ['completed', payment.escrow_id]);
-    await client.query('COMMIT');
-    res.json({ success: true });
-  } catch (e) {
-    await client.query('ROLLBACK').catch(() => {});
-    throw e;
-  } finally { client.release(); }
+  const payment = db.payments.find(p => p.id === req.params.id);
+  if (!payment) return res.status(404).json({ error: 'Payment not found' });
+  if (payment.payer_id !== req.userId) return res.status(403).json({ error: 'Forbidden' });
+  payment.status = 'completed';
+  payment.txid = txid;
+  payment.completed_at = new Date().toISOString();
+  const escrow = db.escrows.find(e => e.id === payment.escrow_id);
+  if (escrow) {
+    escrow.status = 'completed';
+    escrow.completed_at = new Date().toISOString();
+  }
+  saveTable('payments', db.payments);
+  saveTable('escrows', db.escrows);
+  res.json({ success: true });
 });
 
 app.post('/api/ratings', authenticateToken, async (req, res) => {
   const { to_user_id, job_id, rating, comment } = req.body;
   if (!rating || rating < 1 || rating > 5) return res.status(400).json({ error: 'Rating 1-5 required' });
-  const client = await pool.connect();
-  try {
-    await client.query('INSERT INTO ratings (from_user_id, to_user_id, job_id, rating, comment) VALUES ($1,$2,$3,$4,$5)',
-      [req.userId, to_user_id, job_id, rating, comment]);
-    const avg = (await client.query('SELECT AVG(rating)::numeric(10,2) as avg FROM ratings WHERE to_user_id = $1', [to_user_id])).rows[0];
-    await client.query('UPDATE users SET rating = $1 WHERE id = $2', [avg.avg, to_user_id]);
-    res.json({ success: true });
-  } finally { client.release(); }
+  db.ratings.unshift({ id: getNextId('ratings'), from_user_id: req.userId, to_user_id, job_id, rating, comment, created_at: new Date().toISOString() });
+  const userRatings = db.ratings.filter(r => r.to_user_id === to_user_id);
+  const avg = userRatings.length ? (userRatings.reduce((s, r) => s + r.rating, 0) / userRatings.length).toFixed(2) : 0;
+  const user = db.users.find(u => u.id === to_user_id);
+  if (user) user.rating = parseFloat(avg);
+  saveTable('ratings', db.ratings);
+  saveTable('users', db.users);
+  res.json({ success: true });
 });
 
 app.get('/api/users/:id/ratings', async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const ratings = (await client.query(
-      'SELECT r.*, u.username as from_username FROM ratings r JOIN users u ON r.from_user_id = u.id WHERE r.to_user_id = $1 ORDER BY r.created_at DESC',
-      [req.params.id])).rows;
-    res.json({ ratings });
-  } finally { client.release(); }
+  const ratings = db.ratings.filter(r => r.to_user_id === req.params.id).sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+  res.json({ ratings });
 });
 
 app.post('/api/connects/purchase', authenticateToken, paymentLimiter, async (req, res) => {
   const { amount } = req.body;
-  const client = await pool.connect();
-  try {
-    await client.query('UPDATE users SET balance_connects = balance_connects + $1 WHERE id = $2', [amount, req.userId]);
-    await client.query('INSERT INTO connects_transactions (user_id, amount, type, description) VALUES ($1,$2,$3,$4)',
-      [req.userId, amount, 'purchase', `Purchased ${amount} connects`]);
-    res.json({ success: true });
-  } finally { client.release(); }
+  const user = db.users.find(u => u.id === req.userId);
+  if (user) user.balance_connects += amount;
+  db.connects_transactions.unshift({ id: getNextId('connects_transactions'), user_id: req.userId, amount, type: 'purchase', description: `Purchased ${amount} connects`, created_at: new Date().toISOString() });
+  saveTable('users', db.users);
+  saveTable('connects_transactions', db.connects_transactions);
+  res.json({ success: true });
 });
 
 app.get('/api/connects/balance', authenticateToken, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const user = (await client.query('SELECT balance_connects FROM users WHERE id = $1', [req.userId])).rows[0];
-    res.json({ balance: user?.balance_connects || 0 });
-  } finally { client.release(); }
+  const user = db.users.find(u => u.id === req.userId);
+  res.json({ balance: user?.balance_connects || 0 });
 });
 
 app.get('/api/admin/stats', authenticateToken, requireAdmin, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const stats = {
-      total_users: parseInt((await client.query('SELECT COUNT(*) as c FROM users')).rows[0].c),
-      total_jobs: parseInt((await client.query('SELECT COUNT(*) as c FROM jobs')).rows[0].c),
-      total_applications: parseInt((await client.query('SELECT COUNT(*) as c FROM applications')).rows[0].c),
-      total_escrows: parseInt((await client.query('SELECT COUNT(*) as c FROM escrows')).rows[0].c),
-      total_revenue: parseFloat((await client.query("SELECT COALESCE(SUM(amount_pi), 0) as c FROM payments WHERE status = 'completed'")).rows[0].c),
-      active_escrows: parseInt((await client.query("SELECT COUNT(*) as c FROM escrows WHERE status = 'pending'")).rows[0].c),
-      total_completed: parseInt((await client.query("SELECT COUNT(*) as c FROM jobs WHERE status = 'completed'")).rows[0].c),
-    };
-    res.json(stats);
-  } finally { client.release(); }
+  const totalRevenue = db.payments.filter(p => p.status === 'completed').reduce((s, p) => s + (p.amount_pi || 0), 0);
+  res.json({
+    total_users: db.users.length,
+    total_jobs: db.jobs.length,
+    total_applications: db.applications.length,
+    total_escrows: db.escrows.length,
+    total_revenue: totalRevenue,
+    active_escrows: db.escrows.filter(e => e.status === 'pending').length,
+    total_completed: db.jobs.filter(j => j.status === 'completed').length,
+  });
 });
 
 app.get('/api/admin/users', authenticateToken, requireAdmin, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const users = (await client.query('SELECT id, username, email, role, rating, balance_connects, balance_pi, created_at FROM users ORDER BY created_at DESC')).rows;
-    res.json({ users, count: users.length });
-  } finally { client.release(); }
+  const users = db.users.map(u => {
+    const { password_hash, ...safe } = u;
+    return safe;
+  }).sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+  res.json({ users, count: users.length });
 });
 
 app.get('/api/admin/jobs', authenticateToken, requireAdmin, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const jobs = (await client.query('SELECT * FROM jobs ORDER BY created_at DESC')).rows;
-    res.json({ jobs, count: jobs.length });
-  } finally { client.release(); }
+  const jobs = db.jobs.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+  res.json({ jobs, count: jobs.length });
 });
 
 app.get('/api/admin/escrows', authenticateToken, requireAdmin, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const escrows = (await client.query('SELECT * FROM escrows ORDER BY created_at DESC')).rows;
-    res.json({ escrows, count: escrows.length });
-  } finally { client.release(); }
+  const escrows = db.escrows.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+  res.json({ escrows, count: escrows.length });
 });
 
 app.get('/api/admin/earnings', authenticateToken, requireAdmin, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const payments = (await client.query('SELECT * FROM payments ORDER BY created_at DESC')).rows;
-    res.json({ payments, count: payments.length });
-  } finally { client.release(); }
+  const payments = db.payments.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+  res.json({ payments, count: payments.length });
 });
 
 app.get('/api/admin/audit-logs', authenticateToken, requireAdmin, async (req, res) => {
   const { limit = 100 } = req.query;
-  const client = await pool.connect();
-  try {
-    const logs = (await client.query('SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT $1', [parseInt(limit)])).rows;
-    res.json({ logs, count: logs.length });
-  } finally { client.release(); }
+  const logs = db.audit_logs.slice(0, parseInt(limit));
+  res.json({ logs, count: logs.length });
 });
 
 app.post('/api/payments/complete', authenticateToken, paymentLimiter, async (req, res) => {
   const { txid, payment_id } = req.body;
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const payment = (await client.query('SELECT * FROM payments WHERE id = $1 OR pi_payment_id = $2', [payment_id, payment_id])).rows[0];
-    if (!payment) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Payment not found' }); }
-    await client.query('UPDATE payments SET status = $1, txid = $2, completed_at = CURRENT_TIMESTAMP WHERE id = $3', ['completed', txid, payment.id]);
-    await client.query('UPDATE escrows SET status = $1, completed_at = CURRENT_TIMESTAMP WHERE id = $2', ['completed', payment.escrow_id]);
-    await client.query('COMMIT');
-    res.json({ success: true });
-  } catch (e) {
-    await client.query('ROLLBACK').catch(() => {});
-    throw e;
-  } finally { client.release(); }
+  const payment = db.payments.find(p => p.id === payment_id || p.pi_payment_id === payment_id);
+  if (!payment) return res.status(404).json({ error: 'Payment not found' });
+  payment.status = 'completed';
+  payment.txid = txid;
+  payment.completed_at = new Date().toISOString();
+  const escrow = db.escrows.find(e => e.id === payment.escrow_id);
+  if (escrow) {
+    escrow.status = 'completed';
+    escrow.completed_at = new Date().toISOString();
+  }
+  saveTable('payments', db.payments);
+  saveTable('escrows', db.escrows);
+  res.json({ success: true });
 });
 
 app.use((err, req, res, next) => {
@@ -563,6 +453,7 @@ app.use((req, res) => res.status(404).json({ error: 'Not found', path: req.path 
 app.listen(PORT, () => {
   console.log(`WorkPro API on port ${PORT}`);
   console.log(`Environment: ${NODE_ENV}`);
+  console.log(`Storage: JSON files at ${DATA_DIR}`);
 });
 
 module.exports = app;
