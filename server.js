@@ -192,139 +192,134 @@ async function verifyPiToken(accessToken) {
 async function initDb() {
   const client = await pool.connect();
   try {
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS users (
-        id TEXT PRIMARY KEY,
-        username TEXT NOT NULL,
-        email TEXT UNIQUE,
-        role TEXT DEFAULT 'freelancer',
-        balance_connects INTEGER DEFAULT 0,
-        balance_pi REAL DEFAULT 0,
-        rating REAL DEFAULT 0,
-        total_jobs_posted INTEGER DEFAULT 0,
-        total_jobs_completed INTEGER DEFAULT 0,
-        bio TEXT,
-        skills TEXT,
-        kyc_verified BOOLEAN DEFAULT FALSE,
-        availability TEXT DEFAULT 'available',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
-
-      CREATE TABLE IF NOT EXISTS jobs (
-        id SERIAL PRIMARY KEY,
-        title TEXT NOT NULL,
-        description TEXT,
-        category TEXT DEFAULT 'other',
-        budget REAL DEFAULT 0,
-        connects_spent INTEGER DEFAULT 0,
-        skills TEXT,
-        images TEXT,
-        deadline TEXT,
-        status TEXT DEFAULT 'open',
-        posted_by TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        posted_by_name TEXT,
-        applications INTEGER DEFAULT 0,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
-
-      CREATE TABLE IF NOT EXISTS applications (
-        id SERIAL PRIMARY KEY,
-        job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        username TEXT,
-        message TEXT,
-        bid_amount REAL,
-        status TEXT DEFAULT 'pending',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
-
-      CREATE TABLE IF NOT EXISTS chat_rooms (
-        id TEXT PRIMARY KEY,
-        job_id INTEGER REFERENCES jobs(id) ON DELETE SET NULL,
-        user1_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        user2_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
-
-      CREATE TABLE IF NOT EXISTS chat_messages (
-        id SERIAL PRIMARY KEY,
-        room_id TEXT NOT NULL REFERENCES chat_rooms(id) ON DELETE CASCADE,
-        sender_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        sender_name TEXT,
-        message TEXT NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
-
-      CREATE TABLE IF NOT EXISTS escrows (
-        id TEXT PRIMARY KEY,
-        job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-        client_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        freelancer_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        amount_pi REAL DEFAULT 0,
-        amount_usd REAL DEFAULT 0,
-        status TEXT DEFAULT 'pending',
-        payment_id TEXT,
-        txid TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        released_at TIMESTAMP,
-        completed_at TIMESTAMP
-      );
-
-      CREATE TABLE IF NOT EXISTS payments (
-        id TEXT PRIMARY KEY,
-        escrow_id TEXT REFERENCES escrows(id) ON DELETE SET NULL,
-        payer_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        payee_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        amount_pi REAL NOT NULL,
-        amount_usd REAL,
-        status TEXT DEFAULT 'pending',
-        txid TEXT,
-        pi_payment_id TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        completed_at TIMESTAMP
-      );
-
-      CREATE TABLE IF NOT EXISTS ratings (
-        id SERIAL PRIMARY KEY,
-        from_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        to_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        job_id INTEGER REFERENCES jobs(id) ON DELETE SET NULL,
-        rating INTEGER NOT NULL CHECK (rating >= 1 AND rating <= 5),
-        comment TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
-
-      CREATE TABLE IF NOT EXISTS connects_transactions (
-        id SERIAL PRIMARY KEY,
-        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        amount INTEGER NOT NULL,
-        type TEXT NOT NULL,
-        description TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
-
-      CREATE TABLE IF NOT EXISTS audit_logs (
-        id SERIAL PRIMARY KEY,
-        user_id TEXT,
-        action TEXT NOT NULL,
-        details TEXT,
-        ip_address TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
-      CREATE INDEX IF NOT EXISTS idx_jobs_posted_by ON jobs(posted_by);
-      CREATE INDEX IF NOT EXISTS idx_applications_job ON applications(job_id);
-      CREATE INDEX IF NOT EXISTS idx_applications_user ON applications(user_id);
-      CREATE INDEX IF NOT EXISTS idx_chat_room ON chat_messages(room_id);
-      CREATE INDEX IF NOT EXISTS idx_escrows_client ON escrows(client_id);
-      CREATE INDEX IF NOT EXISTS idx_escrows_freelancer ON escrows(freelancer_id);
-      CREATE INDEX IF NOT EXISTS idx_payments_payer ON payments(payer_id);
-      CREATE INDEX IF NOT EXISTS idx_ratings_to ON ratings(to_user_id);
-    `);
+    await client.query('BEGIN');
+    
+    await client.query(`CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY,
+      username TEXT NOT NULL,
+      email TEXT UNIQUE,
+      role TEXT DEFAULT 'freelancer',
+      balance_connects INTEGER DEFAULT 0,
+      balance_pi REAL DEFAULT 0,
+      rating REAL DEFAULT 0,
+      total_jobs_posted INTEGER DEFAULT 0,
+      total_jobs_completed INTEGER DEFAULT 0,
+      bio TEXT,
+      skills TEXT,
+      kyc_verified BOOLEAN DEFAULT FALSE,
+      availability TEXT DEFAULT 'available',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`);
+    
+    await client.query(`CREATE TABLE IF NOT EXISTS jobs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      title TEXT NOT NULL,
+      description TEXT,
+      category TEXT DEFAULT 'other',
+      budget REAL DEFAULT 0,
+      connects_spent INTEGER DEFAULT 0,
+      skills TEXT,
+      images TEXT,
+      deadline TEXT,
+      status TEXT DEFAULT 'open',
+      posted_by TEXT NOT NULL,
+      posted_by_name TEXT,
+      applications INTEGER DEFAULT 0,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`);
+    
+    await client.query(`CREATE TABLE IF NOT EXISTS applications (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      job_id INTEGER NOT NULL,
+      user_id TEXT NOT NULL,
+      username TEXT,
+      message TEXT,
+      bid_amount REAL,
+      status TEXT DEFAULT 'pending',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`);
+    
+    await client.query(`CREATE TABLE IF NOT EXISTS chat_rooms (
+      id TEXT PRIMARY KEY,
+      job_id INTEGER,
+      user1_id TEXT NOT NULL,
+      user2_id TEXT NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`);
+    
+    await client.query(`CREATE TABLE IF NOT EXISTS chat_messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      room_id TEXT NOT NULL,
+      sender_id TEXT NOT NULL,
+      sender_name TEXT,
+      message TEXT NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`);
+    
+    await client.query(`CREATE TABLE IF NOT EXISTS escrows (
+      id TEXT PRIMARY KEY,
+      job_id INTEGER NOT NULL,
+      client_id TEXT NOT NULL,
+      freelancer_id TEXT NOT NULL,
+      amount_pi REAL DEFAULT 0,
+      amount_usd REAL DEFAULT 0,
+      status TEXT DEFAULT 'pending',
+      payment_id TEXT,
+      txid TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      released_at TIMESTAMP,
+      completed_at TIMESTAMP
+    )`);
+    
+    await client.query(`CREATE TABLE IF NOT EXISTS payments (
+      id TEXT PRIMARY KEY,
+      escrow_id TEXT,
+      payer_id TEXT NOT NULL,
+      payee_id TEXT NOT NULL,
+      amount_pi REAL NOT NULL,
+      amount_usd REAL,
+      status TEXT DEFAULT 'pending',
+      txid TEXT,
+      pi_payment_id TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      completed_at TIMESTAMP
+    )`);
+    
+    await client.query(`CREATE TABLE IF NOT EXISTS ratings (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      from_user_id TEXT NOT NULL,
+      to_user_id TEXT NOT NULL,
+      job_id INTEGER,
+      rating INTEGER NOT NULL,
+      comment TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`);
+    
+    await client.query(`CREATE TABLE IF NOT EXISTS connects_transactions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id TEXT NOT NULL,
+      amount INTEGER NOT NULL,
+      type TEXT NOT NULL,
+      description TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`);
+    
+    await client.query(`CREATE TABLE IF NOT EXISTS audit_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id TEXT,
+      action TEXT NOT NULL,
+      details TEXT,
+      ip_address TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`);
+    
+    await client.query('COMMIT');
     console.log('Database initialized successfully');
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('Database init error:', e);
   } finally {
     client.release();
   }
