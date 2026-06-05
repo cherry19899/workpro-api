@@ -98,17 +98,11 @@ function adminAuth(req, res, next) {
   // v2.2: Allow cherry19899 owner access via x-user-id (Pi Browser auth)
   const userId = req.headers['x-user-id'];
   if (userId === 'cherry19899' || userId === 'admin' || userId === 'pi_a2b617f7-f510-4502-a046-805facedcc29') {
+    req.isAdmin = true;
     return next();
   }
 
   const apiKey = req.headers['x-admin-key'] || req.headers['authorization'] || req.query.admin_key;
-  const userId = req.headers['x-user-id'];
-  
-  // Allow cherry19899 as admin
-  if (userId === 'cherry19899') {
-    req.isAdmin = true;
-    return next();
-  }
   
   if (!apiKey) return res.status(403).json({ error: 'Admin access required' });
 
