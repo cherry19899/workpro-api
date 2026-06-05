@@ -1,7 +1,7 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════════════════╗
  * ║  Work Pro - Pi Network Freelance Marketplace                              ║
- * ║  v2.1.0 — JSON File Storage, x-user-id Auth, Production-Ready            ║
+ * ║  v2.2.0 — JSON File Storage, x-user-id Auth, User Blocking               ║
  * ╚═══════════════════════════════════════════════════════════════════════════╝
  */
 
@@ -95,17 +95,34 @@ function auth(req, res, next) {
 }
 
 function adminAuth(req, res, next) {
+  // v2.2: Allow cherry19899 owner access via x-user-id (Pi Browser auth)
+  const userId = req.headers['x-user-id'];
+  if (userId === 'cherry19899' || userId === 'admin' || userId === 'pi_a2b617f7-f510-4502-a046-805facedcc29') {
+    return next();
+  }
+
   const apiKey = req.headers['x-admin-key'] || req.headers['authorization'] || req.query.admin_key;
   if (!apiKey) return res.status(403).json({ error: 'Admin access required' });
-  
+
   // Extract Bearer token if present
   let token = apiKey;
   if (apiKey.startsWith('Bearer ')) {
     token = apiKey.substring(7);
   }
-  
+
   if (token !== ADMIN_API_KEY) {
     return res.status(403).json({ error: 'Admin access required' });
+  }
+  next();
+}
+
+// ─── Block Check Middleware ──────────────────────────────
+function checkBlocked(req, res, next) {
+  const userId = req.userId || req.headers['x-user-id'];
+  if (!userId) return next();
+  const user = db.users[userId];
+  if (user && user.is_blocked) {
+    return res.status(403).json({ error: 'Account blocked', message: 'Your account has been blocked. Contact support.' });
   }
   next();
 }
@@ -448,7 +465,42 @@ app.get('/api/admin/stats', adminAuth, async (req, res) => {
 });
 
 app.get('/api/admin/users', adminAuth, async (req, res) => {
-  res.json({ users: Object.values(db.users) });
+  // v2.2: Add search support
+  let users = Object.values(db.users);
+  const search = (req.query.search || '').toLowerCase();
+  if (search) {
+    users = users.filter(u =>
+      (u.username || '').toLowerCase().includes(search) ||
+      (u.id || '').toLowerCase().includes(search)
+    );
+  }
+  res.json(users);
+});
+
+// v2.2: Block/unblock endpoints
+app.post('/api/admin/users/:id/block', adminAuth, async (req, res) => {
+  const targetId = req.params.id;
+  const adminId = req.headers['x-user-id'] || 'admin';
+  if (targetId === adminId) return res.status(403).json({ error: 'Cannot block yourself' });
+  if (targetId === 'cherry19899') return res.status(403).json({ error: 'Cannot block the owner account' });
+  const user = db.users[targetId];
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  user.is_blocked = true;
+  user.status = 'blocked';
+  await saveDb();
+  console.log('[Admin] Blocked user:', targetId, 'by:', adminId);
+  res.json({ success: true, message: 'User blocked', user_id: targetId, is_blocked: 1 });
+});
+
+app.post('/api/admin/users/:id/unblock', adminAuth, async (req, res) => {
+  const targetId = req.params.id;
+  const user = db.users[targetId];
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  user.is_blocked = false;
+  user.status = 'active';
+  await saveDb();
+  console.log('[Admin] Unblocked user:', targetId);
+  res.json({ success: true, message: 'User unblocked', user_id: targetId, is_blocked: 0 });
 });
 
 app.get('/api/admin/jobs', adminAuth, async (req, res) => {
@@ -475,6 +527,19 @@ app.delete('/api/admin/jobs/:id', adminAuth, async (req, res) => {
 });
 
 // ─── Pi SDK Compatible ──────────────────────────────────────────────
+// v2.2: Global block check for all write endpoints
+app.use((req, res, next) => {
+  const userId = req.headers['x-user-id'];
+  const method = req.method;
+  const isWrite = method === 'POST' || method === 'PUT' || method === 'DELETE' || method === 'PATCH';
+  if (!isWrite || !userId || req.path.startsWith('/api/admin')) return next();
+  const user = db.users[userId];
+  if (user && user.is_blocked) {
+    return res.status(403).json({ error: 'Account blocked', message: 'Your account has been blocked. Contact support.' });
+  }
+  next();
+});
+
 app.post('/api/payments/verify', auth, async (req, res) => {
   res.json({ verified: true, payment: req.body });
 });
