@@ -53,7 +53,7 @@ function generateId(prefix) {
 
 function initDb() {
   if (!db.users.length) {
-    console.log('JSON database initialized at', DATA_DIR);
+    // JSON database initialized
   }
 }
 initDb();
@@ -109,7 +109,6 @@ async function verifyPiToken(accessToken) {
     if (!res.ok) return null;
     return await res.json();
   } catch (e) {
-    console.error('Pi token verification failed:', e.message);
     return null;
   }
 }
@@ -445,15 +444,12 @@ app.post('/api/payments/complete', authenticateToken, paymentLimiter, async (req
 });
 
 app.use((err, req, res, next) => {
-  console.error('Error:', err);
   res.status(500).json({ error: 'Internal server error', message: NODE_ENV === 'development' ? err.message : 'Something went wrong' });
 });
 app.use((req, res) => res.status(404).json({ error: 'Not found', path: req.path }));
 
 app.listen(PORT, () => {
-  console.log(`WorkPro API on port ${PORT}`);
-  console.log(`Environment: ${NODE_ENV}`);
-  console.log(`Storage: JSON files at ${DATA_DIR}`);
+  // Server started
 });
 
 module.exports = app;
