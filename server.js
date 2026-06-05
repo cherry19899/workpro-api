@@ -95,7 +95,7 @@ function auth(req, res, next) {
 }
 
 function adminAuth(req, res, next) {
-  const apiKey = req.headers['x-admin-key'] || req.headers['authorization'];
+  const apiKey = req.headers['x-admin-key'] || req.headers['authorization'] || req.query.admin_key;
   if (apiKey !== `Bearer ${ADMIN_API_KEY}` && apiKey !== ADMIN_API_KEY) {
     return res.status(403).json({ error: 'Admin access required' });
   }
@@ -407,7 +407,14 @@ app.get('/api/ratings', async (req, res) => {
   res.json({ ratings, count: ratings.length });
 });
 
-// ─── Admin ──────────────────────────────────────────────
+app.get('/api/admin/verify', async (req, res) => {
+  const key = req.headers['x-admin-key'] || req.headers['authorization'] || req.query.admin_key;
+  res.json({
+    provided: key ? 'yes' : 'no',
+    valid: key === `Bearer ${ADMIN_API_KEY}` || key === ADMIN_API_KEY,
+    env_set: !!process.env.ADMIN_API_KEY || !!process.env.WORKPRO_API_ACCESS
+  });
+});
 app.get('/api/admin/stats', adminAuth, async (req, res) => {
   res.json({
     users: Object.values(db.users).length,
