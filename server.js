@@ -189,9 +189,10 @@ app.get('/api/jobs', async (req, res) => {
     if (category && category !== 'all') { sql += ` AND category = $${idx}`; params.push(category); idx++; }
     if (posted_by) { sql += ` AND posted_by = $${idx}`; params.push(posted_by); idx++; }
     if (search) { sql += ` AND (title ILIKE $${idx} OR description ILIKE $${idx})`; params.push(`%${search}%`); idx++; }
-    sql += ' ORDER BY created_at DESC';
-    const countResult = await query(sql.replace('SELECT *', 'SELECT COUNT(*)'), params);
+    const countSql = 'SELECT COUNT(*) FROM jobs WHERE 1=1' + sql.substring(sql.indexOf(' AND'));
+    const countResult = await query(countSql, params.slice(0, idx - 1));
     const total = parseInt(countResult.rows[0].count);
+    sql += ' ORDER BY created_at DESC';
     const offset = (page - 1) * limit;
     sql += ` LIMIT $${idx} OFFSET $${idx + 1}`;
     params.push(limit, offset);
