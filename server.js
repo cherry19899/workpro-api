@@ -30,6 +30,7 @@ app.use(cors({
   origin: [FRONTEND_URL, 'https://cherry19899.github.io', 'http://localhost:3000', 'http://localhost:5173', 'http://localhost:3001'],
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
   allowedHeaders: ['Content-Type', 'Authorization', 'x-user-id', 'x-pi-token', 'x-admin-key'],
+  credentials: true,
 }));
 
 app.use(rateLimit({
@@ -720,11 +721,15 @@ app.get('/api/admin/stats', adminAuth, async (req, res) => {
       query('SELECT COUNT(*) FROM ratings'),
       query('SELECT COUNT(*) FROM chat_rooms'),
     ]);
+    const u = parseInt(users.rows[0].count);
+    const j = parseInt(jobs.rows[0].count);
+    const a = parseInt(applications.rows[0].count);
+    const e = parseInt(escrows.rows[0].count);
     res.json({
-      users: parseInt(users.rows[0].count),
-      jobs: parseInt(jobs.rows[0].count),
-      applications: parseInt(applications.rows[0].count),
-      escrows: parseInt(escrows.rows[0].count),
+      total_users: u, users: u,
+      total_jobs: j, jobs: j,
+      total_applications: a, applications: a,
+      total_escrows: e, escrows: e,
       payments: parseInt(payments.rows[0].count),
       ratings: parseInt(ratings.rows[0].count),
       chats: parseInt(chats.rows[0].count),
