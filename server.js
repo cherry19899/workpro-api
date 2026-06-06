@@ -113,7 +113,8 @@ function softAuth(req, res, next) {
 
 function adminAuth(req, res, next) {
   const userId = req.headers['x-user-id'];
-  if (userId === 'cherry19899') {
+  // Accept both direct ID and Pi-prefixed ID for the admin user
+  if (userId === 'cherry19899' || userId === 'pi_cherry19899') {
     req.isAdmin = true;
     return next();
   }
@@ -1444,12 +1445,12 @@ app.post('/api/payments/approve', auth, async (req, res) => {
       }
     });
     const approveData = await approveRes.json();
-    // Record in DB
+    // Record in DB using id as primary key
     await query(
-      `INSERT INTO payments (user_id, payment_id, amount, status, metadata)
-       VALUES ($1,$2,$3,'approved',$4)
-       ON CONFLICT (payment_id) DO UPDATE SET status='approved', updated_at=NOW()`,
-      [req.userId, payment_id, approveData.amount || 0, JSON.stringify(metadata || {})]
+      `INSERT INTO payments (id, user_id, amount, status, metadata, payment_id)
+       VALUES ($1,$2,$3,'approved',$4,$5)
+       ON CONFLICT (id) DO UPDATE SET status='approved', updated_at=NOW()`,
+      [payment_id, req.userId, approveData.amount || 0, JSON.stringify(metadata || {}), payment_id]
     ).catch(() => {});
     res.json({ success: true, payment: approveData });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -1469,8 +1470,9 @@ app.post('/api/payments/complete', auth, async (req, res) => {
       body: JSON.stringify({ txid })
     });
     const completeData = await completeRes.json();
+    // Update using id (not payment_id column)
     await query(
-      `UPDATE payments SET status='completed', txid=$1, updated_at=NOW() WHERE payment_id=$2`,
+      `UPDATE payments SET status='completed', txid=$1, updated_at=NOW() WHERE id=$2`,
       [txid, payment_id]
     ).catch(() => {});
     res.json({ success: true, payment: completeData });
@@ -1502,11 +1504,12 @@ app.post('/api/connects/buy', auth, checkBlocked, async (req, res) => {
 
   // If this is a pending (approval) call, just record and return
   if (status === 'pending') {
+    const pid = payment_id || ('connects_' + req.userId + '_' + Date.now());
     await query(
-      `INSERT INTO payments (user_id, payment_id, amount, status, metadata)
-       VALUES ($1,$2,$3,'pending',$4)
-       ON CONFLICT (payment_id) DO UPDATE SET status='pending', updated_at=NOW()`,
-      [req.userId, payment_id || 'manual', amount || 0, JSON.stringify({ type: 'connects', quantity })]
+      `INSERT INTO payments (id, user_id, payment_id, amount, status, metadata)
+       VALUES ($1,$2,$3,$4,'pending',$5)
+       ON CONFLICT (id) DO UPDATE SET status='pending', updated_at=NOW()`,
+      [pid, req.userId, pid, amount || 0, JSON.stringify({ type: 'connects', quantity })]
     ).catch(() => {});
     return res.json({ success: true, status: 'pending' });
   }

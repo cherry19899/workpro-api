@@ -97,9 +97,14 @@ async function initDb() {
     // Add missing columns if upgrading existing DB
     await query(`ALTER TABLE escrows ADD COLUMN IF NOT EXISTS payment_id VARCHAR(255)`).catch(() => {});
     await query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS txid VARCHAR(255)`).catch(() => {});
+    await query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS payment_id VARCHAR(255)`).catch(() => {});
     await query(`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS hired_freelancer_id VARCHAR(255)`).catch(() => {});
     await query(`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS hired_freelancer_name VARCHAR(255)`).catch(() => {});
     await query(`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS escrow_id INTEGER`).catch(() => {});
+    await query(`ALTER TABLE applications ADD COLUMN IF NOT EXISTS bid_amount DECIMAL(10,2)`).catch(() => {});
+    await query(`ALTER TABLE applications ADD COLUMN IF NOT EXISTS cover_letter TEXT`).catch(() => {});
+    await query(`ALTER TABLE applications ADD COLUMN IF NOT EXISTS viewed BOOLEAN DEFAULT FALSE`).catch(() => {});
+    await query(`ALTER TABLE applications ADD COLUMN IF NOT EXISTS viewed_at TIMESTAMP`).catch(() => {});
     await query(`CREATE TABLE IF NOT EXISTS ratings (
       id SERIAL PRIMARY KEY, from_user_id VARCHAR(255), to_user_id VARCHAR(255),
       job_id INTEGER, rating INTEGER, comment TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
