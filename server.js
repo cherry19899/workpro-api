@@ -1887,6 +1887,40 @@ async function handleAvailability(req, res) {
 app.put('/api/users/:id/availability', softAuth, handleAvailability);
 app.post('/api/users/:id/availability', softAuth, handleAvailability);
 
+// ─── Pi Payment additional endpoints ──────────────────────────────────────────────
+
+// POST /api/payments/:paymentId/cancelled — called by bundle when Pi payment is cancelled
+app.post('/api/payments/:paymentId/cancelled', softAuth, async (req, res) => {
+  try {
+    await query(
+      `UPDATE payments SET status = 'cancelled', updated_at = NOW() WHERE id = $1`,
+      [req.params.paymentId]
+    ).catch(() => {});
+    res.json({ success: true });
+  } catch (err) { res.json({ success: true }); }
+});
+
+// POST /api/payments/clear-pending — called by bundle to clear old pending payments
+app.post('/api/payments/clear-pending', softAuth, async (req, res) => {
+  try {
+    if (req.userId) {
+      await query(
+        `UPDATE payments SET status = 'cancelled', updated_at = NOW() WHERE user_id = $1 AND status = 'pending'`,
+        [req.userId]
+      ).catch(() => {});
+    }
+    res.json({ success: true });
+  } catch (err) { res.json({ success: true }); }
+});
+
+// GET /api/users/:id/connects — get user's connects balance
+app.get('/api/users/:id/connects', async (req, res) => {
+  try {
+    const result = await query('SELECT balance_connects FROM users WHERE id = $1', [req.params.id]);
+    res.json({ balance: result.rows[0]?.balance_connects || 0, connects: result.rows[0]?.balance_connects || 0 });
+  } catch (err) { res.json({ balance: 0, connects: 0 }); }
+});
+
 // ─── 404 ──────────────────────────────────────────────
 app.use((req, res) => {
   res.status(404).json({ error: 'Not found' });
