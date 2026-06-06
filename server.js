@@ -1117,6 +1117,24 @@ app.get('/api/reviews/user/:userId', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// GET /api/reviews?user_id=xxx — alias used by some frontend pages
+app.get('/api/reviews', async (req, res) => {
+  const userId = req.query.user_id || req.headers['x-user-id'];
+  if (!userId) return res.json({ reviews: [], ratings: [] });
+  try {
+    const result = await query('SELECT r.*, u.username as from_username FROM ratings r LEFT JOIN users u ON u.id = r.from_user_id WHERE r.to_user_id = $1 ORDER BY r.created_at DESC', [userId]);
+    res.json({ reviews: result.rows, ratings: result.rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/admin/jobs/all — alias for /api/admin/jobs
+app.get('/api/admin/jobs/all', adminAuth, async (req, res) => {
+  try {
+    const result = await query('SELECT j.*, u.username as posted_by_name FROM jobs j LEFT JOIN users u ON u.id = j.posted_by ORDER BY j.created_at DESC');
+    res.json({ jobs: result.rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ─── Connects buy alias ──────────────────
 app.post('/api/connects/buy', auth, checkBlocked, async (req, res) => {
   const { quantity, amount, payment_id } = req.body;
