@@ -135,7 +135,13 @@ app.post('/api/me', async (req, res) => {
     }
     const user = await query('SELECT * FROM users WHERE id = $1', [uid]);
     await audit('user_login', { user_id: uid });
-    res.json({ ...user.rows[0] });
+    const u = user.rows[0];
+    res.json({
+      ...u,
+      uid: u.id,                          // alias: frontend expects uid
+      is_admin: u.role === 'admin',       // frontend checks is_admin
+      token: 'pi-' + u.id,               // dummy token for compatibility
+    });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -202,9 +208,10 @@ app.get('/api/users/:id', async (req, res) => {
   const userId = req.params.id === 'me' ? (req.headers['x-user-id'] || '') : req.params.id;
   if (!userId) return res.status(401).json({ error: 'User ID required' });
   try {
-    const result = await query('SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, created_at FROM users WHERE id = $1', [userId]);
+    const result = await query('SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, is_blocked, status, created_at FROM users WHERE id = $1', [userId]);
     if (!result.rows.length) return res.status(404).json({ error: 'User not found' });
-    res.json(result.rows[0]);
+    const u = result.rows[0];
+    res.json({ ...u, uid: u.id, is_admin: u.role === 'admin' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
