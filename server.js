@@ -798,6 +798,300 @@ app.get('/api/admin/verify', async (req, res) => {
   res.json({ valid: token === ADMIN_API_KEY, env_set: !!process.env.ADMIN_API_KEY });
 });
 
+// ─── Alias endpoints for cherry19899.github.io frontend ──────────────────
+// POST /api/applications — apply to job (frontend sends job_id in body)
+app.post('/api/applications', auth, checkBlocked, async (req, res) => {
+  const { job_id, message } = req.body;
+  if (!job_id) return res.status(400).json({ error: 'job_id required' });
+  try {
+    const jobResult = await query('SELECT * FROM jobs WHERE id = $1', [job_id]);
+    if (!jobResult.rows.length) return res.status(404).json({ error: 'Job not found' });
+    const job = jobResult.rows[0];
+    if (job.posted_by === req.userId) return res.status(400).json({ error: 'Cannot apply to own job' });
+    if (job.status !== 'open') return res.status(400).json({ error: 'Job is not open' });
+    const existing = await query('SELECT id FROM applications WHERE job_id = $1 AND freelancer_id = $2', [job_id, req.userId]);
+    if (existing.rows.length) return res.status(400).json({ error: 'Already applied' });
+    const userResult = await query('SELECT * FROM users WHERE id = $1', [req.userId]);
+    const user = userResult.rows[0];
+    const cost = job.apply_cost || 1;
+    if (!user || user.balance_connects < cost) return res.status(400).json({ error: 'Not enough connects', required: cost, current: user?.balance_connects || 0 });
+    await query('UPDATE users SET balance_connects = balance_connects - $1, updated_at = NOW() WHERE id = $2', [cost, req.userId]);
+    const appResult = await query(
+      'INSERT INTO applications (job_id, job_title, freelancer_id, freelancer_name, message) VALUES ($1, $2, $3, $4, $5) RETURNING *',
+      [job_id, job.title, req.userId, user.username || req.userId, message || '']
+    );
+    await query('UPDATE jobs SET applications = applications + 1, updated_at = NOW() WHERE id = $1', [job_id]);
+    await audit('job_applied', { job_id, user_id: req.userId });
+    res.json({ application: appResult.rows[0], success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/applications/my — my applications as freelancer
+app.get('/api/applications/my', auth, async (req, res) => {
+  try {
+    const result = await query('SELECT * FROM applications WHERE freelancer_id = $1 ORDER BY created_at DESC', [req.userId]);
+    res.json({ applications: result.rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/applications/job/:jobId — applications for a specific job (owner only)
+app.get('/api/applications/job/:jobId', auth, async (req, res) => {
+  try {
+    const result = await query('SELECT * FROM applications WHERE job_id = $1 ORDER BY created_at DESC', [req.params.jobId]);
+    res.json({ applications: result.rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PUT /api/applications/:id/status — update application status
+app.put('/api/applications/:id/status', auth, async (req, res) => {
+  const { status } = req.body;
+  try {
+    const appResult = await query('SELECT a.*, j.posted_by FROM applications a JOIN jobs j ON a.job_id = j.id WHERE a.id = $1', [req.params.id]);
+    if (!appResult.rows.length) return res.status(404).json({ error: 'Application not found' });
+    if (appResult.rows[0].posted_by !== req.userId) return res.status(403).json({ error: 'Forbidden' });
+    const result = await query('UPDATE applications SET status = $1 WHERE id = $2 RETURNING *', [status, req.params.id]);
+    res.json({ application: result.rows[0], success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PUT /api/jobs/:id — update job
+app.put('/api/jobs/:id', auth, async (req, res) => {
+  const { title, description, category, budget, skills, deadline, status } = req.body;
+  try {
+    const jobResult = await query('SELECT * FROM jobs WHERE id = $1', [req.params.id]);
+    if (!jobResult.rows.length) return res.status(404).json({ error: 'Job not found' });
+    if (jobResult.rows[0].posted_by !== req.userId) return res.status(403).json({ error: 'Not your job' });
+    const fields = [], vals = [];
+    let i = 1;
+    if (title !== undefined) { fields.push(`title=$${i++}`); vals.push(title); }
+    if (description !== undefined) { fields.push(`description=$${i++}`); vals.push(description); }
+    if (category !== undefined) { fields.push(`category=$${i++}`); vals.push(category); }
+    if (budget !== undefined) { fields.push(`budget=$${i++}`); vals.push(parseFloat(budget)); }
+    if (skills !== undefined) { fields.push(`skills=$${i++}`); vals.push(skills); }
+    if (deadline !== undefined) { fields.push(`deadline=$${i++}`); vals.push(deadline || null); }
+    if (status !== undefined) { fields.push(`status=$${i++}`); vals.push(status); }
+    if (!fields.length) return res.status(400).json({ error: 'Nothing to update' });
+    fields.push(`updated_at=NOW()`);
+    vals.push(req.params.id);
+    const result = await query(`UPDATE jobs SET ${fields.join(',')} WHERE id=$${i} RETURNING *`, vals);
+    res.json({ job: result.rows[0], success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/users/me — get current user profile
+app.get('/api/users/me', auth, async (req, res) => {
+  try {
+    const result = await query('SELECT * FROM users WHERE id = $1', [req.userId]);
+    if (!result.rows.length) return res.status(404).json({ error: 'User not found' });
+    res.json(result.rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PUT /api/users/me — update current user profile
+app.put('/api/users/me', auth, async (req, res) => {
+  const { username, bio, skills, availability, avatar, email } = req.body;
+  try {
+    const fields = [], vals = [];
+    let i = 1;
+    if (username) { fields.push(`username=$${i++}`); vals.push(username); }
+    if (bio !== undefined) { fields.push(`bio=$${i++}`); vals.push(bio); }
+    if (skills !== undefined) { fields.push(`skills=$${i++}`); vals.push(skills); }
+    if (availability) { fields.push(`availability=$${i++}`); vals.push(availability); }
+    if (avatar) { fields.push(`avatar=$${i++}`); vals.push(avatar); }
+    if (email) { fields.push(`email=$${i++}`); vals.push(email); }
+    if (!fields.length) return res.status(400).json({ error: 'Nothing to update' });
+    fields.push(`updated_at=NOW()`);
+    vals.push(req.userId);
+    const result = await query(`UPDATE users SET ${fields.join(',')} WHERE id=$${i} RETURNING *`, vals);
+    res.json(result.rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ─── Chat alias endpoints (conversations = rooms) ──────────────────
+app.get('/api/chat/conversations', auth, async (req, res) => {
+  try {
+    const result = await query(
+      `SELECT r.*,
+        (SELECT message FROM chat_messages WHERE room_id = r.id ORDER BY created_at DESC LIMIT 1) as last_message,
+        (SELECT created_at FROM chat_messages WHERE room_id = r.id ORDER BY created_at DESC LIMIT 1) as last_message_at,
+        j.title as job_title,
+        CASE WHEN r.client_id = $1 THEN r.freelancer_id ELSE r.client_id END as other_user_id,
+        CASE WHEN r.client_id = $1 THEN uf.username ELSE uc.username END as other_user_name
+       FROM chat_rooms r
+       LEFT JOIN jobs j ON j.id = r.job_id
+       LEFT JOIN users uc ON uc.id = r.client_id
+       LEFT JOIN users uf ON uf.id = r.freelancer_id
+       WHERE r.client_id = $1 OR r.freelancer_id = $1
+       ORDER BY last_message_at DESC NULLS LAST`,
+      [req.userId]
+    );
+    res.json({ conversations: result.rows, rooms: result.rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/chat/conversations', auth, checkBlocked, async (req, res) => {
+  const { client_id, freelancer_id, job_id, other_user_id } = req.body;
+  const cId = client_id || req.userId;
+  const fId = freelancer_id || other_user_id;
+  if (!fId || !job_id) return res.status(400).json({ error: 'freelancer_id and job_id required' });
+  try {
+    const existing = await query('SELECT * FROM chat_rooms WHERE job_id = $1 AND ((client_id = $2 AND freelancer_id = $3) OR (client_id = $3 AND freelancer_id = $2))', [job_id, cId, fId]);
+    if (existing.rows.length) return res.json({ conversation: existing.rows[0], room: existing.rows[0] });
+    const roomId = 'room_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
+    const result = await query('INSERT INTO chat_rooms (id, client_id, freelancer_id, job_id) VALUES ($1, $2, $3, $4) RETURNING *', [roomId, cId, fId, job_id]);
+    res.json({ conversation: result.rows[0], room: result.rows[0] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/chat/conversations/:id/messages', auth, async (req, res) => {
+  try {
+    const room = await query('SELECT * FROM chat_rooms WHERE id = $1 AND (client_id = $2 OR freelancer_id = $2)', [req.params.id, req.userId]);
+    if (!room.rows.length) return res.status(403).json({ error: 'Forbidden' });
+    const result = await query('SELECT * FROM chat_messages WHERE room_id = $1 ORDER BY created_at ASC LIMIT 200', [req.params.id]);
+    res.json({ messages: result.rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/chat/conversations/:id/messages', auth, checkBlocked, async (req, res) => {
+  const msg = req.body.content || req.body.message;
+  if (!msg || !msg.trim()) return res.status(400).json({ error: 'Message required' });
+  try {
+    const room = await query('SELECT * FROM chat_rooms WHERE id = $1 AND (client_id = $2 OR freelancer_id = $2)', [req.params.id, req.userId]);
+    if (!room.rows.length) return res.status(403).json({ error: 'Forbidden' });
+    const userResult = await query('SELECT username FROM users WHERE id = $1', [req.userId]);
+    const senderName = userResult.rows[0]?.username || req.userId;
+    const result = await query('INSERT INTO chat_messages (room_id, sender_id, sender_name, message) VALUES ($1, $2, $3, $4) RETURNING *', [req.params.id, req.userId, senderName, msg.trim()]);
+    await query('UPDATE chat_rooms SET updated_at = NOW() WHERE id = $1', [req.params.id]);
+    res.json({ message: result.rows[0] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/chat/unread', auth, async (req, res) => {
+  try {
+    // Count messages in rooms where user is participant, not sent by user
+    const result = await query(
+      `SELECT COUNT(*) FROM chat_messages cm
+       JOIN chat_rooms r ON r.id = cm.room_id
+       WHERE (r.client_id = $1 OR r.freelancer_id = $1) AND cm.sender_id != $1
+       AND cm.created_at > COALESCE((SELECT updated_at FROM users WHERE id = $1), NOW() - INTERVAL '30 days')`,
+      [req.userId]
+    );
+    res.json({ count: parseInt(result.rows[0].count) });
+  } catch (err) { res.json({ count: 0 }); }
+});
+
+// ─── Reviews alias (= ratings) ──────────────────
+app.post('/api/reviews', auth, checkBlocked, async (req, res) => {
+  const { to_user_id, job_id, rating, comment, reviewer_id } = req.body;
+  const toId = to_user_id || reviewer_id;
+  if (!toId || !rating) return res.status(400).json({ error: 'to_user_id and rating required' });
+  if (rating < 1 || rating > 5) return res.status(400).json({ error: 'Rating must be 1-5' });
+  try {
+    const existing = await query('SELECT id FROM ratings WHERE from_user_id = $1 AND job_id = $2', [req.userId, job_id]);
+    if (existing.rows.length) return res.status(400).json({ error: 'Already rated this job' });
+    const result = await query('INSERT INTO ratings (from_user_id, to_user_id, job_id, rating, comment) VALUES ($1, $2, $3, $4, $5) RETURNING *', [req.userId, toId, job_id, parseInt(rating), comment || '']);
+    const avgResult = await query('SELECT AVG(rating) as avg FROM ratings WHERE to_user_id = $1', [toId]);
+    const newAvg = Math.round(parseFloat(avgResult.rows[0].avg) * 10) / 10;
+    await query('UPDATE users SET rating = $1, updated_at = NOW() WHERE id = $2', [newAvg, toId]);
+    res.json({ review: result.rows[0], rating: result.rows[0], success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/reviews/user/:userId', async (req, res) => {
+  try {
+    const result = await query('SELECT r.*, u.username as from_username FROM ratings r LEFT JOIN users u ON u.id = r.from_user_id WHERE r.to_user_id = $1 ORDER BY r.created_at DESC', [req.params.userId]);
+    res.json({ reviews: result.rows, ratings: result.rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ─── Connects buy alias ──────────────────
+app.post('/api/connects/buy', auth, checkBlocked, async (req, res) => {
+  const { quantity, amount, payment_id } = req.body;
+  const qty = parseInt(quantity || amount || 10);
+  try {
+    await query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [qty, req.userId]);
+    const result = await query('SELECT balance_connects FROM users WHERE id = $1', [req.userId]);
+    await audit('connects_purchased', { user_id: req.userId, amount: qty, payment_id });
+    res.json({ balance: result.rows[0].balance_connects, success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ─── Escrow refund ──────────────────
+app.post('/api/escrow/:id/refund', auth, checkBlocked, async (req, res) => {
+  try {
+    const result = await query('SELECT * FROM escrows WHERE id = $1', [req.params.id]);
+    if (!result.rows.length) return res.status(404).json({ error: 'Escrow not found' });
+    const escrow = result.rows[0];
+    if (escrow.client_id !== req.userId) return res.status(403).json({ error: 'Not your escrow' });
+    if (escrow.status === 'released' || escrow.status === 'refunded') return res.status(400).json({ error: 'Already processed' });
+    await query('UPDATE escrows SET status = $1, updated_at = NOW() WHERE id = $2', ['refunded', req.params.id]);
+    await query('UPDATE jobs SET status = $1, updated_at = NOW() WHERE id = $2', ['open', escrow.job_id]);
+    await audit('escrow_refunded', { escrow_id: req.params.id });
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ─── Portfolio ──────────────────
+app.get('/api/users/:id/portfolio', async (req, res) => {
+  try {
+    const userResult = await query('SELECT id, username, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar FROM users WHERE id = $1', [req.params.id]);
+    if (!userResult.rows.length) return res.status(404).json({ error: 'User not found' });
+    const portfolioResult = await query('SELECT * FROM portfolios WHERE user_id = $1', [req.params.id]).catch(() => ({ rows: [] }));
+    const itemsResult = await query('SELECT * FROM portfolio_items WHERE user_id = $1 ORDER BY created_at DESC', [req.params.id]).catch(() => ({ rows: [] }));
+    const owner = userResult.rows[0];
+    res.json({
+      owner,
+      portfolio: portfolioResult.rows[0] || {},
+      items: itemsResult.rows,
+      stats: { jobs_posted: owner.total_jobs_posted, jobs_completed: owner.total_jobs_completed, rating: owner.rating }
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.put('/api/users/me/portfolio', auth, async (req, res) => {
+  const { headline, summary, experience_years, website, github, linkedin } = req.body;
+  try {
+    await query(`CREATE TABLE IF NOT EXISTS portfolios (
+      id SERIAL PRIMARY KEY, user_id VARCHAR(255) UNIQUE, headline TEXT, summary TEXT,
+      experience_years INTEGER DEFAULT 0, website TEXT, github TEXT, linkedin TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`).catch(() => {});
+    await query(
+      `INSERT INTO portfolios (user_id, headline, summary, experience_years, website, github, linkedin)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)
+       ON CONFLICT (user_id) DO UPDATE SET headline=$2, summary=$3, experience_years=$4, website=$5, github=$6, linkedin=$7, updated_at=NOW()`,
+      [req.userId, headline || '', summary || '', parseInt(experience_years || 0), website || '', github || '', linkedin || '']
+    );
+    const result = await query('SELECT * FROM portfolios WHERE user_id = $1', [req.userId]);
+    res.json({ portfolio: result.rows[0], success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/users/me/portfolio/items', auth, async (req, res) => {
+  const { title, description, image_url, category, tags } = req.body;
+  if (!title) return res.status(400).json({ error: 'title required' });
+  try {
+    await query(`CREATE TABLE IF NOT EXISTS portfolio_items (
+      id SERIAL PRIMARY KEY, user_id VARCHAR(255), title VARCHAR(500) NOT NULL,
+      description TEXT, image_url TEXT, category VARCHAR(100), tags TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`).catch(() => {});
+    const tagsStr = Array.isArray(tags) ? tags.join(',') : (tags || '');
+    const result = await query(
+      'INSERT INTO portfolio_items (user_id, title, description, image_url, category, tags) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *',
+      [req.userId, title, description || '', image_url || '', category || 'Other', tagsStr]
+    );
+    res.json({ item: result.rows[0], success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/users/me/portfolio/items/:id', auth, async (req, res) => {
+  try {
+    await query('DELETE FROM portfolio_items WHERE id = $1 AND user_id = $2', [req.params.id, req.userId]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ─── 404 ──────────────────────────────────────────────
 app.use((req, res) => {
   res.status(404).json({ error: 'Not found' });
