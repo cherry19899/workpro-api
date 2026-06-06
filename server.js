@@ -314,6 +314,78 @@ app.post('/api/jobs/:id/apply', auth, checkBlocked, async (req, res) => {
   }
 });
 
+app.post('/api/jobs/:id/hire', auth, checkBlocked, async (req, res) => {
+  const { application_id, freelancer_id } = req.body;
+  if (!application_id || !freelancer_id) return res.status(400).json({ error: 'application_id and freelancer_id required' });
+  try {
+    const jobResult = await query('SELECT * FROM jobs WHERE id = $1', [req.params.id]);
+    if (!jobResult.rows.length) return res.status(404).json({ error: 'Job not found' });
+    const job = jobResult.rows[0];
+    if (job.posted_by !== req.userId) return res.status(403).json({ error: 'Not your job' });
+    if (job.status !== 'open') return res.status(400).json({ error: 'Job is not open' });
+
+    const appResult = await query('SELECT * FROM applications WHERE id = $1 AND job_id = $2', [application_id, req.params.id]);
+    if (!appResult.rows.length) return res.status(404).json({ error: 'Application not found' });
+    const app = appResult.rows[0];
+
+    // Accept chosen application, reject all others
+    await query('UPDATE applications SET status = $1 WHERE id = $2', ['accepted', application_id]);
+    await query('UPDATE applications SET status = $1 WHERE job_id = $2 AND id != $3 AND status = $4', ['rejected', req.params.id, application_id, 'pending']);
+
+    // Update job
+    const freelancerRes = await query('SELECT username FROM users WHERE id = $1', [freelancer_id]);
+    const freelancerName = freelancerRes.rows[0]?.username || freelancer_id;
+    await query(
+      'UPDATE jobs SET status = $1, hired_freelancer_id = $2, hired_freelancer_name = $3, updated_at = NOW() WHERE id = $4',
+      ['in_progress', freelancer_id, freelancerName, req.params.id]
+    );
+
+    // Create or get chat room between client and freelancer
+    const existingRoom = await query(
+      'SELECT id FROM chat_rooms WHERE job_id = $1 AND client_id = $2 AND freelancer_id = $3',
+      [req.params.id, req.userId, freelancer_id]
+    );
+    let roomId;
+    if (existingRoom.rows.length) {
+      roomId = existingRoom.rows[0].id;
+    } else {
+      roomId = 'room_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
+      await query('INSERT INTO chat_rooms (id, client_id, freelancer_id, job_id) VALUES ($1, $2, $3, $4)', [roomId, req.userId, freelancer_id, req.params.id]);
+    }
+
+    await audit('job_hired', { job_id: req.params.id, freelancer_id, application_id });
+    res.json({ success: true, room_id: roomId, freelancer_name: freelancerName });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/jobs/:id/complete', auth, checkBlocked, async (req, res) => {
+  try {
+    const jobResult = await query('SELECT * FROM jobs WHERE id = $1', [req.params.id]);
+    if (!jobResult.rows.length) return res.status(404).json({ error: 'Job not found' });
+    const job = jobResult.rows[0];
+    if (job.posted_by !== req.userId) return res.status(403).json({ error: 'Not your job' });
+    if (job.status !== 'in_progress') return res.status(400).json({ error: 'Job is not in progress' });
+
+    const escrow = await query('SELECT * FROM escrows WHERE job_id = $1 AND status IN ($2, $3) LIMIT 1', [req.params.id, 'pending', 'funded']);
+    if (escrow.rows.length) {
+      const e = escrow.rows[0];
+      await query('UPDATE escrows SET status = $1, updated_at = NOW() WHERE id = $2', ['released', e.id]);
+      await query('UPDATE users SET balance_pi = balance_pi + $1, total_jobs_completed = total_jobs_completed + 1, updated_at = NOW() WHERE id = $2', [e.amount, e.freelancer_id]);
+    }
+    await query('UPDATE jobs SET status = $1, updated_at = NOW() WHERE id = $2', ['completed', req.params.id]);
+    if (job.hired_freelancer_id) {
+      await query('UPDATE users SET total_jobs_completed = total_jobs_completed + 1, updated_at = NOW() WHERE id = $1', [job.hired_freelancer_id]);
+    }
+    await query('UPDATE users SET total_jobs_posted = total_jobs_posted + 1, updated_at = NOW() WHERE id = $1', [req.userId]);
+    await audit('job_completed', { job_id: req.params.id });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.delete('/api/jobs/:id', auth, async (req, res) => {
   try {
     const jobResult = await query('SELECT * FROM jobs WHERE id = $1', [req.params.id]);

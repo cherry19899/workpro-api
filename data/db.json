@@ -1,0 +1,21 @@
+{
+  "users": {},
+  "jobs": {},
+  "applications": {},
+  "escrows": {},
+  "payments": {},
+  "ratings": {},
+  "chatRooms": {},
+  "chatMessages": {},
+  "auditLogs": [],
+  "counters": {
+    "jobs": 0,
+    "users": 0,
+    "applications": 0,
+    "escrows": 0,
+    "payments": 0,
+    "ratings": 0,
+    "chatRooms": 0,
+    "chatMessages": 0
+  }
+}
