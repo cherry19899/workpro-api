@@ -1611,6 +1611,38 @@ app.get('/api/reviews/stats', auth, async (req, res) => {
 
 // ─── Additional endpoints from bundle analysis ──────────────────────────────────────────────
 
+// POST /api/chat/:roomId/messages — send message (alias for /chat/rooms/:id/messages)
+app.post('/api/chat/:roomId/messages', auth, checkBlocked, async (req, res) => {
+  const { content, message, text } = req.body;
+  const msg = content || message || text || '';
+  if (!msg.trim()) return res.status(400).json({ error: 'Message content required' });
+  try {
+    const roomCheck = await query('SELECT * FROM chat_rooms WHERE id = $1 AND (client_id = $2 OR freelancer_id = $2)', [req.params.roomId, req.userId]);
+    if (!roomCheck.rows.length) return res.status(403).json({ error: 'Not in this room' });
+    const result = await query(
+      'INSERT INTO messages (room_id, sender_id, content, read) VALUES ($1, $2, $3, false) RETURNING *',
+      [req.params.roomId, req.userId, msg]
+    );
+    res.json({ message: result.rows[0], success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/offers/:id — get a specific offer
+app.get('/api/offers/:id', auth, async (req, res) => {
+  try {
+    const result = await query(
+      `SELECT a.*, j.title as job_title, j.budget, u.username as client_username
+       FROM applications a
+       JOIN jobs j ON a.job_id = j.id
+       LEFT JOIN users u ON u.id = j.posted_by
+       WHERE a.id = $1 AND a.freelancer_id = $2`,
+      [req.params.id, req.userId]
+    );
+    if (!result.rows.length) return res.status(404).json({ error: 'Offer not found' });
+    res.json({ offer: result.rows[0] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // POST /api/applications/:id/view — mark application as viewed
 app.post('/api/applications/:id/view', auth, async (req, res) => {
   try {
