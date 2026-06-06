@@ -176,8 +176,10 @@ app.get('/api/users', async (req, res) => {
 });
 
 app.get('/api/users/:id', async (req, res) => {
+  const userId = req.params.id === 'me' ? (req.headers['x-user-id'] || '') : req.params.id;
+  if (!userId) return res.status(401).json({ error: 'User ID required' });
   try {
-    const result = await query('SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, created_at FROM users WHERE id = $1', [req.params.id]);
+    const result = await query('SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, created_at FROM users WHERE id = $1', [userId]);
     if (!result.rows.length) return res.status(404).json({ error: 'User not found' });
     res.json(result.rows[0]);
   } catch (err) {
