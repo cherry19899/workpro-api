@@ -122,6 +122,22 @@ app.get('/api/health', async (req, res) => {
   }
 });
 
+// PUT /api/me — update profile (used by Profile.js)
+app.put('/api/me', auth, async (req, res) => {
+  const { username, bio, skills, display_name } = req.body;
+  try {
+    const uname = display_name || username;
+    const skillsStr = Array.isArray(skills) ? skills.join(',') : (skills || null);
+    await query(
+      'UPDATE users SET username = COALESCE($1, username), bio = COALESCE($2, bio), skills = COALESCE($3, skills), updated_at = NOW() WHERE id = $4',
+      [uname || null, bio || null, skillsStr, req.userId]
+    );
+    const result = await query('SELECT * FROM users WHERE id = $1', [req.userId]);
+    const u = result.rows[0];
+    res.json({ ...u, uid: u.id, is_admin: u.role === 'admin' });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // GET /api/me — get current user profile (used by Profile.js)
 app.get('/api/me', async (req, res) => {
   const userId = req.headers['x-user-id'];
