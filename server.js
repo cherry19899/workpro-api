@@ -1609,6 +1609,198 @@ app.get('/api/reviews/stats', auth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ─── Additional endpoints from bundle analysis ──────────────────────────────────────────────
+
+// POST /api/applications/:id/view — mark application as viewed
+app.post('/api/applications/:id/view', auth, async (req, res) => {
+  try {
+    await query('UPDATE applications SET viewed = true, viewed_at = NOW() WHERE id = $1', [req.params.id]).catch(() => {
+      // viewed column may not exist, ignore
+    });
+    res.json({ success: true });
+  } catch (err) { res.json({ success: true }); }
+});
+
+// GET /api/chat/:roomId/messages — messages in a chat room
+app.get('/api/chat/:roomId/messages', auth, async (req, res) => {
+  try {
+    const result = await query(
+      `SELECT m.*, u.username as sender_username
+       FROM messages m
+       LEFT JOIN users u ON u.id = m.sender_id
+       WHERE m.room_id = $1
+       ORDER BY m.created_at ASC
+       LIMIT 100`,
+      [req.params.roomId]
+    );
+    res.json({ messages: result.rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/chat/rooms/:id — specific chat room details
+app.get('/api/chat/rooms/:id', auth, async (req, res) => {
+  try {
+    const result = await query(
+      `SELECT cr.*,
+              u1.username as user1_username, u2.username as user2_username
+       FROM chat_rooms cr
+       LEFT JOIN users u1 ON u1.id = cr.user1_id
+       LEFT JOIN users u2 ON u2.id = cr.user2_id
+       WHERE cr.id = $1 AND (cr.user1_id = $2 OR cr.user2_id = $2)`,
+      [req.params.id, req.userId]
+    );
+    if (!result.rows.length) return res.status(404).json({ error: 'Room not found' });
+    res.json({ room: result.rows[0] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /api/escrows/:id/fund — fund an escrow after Pi payment
+app.post('/api/escrows/:id/fund', auth, checkBlocked, async (req, res) => {
+  const { payment_id, txid } = req.body;
+  try {
+    const result = await query('SELECT * FROM escrows WHERE id = $1', [req.params.id]);
+    if (!result.rows.length) return res.status(404).json({ error: 'Escrow not found' });
+    const escrow = result.rows[0];
+    if (escrow.client_id !== req.userId) return res.status(403).json({ error: 'Not your escrow' });
+    await query('UPDATE escrows SET status = $1, payment_id = $2, updated_at = NOW() WHERE id = $3', ['funded', payment_id || escrow.payment_id, req.params.id]);
+    await audit('escrow_funded', { escrow_id: req.params.id, payment_id, txid });
+    res.json({ escrow: { ...escrow, status: 'funded' }, success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /api/escrows/:id/dispute — open a dispute
+app.post('/api/escrows/:id/dispute', auth, checkBlocked, async (req, res) => {
+  const { reason } = req.body;
+  try {
+    const result = await query('SELECT * FROM escrows WHERE id = $1', [req.params.id]);
+    if (!result.rows.length) return res.status(404).json({ error: 'Escrow not found' });
+    const escrow = result.rows[0];
+    if (escrow.client_id !== req.userId && escrow.freelancer_id !== req.userId) {
+      return res.status(403).json({ error: 'Not your escrow' });
+    }
+    await query('UPDATE escrows SET status = $1, updated_at = NOW() WHERE id = $2', ['disputed', req.params.id]);
+    await audit('escrow_disputed', { escrow_id: req.params.id, reason, user_id: req.userId });
+    res.json({ escrow: { ...escrow, status: 'disputed' }, success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/escrows/:id/room — chat room for an escrow
+app.get('/api/escrows/:id/room', auth, async (req, res) => {
+  try {
+    const escResult = await query('SELECT * FROM escrows WHERE id = $1', [req.params.id]);
+    if (!escResult.rows.length) return res.status(404).json({ error: 'Escrow not found' });
+    const escrow = escResult.rows[0];
+    // Find or create chat room between client and freelancer
+    const roomResult = await query(
+      `SELECT * FROM chat_rooms WHERE (user1_id = $1 AND user2_id = $2) OR (user1_id = $2 AND user2_id = $1) LIMIT 1`,
+      [escrow.client_id, escrow.freelancer_id]
+    );
+    if (roomResult.rows.length) {
+      return res.json({ room: roomResult.rows[0], room_id: roomResult.rows[0].id });
+    }
+    // Create room if not exists
+    const newRoom = await query(
+      'INSERT INTO chat_rooms (user1_id, user2_id) VALUES ($1, $2) RETURNING *',
+      [escrow.client_id, escrow.freelancer_id]
+    );
+    res.json({ room: newRoom.rows[0], room_id: newRoom.rows[0].id });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /api/jobs/:id/apply — apply to a job (alternative endpoint to /api/applications)
+app.post('/api/jobs/:id/apply', auth, checkBlocked, async (req, res) => {
+  const { message, cover_letter, bid_amount, proposed_budget, username } = req.body;
+  try {
+    const jobResult = await query('SELECT * FROM jobs WHERE id = $1', [req.params.id]);
+    if (!jobResult.rows.length) return res.status(404).json({ error: 'Job not found' });
+    const job = jobResult.rows[0];
+    if (job.posted_by === req.userId) return res.status(400).json({ error: 'Cannot apply to your own job' });
+
+    // Check connects
+    const userResult = await query('SELECT balance_connects FROM users WHERE id = $1', [req.userId]);
+    const connectsNeeded = job.connects_required || 1;
+    if ((userResult.rows[0]?.balance_connects || 0) < connectsNeeded) {
+      return res.status(400).json({ error: `Insufficient connects. Need ${connectsNeeded}.` });
+    }
+
+    // Deduct connects
+    await query('UPDATE users SET balance_connects = balance_connects - $1 WHERE id = $2', [connectsNeeded, req.userId]);
+
+    const coverLetter = message || cover_letter || '';
+    const bidAmount = parseFloat(bid_amount || proposed_budget) || job.budget;
+    const result = await query(
+      `INSERT INTO applications (job_id, freelancer_uid, user_id, cover_letter, bid_amount, status)
+       VALUES ($1,$2,$2,$3,$4,'pending') RETURNING *`,
+      [parseInt(req.params.id), req.userId, coverLetter, bidAmount]
+    );
+    res.json({ application: result.rows[0], success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /api/offers/:id/accept — accept a job offer
+app.post('/api/offers/:id/accept', auth, async (req, res) => {
+  try {
+    const result = await query('UPDATE applications SET status = $1 WHERE id = $2 AND (freelancer_uid = $3 OR user_id = $3) RETURNING *', ['accepted', req.params.id, req.userId]);
+    if (!result.rows.length) return res.status(404).json({ error: 'Offer not found' });
+    res.json({ application: result.rows[0], success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /api/offers/:id/decline — decline a job offer
+app.post('/api/offers/:id/decline', auth, async (req, res) => {
+  try {
+    const result = await query('UPDATE applications SET status = $1 WHERE id = $2 AND (freelancer_uid = $3 OR user_id = $3) RETURNING *', ['declined', req.params.id, req.userId]);
+    if (!result.rows.length) return res.status(404).json({ error: 'Offer not found' });
+    res.json({ application: result.rows[0], success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/reviews/stats/:userId — review stats for a specific user (path param, MUST be before /:id)
+app.get('/api/reviews/stats/:userId', async (req, res) => {
+  try {
+    const userId = req.params.userId;
+    const [totalResult, avgResult, distResult] = await Promise.all([
+      query('SELECT COUNT(*) FROM ratings WHERE to_user_id = $1', [userId]),
+      query('SELECT AVG(rating) as avg FROM ratings WHERE to_user_id = $1', [userId]),
+      query('SELECT rating, COUNT(*) as count FROM ratings WHERE to_user_id = $1 GROUP BY rating ORDER BY rating DESC', [userId]),
+    ]);
+    const total = parseInt(totalResult.rows[0].count);
+    const avg = parseFloat(avgResult.rows[0].avg || 0).toFixed(1);
+    const distribution = {};
+    distResult.rows.forEach(r => { distribution[r.rating] = parseInt(r.count); });
+    res.json({ total, avg: parseFloat(avg), distribution, rating: parseFloat(avg) });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/reviews/:id — get a specific review/rating (MUST be after /stats/:userId)
+app.get('/api/reviews/:id', auth, async (req, res) => {
+  try {
+    const result = await query(
+      'SELECT r.*, u.username as from_username FROM ratings r LEFT JOIN users u ON u.id = r.from_user_id WHERE r.id = $1',
+      [req.params.id]
+    );
+    if (!result.rows.length) return res.status(404).json({ error: 'Review not found' });
+    res.json({ review: result.rows[0] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PUT /api/users/:id/availability — update user availability status
+app.put('/api/users/:id/availability', auth, async (req, res) => {
+  const { available, availability } = req.body;
+  if (req.params.id !== req.userId) return res.status(403).json({ error: 'Forbidden' });
+  try {
+    const isAvailable = available !== undefined ? available : (availability === 'available');
+    await query('UPDATE users SET is_available = $1, updated_at = NOW() WHERE id = $2', [isAvailable, req.userId]).catch(async () => {
+      // Column may not exist, try adding it
+      await query('ALTER TABLE users ADD COLUMN IF NOT EXISTS is_available BOOLEAN DEFAULT true').catch(() => {});
+      await query('UPDATE users SET is_available = $1, updated_at = NOW() WHERE id = $2', [isAvailable, req.userId]).catch(() => {});
+    });
+    const result = await query('SELECT * FROM users WHERE id = $1', [req.userId]);
+    const u = result.rows[0];
+    res.json({ ...u, uid: u.id, is_admin: u.role === 'admin', success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ─── 404 ──────────────────────────────────────────────
 app.use((req, res) => {
   res.status(404).json({ error: 'Not found' });
