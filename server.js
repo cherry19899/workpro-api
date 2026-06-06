@@ -828,6 +828,18 @@ app.delete('/api/admin/jobs/:id', adminAuth, async (req, res) => {
   }
 });
 
+// POST /api/admin/users/:id/grant-connects — admin grants connects to user
+app.post('/api/admin/users/:id/grant-connects', adminAuth, async (req, res) => {
+  const { amount } = req.body;
+  const qty = parseInt(amount || 50);
+  try {
+    await query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [qty, req.params.id]);
+    const result = await query('SELECT balance_connects FROM users WHERE id = $1', [req.params.id]);
+    await audit('admin_grant_connects', { user_id: req.params.id, amount: qty, granted_by: req.userId });
+    res.json({ success: true, balance: result.rows[0]?.balance_connects || 0 });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.get('/api/admin/escrows', adminAuth, async (req, res) => {
   try {
     const result = await query('SELECT * FROM escrows ORDER BY created_at DESC');
@@ -1444,6 +1456,15 @@ app.post('/api/connects/buy', auth, checkBlocked, async (req, res) => {
   const quantity = req.body.quantity || req.body.package_amount;
   const { payment_id, txid, amount, status, pi_amount, user_id } = req.body;
   if (!quantity) return res.status(400).json({ error: 'quantity required' });
+
+  // If this is a granted (admin/dev bonus) call, add directly
+  if (status === 'granted') {
+    try {
+      await query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [parseInt(quantity), req.userId]);
+      const result = await query('SELECT balance_connects FROM users WHERE id = $1', [req.userId]);
+      return res.json({ success: true, balance: result.rows[0]?.balance_connects || 0 });
+    } catch (err) { return res.status(500).json({ error: err.message }); }
+  }
 
   // If this is a pending (approval) call, just record and return
   if (status === 'pending') {
