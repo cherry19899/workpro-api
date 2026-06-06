@@ -1515,6 +1515,100 @@ app.post('/api/connects/buy', auth, checkBlocked, async (req, res) => {
 
 // (jobs/my is defined above, before /jobs/:id)
 
+// ─── Missing endpoint aliases found from bundle analysis ──────────────────────────────────────────────
+
+// GET /api/applications/user/:userId — list applications for a user
+app.get('/api/applications/user/:userId', auth, async (req, res) => {
+  try {
+    const userId = req.params.userId || req.userId;
+    const result = await query(
+      `SELECT a.*, j.title as job_title, j.budget, j.status as job_status,
+              u.username as client_username
+       FROM applications a
+       JOIN jobs j ON a.job_id = j.id
+       LEFT JOIN users u ON u.id = j.posted_by
+       WHERE a.freelancer_uid = $1 OR a.user_id = $1
+       ORDER BY a.created_at DESC`,
+      [userId]
+    );
+    res.json({ applications: result.rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/escrows/user/:userId — list escrows for a user
+app.get('/api/escrows/user/:userId', auth, async (req, res) => {
+  try {
+    const userId = req.params.userId || req.userId;
+    const result = await query(
+      `SELECT e.*, j.title as job_title,
+              c.username as client_username, f.username as freelancer_username
+       FROM escrows e
+       LEFT JOIN jobs j ON j.id = e.job_id
+       LEFT JOIN users c ON c.id = e.client_id
+       LEFT JOIN users f ON f.id = e.freelancer_id
+       WHERE e.client_id = $1 OR e.freelancer_id = $1
+       ORDER BY e.created_at DESC`,
+      [userId]
+    );
+    res.json({ escrows: result.rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/jobs/user/:userId — list jobs posted by a user (public)
+app.get('/api/jobs/user/:userId', async (req, res) => {
+  try {
+    const userId = req.params.userId;
+    const result = await query(
+      `SELECT j.*, u.username as client_username
+       FROM jobs j LEFT JOIN users u ON u.id = j.posted_by
+       WHERE j.posted_by = $1
+       ORDER BY j.created_at DESC`,
+      [userId]
+    );
+    res.json({ jobs: result.rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/offers — direct offers (job invitations) for freelancer
+app.get('/api/offers', auth, async (req, res) => {
+  try {
+    // Offers are applications where the job posted_by invited the freelancer
+    // For now, return applications with status 'offer' or all pending ones
+    const result = await query(
+      `SELECT a.*, j.title as job_title, j.budget, j.status as job_status,
+              u.username as client_username
+       FROM applications a
+       JOIN jobs j ON a.job_id = j.id
+       LEFT JOIN users u ON u.id = j.posted_by
+       WHERE (a.freelancer_uid = $1 OR a.user_id = $1)
+         AND a.status = 'offer'
+       ORDER BY a.created_at DESC`,
+      [req.userId]
+    );
+    res.json({ offers: result.rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/reviews/stats — review statistics for logged-in user
+app.get('/api/reviews/stats', auth, async (req, res) => {
+  try {
+    const userId = req.query.user_id || req.userId;
+    const [totalResult, avgResult, distResult] = await Promise.all([
+      query('SELECT COUNT(*) FROM ratings WHERE to_user_id = $1', [userId]),
+      query('SELECT AVG(rating) as avg FROM ratings WHERE to_user_id = $1', [userId]),
+      query(
+        'SELECT rating, COUNT(*) as count FROM ratings WHERE to_user_id = $1 GROUP BY rating ORDER BY rating DESC',
+        [userId]
+      ),
+    ]);
+    const total = parseInt(totalResult.rows[0].count);
+    const avg = parseFloat(avgResult.rows[0].avg || 0).toFixed(1);
+    const distribution = {};
+    distResult.rows.forEach(r => { distribution[r.rating] = parseInt(r.count); });
+    res.json({ total, avg: parseFloat(avg), distribution, rating: parseFloat(avg) });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ─── 404 ──────────────────────────────────────────────
 app.use((req, res) => {
   res.status(404).json({ error: 'Not found' });
