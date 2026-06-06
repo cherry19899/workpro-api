@@ -320,6 +320,17 @@ app.post('/api/jobs', auth, checkBlocked, async (req, res) => {
   }
 });
 
+// GET /api/jobs/my — client's own posted jobs (must be before /:id to avoid conflict)
+app.get('/api/jobs/my', auth, async (req, res) => {
+  try {
+    const result = await query(
+      'SELECT j.*, u.username as client_username FROM jobs j LEFT JOIN users u ON u.id = j.posted_by WHERE j.posted_by = $1 ORDER BY j.created_at DESC',
+      [req.userId]
+    );
+    res.json({ jobs: result.rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.get('/api/jobs/:id', async (req, res) => {
   try {
     const jobResult = await query('SELECT * FROM jobs WHERE id = $1', [req.params.id]);
@@ -1502,16 +1513,7 @@ app.post('/api/connects/buy', auth, checkBlocked, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// GET /api/jobs/my — alias for client's own jobs
-app.get('/api/jobs/my', auth, async (req, res) => {
-  try {
-    const result = await query(
-      'SELECT j.*, u.username as client_username FROM jobs j LEFT JOIN users u ON u.id = j.posted_by WHERE j.posted_by = $1 ORDER BY j.created_at DESC',
-      [req.userId]
-    );
-    res.json({ jobs: result.rows });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
+// (jobs/my is defined above, before /jobs/:id)
 
 // ─── 404 ──────────────────────────────────────────────
 app.use((req, res) => {
