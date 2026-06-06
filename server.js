@@ -84,16 +84,11 @@ function auth(req, res, next) {
 
 function adminAuth(req, res, next) {
   const userId = req.headers['x-user-id'];
-  if (userId === 'cherry19899' || userId === 'admin') {
+  if (userId === 'cherry19899') {
     req.isAdmin = true;
     return next();
   }
-  const apiKey = req.headers['x-admin-key'] || req.headers['authorization'] || req.query.admin_key;
-  if (!apiKey) return res.status(403).json({ error: 'Admin access required' });
-  let token = apiKey.startsWith('Bearer ') ? apiKey.substring(7) : apiKey;
-  if (token !== ADMIN_API_KEY) return res.status(403).json({ error: 'Admin access required' });
-  req.isAdmin = true;
-  next();
+  return res.status(403).json({ error: 'Admin access required' });
 }
 
 async function checkBlocked(req, res, next) {
