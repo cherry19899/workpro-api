@@ -122,6 +122,18 @@ app.get('/api/health', async (req, res) => {
   }
 });
 
+// GET /api/me — get current user profile (used by Profile.js)
+app.get('/api/me', async (req, res) => {
+  const userId = req.headers['x-user-id'];
+  if (!userId) return res.status(401).json({ error: 'x-user-id header required' });
+  try {
+    const result = await query('SELECT * FROM users WHERE id = $1', [userId]);
+    if (!result.rows.length) return res.status(404).json({ error: 'User not found' });
+    const u = result.rows[0];
+    res.json({ ...u, uid: u.id, is_admin: u.role === 'admin' });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // POST /api/me — alias login endpoint used by Auth.js
 app.post('/api/me', async (req, res) => {
   const { uid, username, accessToken } = req.body;
