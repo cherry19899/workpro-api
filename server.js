@@ -106,6 +106,16 @@ async function checkBlocked(req, res, next) {
   } catch (_) { next(); }
 }
 
+// ─── Root & Pi Network verification ──────────────────────────────────────────
+app.get('/', (req, res) => {
+  res.json({ name: 'WorkPro API', version: '3.1.0', status: 'ok' });
+});
+
+// Pi Network calls this to verify backend ownership
+app.get('/.well-known/pi-network', (req, res) => {
+  res.json({ app: 'workpro', backend: true, version: '3.1.0' });
+});
+
 // ─── Health ──────────────────────────────────────────────
 app.get('/api/health', async (req, res) => {
   try {
