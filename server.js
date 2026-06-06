@@ -983,6 +983,28 @@ app.get('/api/applications/job/:jobId', auth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// POST /api/applications/:id/accept — alias used by JobDetail.js
+app.post('/api/applications/:id/accept', auth, async (req, res) => {
+  try {
+    const appResult = await query('SELECT a.*, j.posted_by FROM applications a JOIN jobs j ON a.job_id = j.id WHERE a.id = $1', [req.params.id]);
+    if (!appResult.rows.length) return res.status(404).json({ error: 'Application not found' });
+    if (appResult.rows[0].posted_by !== req.userId) return res.status(403).json({ error: 'Forbidden' });
+    const result = await query('UPDATE applications SET status = $1 WHERE id = $2 RETURNING *', ['accepted', req.params.id]);
+    res.json({ application: result.rows[0], success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /api/applications/:id/reject — alias used by JobDetail.js
+app.post('/api/applications/:id/reject', auth, async (req, res) => {
+  try {
+    const appResult = await query('SELECT a.*, j.posted_by FROM applications a JOIN jobs j ON a.job_id = j.id WHERE a.id = $1', [req.params.id]);
+    if (!appResult.rows.length) return res.status(404).json({ error: 'Application not found' });
+    if (appResult.rows[0].posted_by !== req.userId) return res.status(403).json({ error: 'Forbidden' });
+    const result = await query('UPDATE applications SET status = $1 WHERE id = $2 RETURNING *', ['rejected', req.params.id]);
+    res.json({ application: result.rows[0], success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // PUT /api/applications/:id/status — update application status
 app.put('/api/applications/:id/status', auth, async (req, res) => {
   const { status } = req.body;
