@@ -429,8 +429,16 @@ app.get('/api/chat/rooms', auth, async (req, res) => {
     const result = await query(
       `SELECT r.*,
         (SELECT message FROM chat_messages WHERE room_id = r.id ORDER BY created_at DESC LIMIT 1) as last_message,
-        (SELECT created_at FROM chat_messages WHERE room_id = r.id ORDER BY created_at DESC LIMIT 1) as last_message_at
-       FROM chat_rooms r WHERE r.client_id = $1 OR r.freelancer_id = $1 ORDER BY last_message_at DESC NULLS LAST`,
+        (SELECT created_at FROM chat_messages WHERE room_id = r.id ORDER BY created_at DESC LIMIT 1) as last_message_at,
+        j.title as job_title,
+        CASE WHEN r.client_id = $1 THEN r.freelancer_id ELSE r.client_id END as other_user_id,
+        CASE WHEN r.client_id = $1 THEN uf.username ELSE uc.username END as other_user_name
+       FROM chat_rooms r
+       LEFT JOIN jobs j ON j.id = r.job_id
+       LEFT JOIN users uc ON uc.id = r.client_id
+       LEFT JOIN users uf ON uf.id = r.freelancer_id
+       WHERE r.client_id = $1 OR r.freelancer_id = $1
+       ORDER BY last_message_at DESC NULLS LAST`,
       [req.userId]
     );
     res.json({ rooms: result.rows });
