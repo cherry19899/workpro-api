@@ -85,15 +85,18 @@ async function initDb() {
     await query(`CREATE TABLE IF NOT EXISTS escrows (
       id SERIAL PRIMARY KEY, job_id INTEGER, client_id VARCHAR(255),
       freelancer_id VARCHAR(255), amount DECIMAL(10,2) NOT NULL,
-      status VARCHAR(50) DEFAULT 'pending', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      payment_id VARCHAR(255), status VARCHAR(50) DEFAULT 'pending',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )`);
     await query(`CREATE TABLE IF NOT EXISTS payments (
       id VARCHAR(255) PRIMARY KEY, user_id VARCHAR(255), type VARCHAR(100),
       amount DECIMAL(10,2), status VARCHAR(50) DEFAULT 'pending',
-      metadata JSONB DEFAULT '{}', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      txid VARCHAR(255), metadata JSONB DEFAULT '{}',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )`);
+    // Add missing columns if upgrading existing DB
+    await query(`ALTER TABLE escrows ADD COLUMN IF NOT EXISTS payment_id VARCHAR(255)`).catch(() => {});
+    await query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS txid VARCHAR(255)`).catch(() => {});
     await query(`CREATE TABLE IF NOT EXISTS ratings (
       id SERIAL PRIMARY KEY, from_user_id VARCHAR(255), to_user_id VARCHAR(255),
       job_id INTEGER, rating INTEGER, comment TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP

@@ -2,10 +2,10 @@
   "name": "workpro-api",
   "version": "3.0.0",
   "description": "WorkPro API - PostgreSQL",
-  "main": "server-pg.js",
+  "main": "server.js",
   "scripts": {
-    "start": "node server-pg.js",
-    "dev": "nodemon server-pg.js",
+    "start": "node server.js",
+    "dev": "nodemon server.js",
     "db:init": "node -e \"require('./db').initDb()\""
   },
   "dependencies": {
