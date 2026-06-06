@@ -104,19 +104,19 @@ async function checkBlocked(req, res, next) {
 
 // ─── Root & Pi Network verification ──────────────────────────────────────────
 app.get('/', (req, res) => {
-  res.json({ name: 'WorkPro API', version: '3.1.0', status: 'ok' });
+  res.json({ name: 'WorkPro API', version: '3.2.0', status: 'ok' });
 });
 
 // Pi Network calls this to verify backend ownership
 app.get('/.well-known/pi-network', (req, res) => {
-  res.json({ app: 'workpro', backend: true, version: '3.1.0' });
+  res.json({ app: 'workpro', backend: true, version: '3.2.0' });
 });
 
 // ─── Health ──────────────────────────────────────────────
 app.get('/api/health', async (req, res) => {
   try {
     await query('SELECT 1');
-    res.json({ status: 'ok', version: '3.1.0', database: 'connected', timestamp: now() });
+    res.json({ status: 'ok', version: '3.2.0', database: 'connected', timestamp: now() });
   } catch (err) {
     res.status(500).json({ status: 'error', database: 'disconnected', error: err.message });
   }
@@ -983,14 +983,42 @@ app.get('/api/applications/job/:jobId', auth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// POST /api/applications/:id/accept — alias used by JobDetail.js
+// POST /api/applications/:id/accept — accept application + create escrow record
 app.post('/api/applications/:id/accept', auth, async (req, res) => {
   try {
-    const appResult = await query('SELECT a.*, j.posted_by FROM applications a JOIN jobs j ON a.job_id = j.id WHERE a.id = $1', [req.params.id]);
+    const appResult = await query(
+      'SELECT a.*, j.posted_by, j.budget, j.title FROM applications a JOIN jobs j ON a.job_id = j.id WHERE a.id = $1',
+      [req.params.id]
+    );
     if (!appResult.rows.length) return res.status(404).json({ error: 'Application not found' });
-    if (appResult.rows[0].posted_by !== req.userId) return res.status(403).json({ error: 'Forbidden' });
+    const app_ = appResult.rows[0];
+    if (app_.posted_by !== req.userId) return res.status(403).json({ error: 'Forbidden' });
+
+    // Accept the application
     const result = await query('UPDATE applications SET status = $1 WHERE id = $2 RETURNING *', ['accepted', req.params.id]);
-    res.json({ application: result.rows[0], success: true });
+
+    // Create escrow record (pending state — will be funded after Pi payment)
+    const freelancerId = app_.freelancer_uid || app_.user_id;
+    const escrowAmount = app_.bid_amount || app_.budget || 0;
+    let escrow = null;
+    if (freelancerId) {
+      const existing = await query('SELECT * FROM escrows WHERE job_id = $1 AND status IN ($2, $3)', [app_.job_id, 'pending', 'funded']);
+      if (!existing.rows.length) {
+        const escrowResult = await query(
+          `INSERT INTO escrows (job_id, client_id, freelancer_id, amount, status)
+           VALUES ($1,$2,$3,$4,'pending') RETURNING *`,
+          [app_.job_id, req.userId, freelancerId, escrowAmount]
+        );
+        escrow = escrowResult.rows[0];
+      } else {
+        escrow = existing.rows[0];
+      }
+      // Mark job as in-progress
+      await query("UPDATE jobs SET status='in_progress', updated_at=NOW() WHERE id=$1", [app_.job_id]);
+    }
+
+    await audit('application_accepted', { app_id: req.params.id, job_id: app_.job_id, freelancer_id: freelancerId });
+    res.json({ application: result.rows[0], escrow, success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -1270,6 +1298,197 @@ app.delete('/api/users/me/portfolio/items/:id', auth, async (req, res) => {
   try {
     await query('DELETE FROM portfolio_items WHERE id = $1 AND user_id = $2', [req.params.id, req.userId]);
     res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ─── Notifications ──────────────────────────────────────────────
+// Simple notifications: unread chat messages count as notifications
+app.get('/api/notifications/unread-count', auth, async (req, res) => {
+  try {
+    // Count unread messages from chat rooms the user is in
+    const result = await query(
+      `SELECT COUNT(*) FROM messages m
+       JOIN chat_rooms cr ON cr.id = m.room_id
+       WHERE (cr.user1_id = $1 OR cr.user2_id = $1)
+         AND m.sender_id != $1
+         AND m.read = false`,
+      [req.userId]
+    );
+    const unread_count = parseInt(result.rows[0].count) || 0;
+    res.json({ unread_count, count: unread_count });
+  } catch (err) {
+    // Table may not exist yet — return 0 silently
+    res.json({ unread_count: 0, count: 0 });
+  }
+});
+
+app.get('/api/notifications', auth, async (req, res) => {
+  try {
+    const result = await query(
+      `SELECT m.id, m.content as message, m.created_at,
+              u.username as from_username, cr.id as room_id
+       FROM messages m
+       JOIN chat_rooms cr ON cr.id = m.room_id
+       JOIN users u ON u.id = m.sender_id
+       WHERE (cr.user1_id = $1 OR cr.user2_id = $1)
+         AND m.sender_id != $1
+         AND m.read = false
+       ORDER BY m.created_at DESC LIMIT 50`,
+      [req.userId]
+    );
+    res.json({ notifications: result.rows });
+  } catch (err) {
+    res.json({ notifications: [] });
+  }
+});
+
+app.post('/api/notifications/mark-read', auth, async (req, res) => {
+  try {
+    await query(
+      `UPDATE messages SET read = true
+       WHERE id IN (
+         SELECT m.id FROM messages m
+         JOIN chat_rooms cr ON cr.id = m.room_id
+         WHERE (cr.user1_id = $1 OR cr.user2_id = $1) AND m.sender_id != $1
+       )`,
+      [req.userId]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    res.json({ success: true }); // silent
+  }
+});
+
+// ─── Hire with Pi payment (escrow) ──────────────────────────────────────────────
+// POST /api/applications/:id/hire — initiate Pi escrow for hired freelancer
+// Called from frontend after client decides to hire (Pi payment flow)
+app.post('/api/applications/:id/hire', auth, checkBlocked, async (req, res) => {
+  const { payment_id, txid, amount } = req.body;
+  try {
+    const appResult = await query(
+      'SELECT a.*, j.posted_by, j.budget FROM applications a JOIN jobs j ON a.job_id = j.id WHERE a.id = $1',
+      [req.params.id]
+    );
+    if (!appResult.rows.length) return res.status(404).json({ error: 'Application not found' });
+    const app_ = appResult.rows[0];
+    if (app_.posted_by !== req.userId) return res.status(403).json({ error: 'Forbidden' });
+
+    const escrowAmount = amount || app_.bid_amount || app_.budget;
+    const freelancerId = app_.freelancer_uid || app_.user_id;
+
+    // Accept application
+    await query('UPDATE applications SET status = $1 WHERE id = $2', ['accepted', req.params.id]);
+    // Create escrow
+    const escrow = await query(
+      `INSERT INTO escrows (job_id, client_id, freelancer_id, amount, payment_id, status)
+       VALUES ($1,$2,$3,$4,$5,'funded') ON CONFLICT DO NOTHING RETURNING *`,
+      [app_.job_id, req.userId, freelancerId, escrowAmount, payment_id || null]
+    );
+    // Mark job as in-progress
+    await query("UPDATE jobs SET status='in_progress', updated_at=NOW() WHERE id=$1", [app_.job_id]);
+    await audit('hire_with_escrow', { app_id: req.params.id, job_id: app_.job_id, freelancer_id: freelancerId, amount: escrowAmount });
+    res.json({ success: true, escrow: escrow.rows[0] || { job_id: app_.job_id, status: 'funded' } });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /api/payments/approve — Pi payment server-side approval
+app.post('/api/payments/approve', auth, async (req, res) => {
+  const { payment_id, metadata } = req.body;
+  if (!payment_id) return res.status(400).json({ error: 'payment_id required' });
+  try {
+    // Call Pi Platform API to approve
+    const approveRes = await fetch(`https://api.minepi.com/v2/payments/${payment_id}/approve`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Key ${process.env.PI_API_KEY}`,
+        'Content-Type': 'application/json',
+      }
+    });
+    const approveData = await approveRes.json();
+    // Record in DB
+    await query(
+      `INSERT INTO payments (user_id, payment_id, amount, status, metadata)
+       VALUES ($1,$2,$3,'approved',$4)
+       ON CONFLICT (payment_id) DO UPDATE SET status='approved', updated_at=NOW()`,
+      [req.userId, payment_id, approveData.amount || 0, JSON.stringify(metadata || {})]
+    ).catch(() => {});
+    res.json({ success: true, payment: approveData });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /api/payments/complete — Pi payment server-side completion
+app.post('/api/payments/complete', auth, async (req, res) => {
+  const { payment_id, txid, metadata } = req.body;
+  if (!payment_id || !txid) return res.status(400).json({ error: 'payment_id and txid required' });
+  try {
+    const completeRes = await fetch(`https://api.minepi.com/v2/payments/${payment_id}/complete`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Key ${process.env.PI_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ txid })
+    });
+    const completeData = await completeRes.json();
+    await query(
+      `UPDATE payments SET status='completed', txid=$1, updated_at=NOW() WHERE payment_id=$2`,
+      [txid, payment_id]
+    ).catch(() => {});
+    res.json({ success: true, payment: completeData });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /api/connects/buy — alias for connects/purchase, called from Connects.js and bundle
+app.post('/api/connects/buy', auth, checkBlocked, async (req, res) => {
+  // Support both Connects.js format (quantity) and bundle format (package_amount)
+  const quantity = req.body.quantity || req.body.package_amount;
+  const { payment_id, txid, amount, status, pi_amount, user_id } = req.body;
+  if (!quantity) return res.status(400).json({ error: 'quantity required' });
+
+  // If this is a pending (approval) call, just record and return
+  if (status === 'pending') {
+    await query(
+      `INSERT INTO payments (user_id, payment_id, amount, status, metadata)
+       VALUES ($1,$2,$3,'pending',$4)
+       ON CONFLICT (payment_id) DO UPDATE SET status='pending', updated_at=NOW()`,
+      [req.userId, payment_id || 'manual', amount || 0, JSON.stringify({ type: 'connects', quantity })]
+    ).catch(() => {});
+    return res.json({ success: true, status: 'pending' });
+  }
+
+  // Completed — add connects
+  try {
+    if (payment_id && txid) {
+      // Approve + complete with Pi
+      await fetch(`https://api.minepi.com/v2/payments/${payment_id}/approve`, {
+        method: 'POST',
+        headers: { 'Authorization': `Key ${process.env.PI_API_KEY}` }
+      }).catch(() => {});
+      await fetch(`https://api.minepi.com/v2/payments/${payment_id}/complete`, {
+        method: 'POST',
+        headers: { 'Authorization': `Key ${process.env.PI_API_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ txid })
+      }).catch(() => {});
+    }
+    await query(
+      'UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2',
+      [parseInt(quantity), req.userId]
+    );
+    const result = await query('SELECT balance_connects FROM users WHERE id = $1', [req.userId]);
+    const balance = result.rows[0]?.balance_connects || 0;
+    await audit('connects_purchased', { user_id: req.userId, quantity, payment_id });
+    res.json({ success: true, balance, balance_connects: balance });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/jobs/my — alias for client's own jobs
+app.get('/api/jobs/my', auth, async (req, res) => {
+  try {
+    const result = await query(
+      'SELECT j.*, u.username as client_username FROM jobs j LEFT JOIN users u ON u.id = j.posted_by WHERE j.posted_by = $1 ORDER BY j.created_at DESC',
+      [req.userId]
+    );
+    res.json({ jobs: result.rows });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
