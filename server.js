@@ -126,6 +126,23 @@ app.get('/api/health', async (req, res) => {
   }
 });
 
+// POST /api/me — alias login endpoint used by Auth.js
+app.post('/api/me', async (req, res) => {
+  const { uid, username, accessToken } = req.body;
+  if (!uid) return res.status(400).json({ error: 'uid required' });
+  try {
+    const existing = await query('SELECT * FROM users WHERE id = $1', [uid]);
+    if (!existing.rows.length) {
+      await query('INSERT INTO users (id, username, role, balance_connects, created_at, updated_at) VALUES ($1, $2, $3, 10, NOW(), NOW())', [uid, username || uid, 'freelancer']);
+    } else {
+      await query('UPDATE users SET username = $1, updated_at = NOW() WHERE id = $2', [username || uid, uid]);
+    }
+    const user = await query('SELECT * FROM users WHERE id = $1', [uid]);
+    await audit('user_login', { user_id: uid });
+    res.json({ ...user.rows[0] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ─── Auth ──────────────────────────────────────────────
 app.post('/api/auth/login', async (req, res) => {
   const { userId, username, accessToken } = req.body;
@@ -224,7 +241,8 @@ app.get('/api/users/:id/ratings', async (req, res) => {
 
 // ─── Jobs ──────────────────────────────────────────────
 app.get('/api/jobs', async (req, res) => {
-  const { status = 'open', category, posted_by, search, limit = 20, page = 1 } = req.query;
+  const { status, category, posted_by, client_uid, search, limit = 20, page = 1 } = req.query;
+  const ownerFilter = posted_by || client_uid;
   try {
     let conditions = [];
     const params = [];
@@ -232,7 +250,7 @@ app.get('/api/jobs', async (req, res) => {
 
     if (status) { conditions.push(`status = $${idx++}`); params.push(status); }
     if (category && category !== 'all' && category !== 'All') { conditions.push(`category = $${idx++}`); params.push(category); }
-    if (posted_by) { conditions.push(`posted_by = $${idx++}`); params.push(posted_by); }
+    if (ownerFilter) { conditions.push(`posted_by = $${idx++}`); params.push(ownerFilter); }
     if (search) { conditions.push(`(title ILIKE $${idx} OR description ILIKE $${idx})`); params.push(`%${search}%`); idx++; }
 
     const where = conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
@@ -810,6 +828,76 @@ app.get('/api/admin/verify', async (req, res) => {
   res.json({ valid: token === ADMIN_API_KEY, env_set: !!process.env.ADMIN_API_KEY });
 });
 
+// GET /api/jobs/:id/applications — used by JobDetail.js
+app.get('/api/jobs/:id/applications', auth, async (req, res) => {
+  try {
+    const result = await query('SELECT * FROM applications WHERE job_id = $1 ORDER BY created_at DESC', [req.params.id]);
+    res.json({ applications: result.rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/jobs?client_uid=xxx — filter by owner (client_uid alias for posted_by)
+// Handled in existing GET /api/jobs — patching it to support client_uid param
+// (done below in the jobs section override)
+
+// GET /api/applications/me — alias for /my
+// (added below)
+
+// GET /api/escrows + /api/escrows/me — alias for /api/escrow
+app.get('/api/escrows', auth, async (req, res) => {
+  try {
+    const result = await query('SELECT * FROM escrows WHERE client_id = $1 OR freelancer_id = $1 ORDER BY created_at DESC', [req.userId]);
+    res.json({ escrows: result.rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+app.get('/api/escrows/me', auth, async (req, res) => {
+  try {
+    const result = await query('SELECT * FROM escrows WHERE client_id = $1 OR freelancer_id = $1 ORDER BY created_at DESC', [req.userId]);
+    res.json({ escrows: result.rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+app.post('/api/escrows/:id/release', auth, checkBlocked, async (req, res) => {
+  try {
+    const result = await query('SELECT * FROM escrows WHERE id = $1', [req.params.id]);
+    if (!result.rows.length) return res.status(404).json({ error: 'Escrow not found' });
+    const escrow = result.rows[0];
+    if (escrow.client_id !== req.userId) return res.status(403).json({ error: 'Not your escrow' });
+    await query('UPDATE escrows SET status = $1, updated_at = NOW() WHERE id = $2', ['released', req.params.id]);
+    await query('UPDATE users SET balance_pi = balance_pi + $1, total_jobs_completed = total_jobs_completed + 1, updated_at = NOW() WHERE id = $2', [escrow.amount, escrow.freelancer_id]);
+    await query('UPDATE jobs SET status = $1, updated_at = NOW() WHERE id = $2', ['completed', escrow.job_id]);
+    await audit('escrow_released', { escrow_id: req.params.id });
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+app.post('/api/escrows/:id/cancel', auth, checkBlocked, async (req, res) => {
+  try {
+    const result = await query('SELECT * FROM escrows WHERE id = $1', [req.params.id]);
+    if (!result.rows.length) return res.status(404).json({ error: 'Escrow not found' });
+    const escrow = result.rows[0];
+    if (escrow.client_id !== req.userId) return res.status(403).json({ error: 'Not your escrow' });
+    await query('UPDATE escrows SET status = $1, updated_at = NOW() WHERE id = $2', ['refunded', req.params.id]);
+    await query('UPDATE jobs SET status = $1, updated_at = NOW() WHERE id = $2', ['open', escrow.job_id]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /api/chat/start — start or get conversation
+app.post('/api/chat/start', auth, checkBlocked, async (req, res) => {
+  const { other_user_id, job_id } = req.body;
+  if (!other_user_id) return res.status(400).json({ error: 'other_user_id required' });
+  try {
+    const jobId = job_id || 0;
+    const existing = await query(
+      'SELECT * FROM chat_rooms WHERE (client_id = $1 AND freelancer_id = $2) OR (client_id = $2 AND freelancer_id = $1)',
+      [req.userId, other_user_id]
+    );
+    if (existing.rows.length) return res.json({ conversation: existing.rows[0], id: existing.rows[0].id });
+    const roomId = 'room_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
+    const result = await query('INSERT INTO chat_rooms (id, client_id, freelancer_id, job_id) VALUES ($1, $2, $3, $4) RETURNING *', [roomId, req.userId, other_user_id, jobId]);
+    res.json({ conversation: result.rows[0], id: result.rows[0].id });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ─── Alias endpoints for cherry19899.github.io frontend ──────────────────
 // POST /api/applications — apply to job (frontend sends job_id in body)
 app.post('/api/applications', auth, checkBlocked, async (req, res) => {
@@ -838,8 +926,14 @@ app.post('/api/applications', auth, checkBlocked, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// GET /api/applications/my — my applications as freelancer
+// GET /api/applications/my + /api/applications/me — my applications as freelancer
 app.get('/api/applications/my', auth, async (req, res) => {
+  try {
+    const result = await query('SELECT * FROM applications WHERE freelancer_id = $1 ORDER BY created_at DESC', [req.userId]);
+    res.json({ applications: result.rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+app.get('/api/applications/me', auth, async (req, res) => {
   try {
     const result = await query('SELECT * FROM applications WHERE freelancer_id = $1 ORDER BY created_at DESC', [req.userId]);
     res.json({ applications: result.rows });
