@@ -1021,7 +1021,7 @@ app.post('/api/applications/:id/accept', auth, async (req, res) => {
     const result = await query('UPDATE applications SET status = $1 WHERE id = $2 RETURNING *', ['accepted', req.params.id]);
 
     // Create escrow record (pending state — will be funded after Pi payment)
-    const freelancerId = app_.freelancer_uid || app_.user_id;
+    const freelancerId = app_.freelancer_id;
     const escrowAmount = app_.bid_amount || app_.budget || 0;
     let escrow = null;
     if (freelancerId) {
@@ -1332,7 +1332,7 @@ app.get('/api/notifications/unread-count', auth, async (req, res) => {
     const result = await query(
       `SELECT COUNT(*) FROM messages m
        JOIN chat_rooms cr ON cr.id = m.room_id
-       WHERE (cr.user1_id = $1 OR cr.user2_id = $1)
+       WHERE (cr.client_id = $1 OR cr.freelancer_id = $1)
          AND m.sender_id != $1
          AND m.read = false`,
       [req.userId]
@@ -1353,7 +1353,7 @@ app.get('/api/notifications', auth, async (req, res) => {
        FROM messages m
        JOIN chat_rooms cr ON cr.id = m.room_id
        JOIN users u ON u.id = m.sender_id
-       WHERE (cr.user1_id = $1 OR cr.user2_id = $1)
+       WHERE (cr.client_id = $1 OR cr.freelancer_id = $1)
          AND m.sender_id != $1
          AND m.read = false
        ORDER BY m.created_at DESC LIMIT 50`,
@@ -1372,7 +1372,7 @@ app.post('/api/notifications/mark-read', auth, async (req, res) => {
        WHERE id IN (
          SELECT m.id FROM messages m
          JOIN chat_rooms cr ON cr.id = m.room_id
-         WHERE (cr.user1_id = $1 OR cr.user2_id = $1) AND m.sender_id != $1
+         WHERE (cr.client_id = $1 OR cr.freelancer_id = $1) AND m.sender_id != $1
        )`,
       [req.userId]
     );
@@ -1397,7 +1397,7 @@ app.post('/api/applications/:id/hire', auth, checkBlocked, async (req, res) => {
     if (app_.posted_by !== req.userId) return res.status(403).json({ error: 'Forbidden' });
 
     const escrowAmount = amount || app_.bid_amount || app_.budget;
-    const freelancerId = app_.freelancer_uid || app_.user_id;
+    const freelancerId = app_.freelancer_id;
 
     // Accept application
     await query('UPDATE applications SET status = $1 WHERE id = $2', ['accepted', req.params.id]);
@@ -1527,7 +1527,7 @@ app.get('/api/applications/user/:userId', auth, async (req, res) => {
        FROM applications a
        JOIN jobs j ON a.job_id = j.id
        LEFT JOIN users u ON u.id = j.posted_by
-       WHERE a.freelancer_uid = $1 OR a.user_id = $1
+       WHERE a.freelancer_id = $1
        ORDER BY a.created_at DESC`,
       [userId]
     );
@@ -1580,7 +1580,7 @@ app.get('/api/offers', auth, async (req, res) => {
        FROM applications a
        JOIN jobs j ON a.job_id = j.id
        LEFT JOIN users u ON u.id = j.posted_by
-       WHERE (a.freelancer_uid = $1 OR a.user_id = $1)
+       WHERE a.freelancer_id = $1
          AND a.status = 'offer'
        ORDER BY a.created_at DESC`,
       [req.userId]
@@ -1642,11 +1642,11 @@ app.get('/api/chat/rooms/:id', auth, async (req, res) => {
   try {
     const result = await query(
       `SELECT cr.*,
-              u1.username as user1_username, u2.username as user2_username
+              u1.username as client_username, u2.username as freelancer_username
        FROM chat_rooms cr
-       LEFT JOIN users u1 ON u1.id = cr.user1_id
-       LEFT JOIN users u2 ON u2.id = cr.user2_id
-       WHERE cr.id = $1 AND (cr.user1_id = $2 OR cr.user2_id = $2)`,
+       LEFT JOIN users u1 ON u1.id = cr.client_id
+       LEFT JOIN users u2 ON u2.id = cr.freelancer_id
+       WHERE cr.id = $1 AND (cr.client_id = $2 OR cr.freelancer_id = $2)`,
       [req.params.id, req.userId]
     );
     if (!result.rows.length) return res.status(404).json({ error: 'Room not found' });
@@ -1692,15 +1692,16 @@ app.get('/api/escrows/:id/room', auth, async (req, res) => {
     const escrow = escResult.rows[0];
     // Find or create chat room between client and freelancer
     const roomResult = await query(
-      `SELECT * FROM chat_rooms WHERE (user1_id = $1 AND user2_id = $2) OR (user1_id = $2 AND user2_id = $1) LIMIT 1`,
+      `SELECT * FROM chat_rooms WHERE (client_id = $1 AND freelancer_id = $2) OR (client_id = $2 AND freelancer_id = $1) LIMIT 1`,
       [escrow.client_id, escrow.freelancer_id]
     );
     if (roomResult.rows.length) {
       return res.json({ room: roomResult.rows[0], room_id: roomResult.rows[0].id });
     }
     // Create room if not exists
+    const roomId = `${escrow.client_id}-${escrow.freelancer_id}-${Date.now()}`;
     const newRoom = await query(
-      'INSERT INTO chat_rooms (user1_id, user2_id) VALUES ($1, $2) RETURNING *',
+      'INSERT INTO chat_rooms (id, client_id, freelancer_id) VALUES ($1, $2, $3) RETURNING *',
       [escrow.client_id, escrow.freelancer_id]
     );
     res.json({ room: newRoom.rows[0], room_id: newRoom.rows[0].id });
@@ -1729,8 +1730,8 @@ app.post('/api/jobs/:id/apply', auth, checkBlocked, async (req, res) => {
     const coverLetter = message || cover_letter || '';
     const bidAmount = parseFloat(bid_amount || proposed_budget) || job.budget;
     const result = await query(
-      `INSERT INTO applications (job_id, freelancer_uid, user_id, cover_letter, bid_amount, status)
-       VALUES ($1,$2,$2,$3,$4,'pending') RETURNING *`,
+      `INSERT INTO applications (job_id, freelancer_id, cover_letter, bid_amount, status)
+       VALUES ($1,$2,$3,$4,'pending') RETURNING *`,
       [parseInt(req.params.id), req.userId, coverLetter, bidAmount]
     );
     res.json({ application: result.rows[0], success: true });
@@ -1740,7 +1741,7 @@ app.post('/api/jobs/:id/apply', auth, checkBlocked, async (req, res) => {
 // POST /api/offers/:id/accept — accept a job offer
 app.post('/api/offers/:id/accept', auth, async (req, res) => {
   try {
-    const result = await query('UPDATE applications SET status = $1 WHERE id = $2 AND (freelancer_uid = $3 OR user_id = $3) RETURNING *', ['accepted', req.params.id, req.userId]);
+    const result = await query('UPDATE applications SET status = $1 WHERE id = $2 AND freelancer_id = $3 RETURNING *', ['accepted', req.params.id, req.userId]);
     if (!result.rows.length) return res.status(404).json({ error: 'Offer not found' });
     res.json({ application: result.rows[0], success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -1749,7 +1750,7 @@ app.post('/api/offers/:id/accept', auth, async (req, res) => {
 // POST /api/offers/:id/decline — decline a job offer
 app.post('/api/offers/:id/decline', auth, async (req, res) => {
   try {
-    const result = await query('UPDATE applications SET status = $1 WHERE id = $2 AND (freelancer_uid = $3 OR user_id = $3) RETURNING *', ['declined', req.params.id, req.userId]);
+    const result = await query('UPDATE applications SET status = $1 WHERE id = $2 AND freelancer_id = $3 RETURNING *', ['declined', req.params.id, req.userId]);
     if (!result.rows.length) return res.status(404).json({ error: 'Offer not found' });
     res.json({ application: result.rows[0], success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
