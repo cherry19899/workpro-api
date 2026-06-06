@@ -1357,19 +1357,18 @@ app.delete('/api/users/me/portfolio/items/:id', auth, async (req, res) => {
 // Simple notifications: unread chat messages count as notifications
 app.get('/api/notifications/unread-count', auth, async (req, res) => {
   try {
-    // Count unread messages from chat rooms the user is in
+    // Count recent messages in chat rooms where user is participant but not sender
     const result = await query(
-      `SELECT COUNT(*) FROM messages m
-       JOIN chat_rooms cr ON cr.id = m.room_id
+      `SELECT COUNT(*) FROM chat_messages cm
+       JOIN chat_rooms cr ON cr.id = cm.room_id
        WHERE (cr.client_id = $1 OR cr.freelancer_id = $1)
-         AND m.sender_id != $1
-         AND m.read = false`,
+         AND cm.sender_id != $1
+         AND cm.created_at > NOW() - INTERVAL '7 days'`,
       [req.userId]
     );
     const unread_count = parseInt(result.rows[0].count) || 0;
     res.json({ unread_count, count: unread_count });
   } catch (err) {
-    // Table may not exist yet — return 0 silently
     res.json({ unread_count: 0, count: 0 });
   }
 });
@@ -1377,15 +1376,15 @@ app.get('/api/notifications/unread-count', auth, async (req, res) => {
 app.get('/api/notifications', auth, async (req, res) => {
   try {
     const result = await query(
-      `SELECT m.id, m.content as message, m.created_at,
+      `SELECT cm.id, cm.message as message, cm.message as content, cm.created_at,
               u.username as from_username, cr.id as room_id
-       FROM messages m
-       JOIN chat_rooms cr ON cr.id = m.room_id
-       JOIN users u ON u.id = m.sender_id
+       FROM chat_messages cm
+       JOIN chat_rooms cr ON cr.id = cm.room_id
+       JOIN users u ON u.id = cm.sender_id
        WHERE (cr.client_id = $1 OR cr.freelancer_id = $1)
-         AND m.sender_id != $1
-         AND m.read = false
-       ORDER BY m.created_at DESC LIMIT 50`,
+         AND cm.sender_id != $1
+         AND cm.created_at > NOW() - INTERVAL '7 days'
+       ORDER BY cm.created_at DESC LIMIT 50`,
       [req.userId]
     );
     res.json({ notifications: result.rows });
@@ -1395,20 +1394,8 @@ app.get('/api/notifications', auth, async (req, res) => {
 });
 
 app.post('/api/notifications/mark-read', auth, async (req, res) => {
-  try {
-    await query(
-      `UPDATE messages SET read = true
-       WHERE id IN (
-         SELECT m.id FROM messages m
-         JOIN chat_rooms cr ON cr.id = m.room_id
-         WHERE (cr.client_id = $1 OR cr.freelancer_id = $1) AND m.sender_id != $1
-       )`,
-      [req.userId]
-    );
-    res.json({ success: true });
-  } catch (err) {
-    res.json({ success: true }); // silent
-  }
+  // No read tracking in chat_messages table — just return success
+  res.json({ success: true });
 });
 
 // ─── Hire with Pi payment (escrow) ──────────────────────────────────────────────
@@ -1655,10 +1642,13 @@ app.post('/api/chat/:roomId/messages', auth, checkBlocked, async (req, res) => {
   try {
     const roomCheck = await query('SELECT * FROM chat_rooms WHERE id = $1 AND (client_id = $2 OR freelancer_id = $2)', [req.params.roomId, req.userId]);
     if (!roomCheck.rows.length) return res.status(403).json({ error: 'Not in this room' });
+    const userRes = await query('SELECT username FROM users WHERE id = $1', [req.userId]);
+    const senderName = userRes.rows[0]?.username || req.userId;
     const result = await query(
-      'INSERT INTO messages (room_id, sender_id, content, read) VALUES ($1, $2, $3, false) RETURNING *',
-      [req.params.roomId, req.userId, msg]
+      'INSERT INTO chat_messages (room_id, sender_id, sender_name, message) VALUES ($1, $2, $3, $4) RETURNING *',
+      [req.params.roomId, req.userId, senderName, msg]
     );
+    await query('UPDATE chat_rooms SET updated_at = NOW() WHERE id = $1', [req.params.roomId]);
     res.json({ message: result.rows[0], success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -1689,16 +1679,17 @@ app.post('/api/applications/:id/view', auth, async (req, res) => {
   } catch (err) { res.json({ success: true }); }
 });
 
-// GET /api/chat/:roomId/messages — messages in a chat room
+// GET /api/chat/:roomId/messages — messages in a chat room (uses chat_messages table)
 app.get('/api/chat/:roomId/messages', auth, async (req, res) => {
   try {
     const result = await query(
-      `SELECT m.*, u.username as sender_username
-       FROM messages m
-       LEFT JOIN users u ON u.id = m.sender_id
-       WHERE m.room_id = $1
-       ORDER BY m.created_at ASC
-       LIMIT 100`,
+      `SELECT cm.*, u.username as sender_username,
+              cm.message as content, cm.message as text
+       FROM chat_messages cm
+       LEFT JOIN users u ON u.id = cm.sender_id
+       WHERE cm.room_id = $1
+       ORDER BY cm.created_at ASC
+       LIMIT 200`,
       [req.params.roomId]
     );
     res.json({ messages: result.rows });
@@ -1771,10 +1762,10 @@ app.get('/api/escrows/:id/room', auth, async (req, res) => {
       return res.json({ room: roomResult.rows[0], room_id: roomResult.rows[0].id });
     }
     // Create room if not exists
-    const roomId = `${escrow.client_id}-${escrow.freelancer_id}-${Date.now()}`;
+    const roomId = `room_${escrow.client_id}-${escrow.freelancer_id}-${Date.now()}`;
     const newRoom = await query(
       'INSERT INTO chat_rooms (id, client_id, freelancer_id) VALUES ($1, $2, $3) RETURNING *',
-      [escrow.client_id, escrow.freelancer_id]
+      [roomId, escrow.client_id, escrow.freelancer_id]
     );
     res.json({ room: newRoom.rows[0], room_id: newRoom.rows[0].id });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -1845,15 +1836,27 @@ app.get('/api/reviews/stats/:userId', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// GET /api/reviews/:id — get a specific review/rating (MUST be after /stats/:userId)
-app.get('/api/reviews/:id', auth, async (req, res) => {
+// GET /api/reviews/:id — get review by ID, OR if id is non-integer, treat as user ID
+app.get('/api/reviews/:id', async (req, res) => {
+  const id = req.params.id;
+  const isNumeric = /^\d+$/.test(id);
   try {
-    const result = await query(
-      'SELECT r.*, u.username as from_username FROM ratings r LEFT JOIN users u ON u.id = r.from_user_id WHERE r.id = $1',
-      [req.params.id]
-    );
-    if (!result.rows.length) return res.status(404).json({ error: 'Review not found' });
-    res.json({ review: result.rows[0] });
+    if (isNumeric) {
+      // Get specific review by integer ID
+      const result = await query(
+        'SELECT r.*, u.username as from_username FROM ratings r LEFT JOIN users u ON u.id = r.from_user_id WHERE r.id = $1',
+        [id]
+      );
+      if (!result.rows.length) return res.status(404).json({ error: 'Review not found' });
+      res.json({ review: result.rows[0] });
+    } else {
+      // Treat as user ID — return all reviews for this user
+      const result = await query(
+        'SELECT r.*, u.username as from_username FROM ratings r LEFT JOIN users u ON u.id = r.from_user_id WHERE r.to_user_id = $1 ORDER BY r.created_at DESC',
+        [id]
+      );
+      res.json({ reviews: result.rows, ratings: result.rows });
+    }
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
