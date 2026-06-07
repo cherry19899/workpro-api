@@ -381,6 +381,21 @@ app.get('/api/jobs/user/:userId', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// GET /api/jobs/as-freelancer — jobs where current user is the hired freelancer
+app.get('/api/jobs/as-freelancer', auth, async (req, res) => {
+  try {
+    const result = await query(
+      `SELECT j.*, u.username as client_username
+       FROM jobs j
+       LEFT JOIN users u ON u.id = j.posted_by
+       WHERE j.hired_freelancer_id = $1
+       ORDER BY j.updated_at DESC`,
+      [req.userId]
+    );
+    res.json({ jobs: result.rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // GET /api/jobs/my — client's own posted jobs (must be before /:id to avoid conflict)
 app.get('/api/jobs/my', auth, async (req, res) => {
   try {
@@ -407,8 +422,14 @@ app.patch('/api/jobs/:id', auth, async (req, res) => {
   try {
     const jobResult = await query('SELECT * FROM jobs WHERE id = $1', [req.params.id]);
     if (!jobResult.rows.length) return res.status(404).json({ error: 'Job not found' });
-    if (jobResult.rows[0].posted_by !== req.userId) return res.status(403).json({ error: 'Forbidden' });
+    const job = jobResult.rows[0];
     const { status } = req.body;
+    const isOwner = job.posted_by === req.userId;
+    const isHiredFreelancer = job.hired_freelancer_id === req.userId;
+    // Hired freelancer can only submit work for review; job owner can set any status
+    if (!isOwner && !(isHiredFreelancer && status === 'submitted')) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
     const result = await query('UPDATE jobs SET status = COALESCE($1, status), updated_at = NOW() WHERE id = $2 RETURNING *', [status, req.params.id]);
     res.json({ job: result.rows[0], success: true });
   } catch (err) {
@@ -500,7 +521,7 @@ app.post('/api/jobs/:id/complete', auth, checkBlocked, async (req, res) => {
     if (!jobResult.rows.length) return res.status(404).json({ error: 'Job not found' });
     const job = jobResult.rows[0];
     if (job.posted_by !== req.userId) return res.status(403).json({ error: 'Not your job' });
-    if (job.status !== 'in_progress') return res.status(400).json({ error: 'Job is not in progress' });
+    if (!['in_progress', 'submitted'].includes(job.status)) return res.status(400).json({ error: 'Job is not in progress' });
 
     const escrow = await query('SELECT * FROM escrows WHERE job_id = $1 AND status IN ($2, $3) LIMIT 1', [req.params.id, 'pending', 'funded']);
     if (escrow.rows.length) {
