@@ -2000,6 +2000,36 @@ app.get('/api/users/:id/connects', async (req, res) => {
   } catch (err) { res.json({ balance: 0, connects: 0 }); }
 });
 
+// GET /api/reviews/stats/:userId — get review stats for a user (bundle calls this form)
+// Must come BEFORE /api/reviews/:userId wildcard below
+app.get('/api/reviews/stats/:userId', async (req, res) => {
+  try {
+    const userId = req.params.userId;
+    const [totalResult, avgResult, distResult] = await Promise.all([
+      query('SELECT COUNT(*) FROM ratings WHERE to_user_id = $1', [userId]),
+      query('SELECT AVG(rating) as avg FROM ratings WHERE to_user_id = $1', [userId]),
+      query('SELECT rating, COUNT(*) as count FROM ratings WHERE to_user_id = $1 GROUP BY rating ORDER BY rating DESC', [userId]),
+    ]);
+    const total = parseInt(totalResult.rows[0].count);
+    const avg = parseFloat(avgResult.rows[0].avg || 0).toFixed(1);
+    const distribution = {};
+    distResult.rows.forEach(r => { distribution[r.rating] = parseInt(r.count); });
+    res.json({ total, avg: parseFloat(avg), distribution, rating: parseFloat(avg) });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/reviews/:userId — list reviews for a user (bundle calls /api/reviews/${userId})
+// Must come AFTER all specific /api/reviews/... routes
+app.get('/api/reviews/:userId', async (req, res) => {
+  try {
+    const result = await query(
+      'SELECT r.*, u.username as from_username FROM ratings r LEFT JOIN users u ON u.id = r.from_user_id WHERE r.to_user_id = $1 ORDER BY r.created_at DESC',
+      [req.params.userId]
+    );
+    res.json({ reviews: result.rows, ratings: result.rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ─── 404 ──────────────────────────────────────────────
 app.use((req, res) => {
   res.status(404).json({ error: 'Not found' });
