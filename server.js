@@ -1015,7 +1015,7 @@ app.get('/api/admin/stats', adminAuth, async (req, res) => {
       query('SELECT COUNT(*) FROM escrows'),
       query("SELECT COUNT(*) FROM escrows WHERE status IN ('pending','funded')"),
       query('SELECT COUNT(*) FROM payments'),
-      query("SELECT COALESCE(SUM(developer_fee),0) AS total FROM payments WHERE status='completed'"),
+      query("SELECT COALESCE(SUM(amount*0.02),0) AS total FROM payments WHERE status='completed'"),
       query('SELECT COUNT(*) FROM ratings'),
       query('SELECT COUNT(*) FROM chat_rooms'),
     ]);
@@ -1157,17 +1157,18 @@ app.get('/api/admin/escrows', adminAuth, async (req, res) => {
 app.get('/api/admin/earnings', adminAuth, async (req, res) => {
   try {
     const [result, transactions, collected, pending, recentPayments] = await Promise.all([
-      query("SELECT COALESCE(SUM(developer_fee), 0) as total FROM payments WHERE status = 'completed'"),
+      query("SELECT COALESCE(SUM(amount*0.02), 0) as total FROM payments WHERE status = 'completed'"),
       query('SELECT COUNT(*) FROM payments'),
-      query("SELECT COALESCE(SUM(developer_fee), 0) as total FROM payments WHERE status = 'completed'"),
-      query("SELECT COALESCE(SUM(developer_fee), 0) as total FROM payments WHERE status != 'completed'"),
+      query("SELECT COALESCE(SUM(amount*0.02), 0) as total FROM payments WHERE status = 'completed'"),
+      query("SELECT COALESCE(SUM(amount*0.02), 0) as total FROM payments WHERE status != 'completed'"),
       query(`
         SELECT p.*,
           j.title AS job_title,
           j.budget AS job_amount,
           uc.username AS client_name,
           uf.username AS freelancer_name,
-          (p.amount - COALESCE(p.developer_fee, 0)) AS freelancer_amount
+          ROUND(p.amount * 0.98, 4) AS freelancer_amount,
+          ROUND(p.amount * 0.02, 4) AS developer_fee
         FROM payments p
         LEFT JOIN jobs j ON j.id = p.job_id
         LEFT JOIN users uc ON uc.id = p.client_id
