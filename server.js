@@ -72,6 +72,8 @@ async function ensureNotificationsTable() {
       created_at TIMESTAMPTZ DEFAULT NOW()
     )`);
     await query(`CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, is_read, created_at DESC)`);
+    // Add last_chat_read_at to users if not exists (idempotent)
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_chat_read_at TIMESTAMPTZ`);
   } catch (_) {}
 }
 
@@ -564,7 +566,7 @@ app.post('/api/jobs/:id/complete', auth, checkBlocked, async (req, res) => {
     if (escrow.rows.length) {
       const e = escrow.rows[0];
       await query('UPDATE escrows SET status = $1, updated_at = NOW() WHERE id = $2', ['released', e.id]);
-      await query('UPDATE users SET balance_pi = balance_pi + $1, total_jobs_completed = total_jobs_completed + 1, updated_at = NOW() WHERE id = $2', [e.amount, e.freelancer_id]);
+      await query('UPDATE users SET balance_pi = balance_pi + $1, updated_at = NOW() WHERE id = $2', [e.amount, e.freelancer_id]);
     }
     await query('UPDATE jobs SET status = $1, updated_at = NOW() WHERE id = $2', ['completed', req.params.id]);
     if (job.hired_freelancer_id) {
@@ -1326,16 +1328,26 @@ app.post('/api/chat/conversations/:id/messages', auth, checkBlocked, async (req,
 
 app.get('/api/chat/unread', auth, async (req, res) => {
   try {
-    // Count messages in rooms where user is participant, not sent by user
     const result = await query(
       `SELECT COUNT(*) FROM chat_messages cm
        JOIN chat_rooms r ON r.id = cm.room_id
        WHERE (r.client_id = $1 OR r.freelancer_id = $1) AND cm.sender_id != $1
-       AND cm.created_at > COALESCE((SELECT updated_at FROM users WHERE id = $1), NOW() - INTERVAL '30 days')`,
+       AND cm.created_at > COALESCE(
+         (SELECT last_chat_read_at FROM users WHERE id = $1),
+         NOW() - INTERVAL '7 days'
+       )`,
       [req.userId]
     );
     res.json({ count: parseInt(result.rows[0].count) });
   } catch (err) { res.json({ count: 0 }); }
+});
+
+// Mark all chat messages as read (called when user opens chat)
+app.post('/api/chat/read-all', auth, async (req, res) => {
+  try {
+    await query('UPDATE users SET last_chat_read_at = NOW() WHERE id = $1', [req.userId]);
+    res.json({ success: true });
+  } catch (_) { res.json({ success: true }); }
 });
 
 // ─── Reviews alias (= ratings) ──────────────────
