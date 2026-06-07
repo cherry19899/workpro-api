@@ -441,7 +441,8 @@ app.post('/api/jobs/:id/apply', auth, checkBlocked, async (req, res) => {
     );
     await query('UPDATE jobs SET applications = applications + 1, updated_at = NOW() WHERE id = $1', [req.params.id]);
     await audit('job_applied', { job_id: req.params.id, user_id: req.userId });
-    res.json({ application: appResult.rows[0], success: true });
+    const newBalance = (user.balance_connects || 0) - cost;
+    res.json({ application: appResult.rows[0], success: true, remaining_connects: newBalance, new_balance: newBalance });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1056,7 +1057,8 @@ app.post('/api/applications', auth, checkBlocked, async (req, res) => {
     );
     await query('UPDATE jobs SET applications = applications + 1, updated_at = NOW() WHERE id = $1', [job_id]);
     await audit('job_applied', { job_id, user_id: req.userId });
-    res.json({ application: appResult.rows[0], success: true });
+    const newBal = (user.balance_connects || 0) - cost;
+    res.json({ application: appResult.rows[0], success: true, remaining_connects: newBal, new_balance: newBal });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -1540,7 +1542,8 @@ app.post('/api/connects/buy', auth, checkBlocked, async (req, res) => {
         [req.userId, uname, parseInt(quantity)]
       );
       const result = await query('SELECT balance_connects FROM users WHERE id = $1', [req.userId]);
-      return res.json({ success: true, balance: result.rows[0]?.balance_connects || 0 });
+      const bal = result.rows[0]?.balance_connects || 0;
+      return res.json({ success: true, balance: bal, new_balance: bal, balance_connects: bal });
     } catch (err) { return res.status(500).json({ error: err.message }); }
   }
 
@@ -1577,7 +1580,7 @@ app.post('/api/connects/buy', auth, checkBlocked, async (req, res) => {
     const result = await query('SELECT balance_connects FROM users WHERE id = $1', [req.userId]);
     const balance = result.rows[0]?.balance_connects || 0;
     await audit('connects_purchased', { user_id: req.userId, quantity, payment_id });
-    res.json({ success: true, balance, balance_connects: balance });
+    res.json({ success: true, balance, balance_connects: balance, new_balance: balance, remaining_connects: balance });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
