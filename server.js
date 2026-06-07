@@ -1395,7 +1395,8 @@ app.put('/api/users/me/portfolio', auth, async (req, res) => {
 });
 
 app.post('/api/users/me/portfolio/items', auth, async (req, res) => {
-  const { title, description, image_url, category, tags } = req.body;
+  const { title, description, image_url, url, category, tags } = req.body;
+  const finalUrl = image_url || url || '';
   if (!title) return res.status(400).json({ error: 'title required' });
   try {
     await query(`CREATE TABLE IF NOT EXISTS portfolio_items (
@@ -1406,9 +1407,17 @@ app.post('/api/users/me/portfolio/items', auth, async (req, res) => {
     const tagsStr = Array.isArray(tags) ? tags.join(',') : (tags || '');
     const result = await query(
       'INSERT INTO portfolio_items (user_id, title, description, image_url, category, tags) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *',
-      [req.userId, title, description || '', image_url || '', category || 'Other', tagsStr]
+      [req.userId, title, description || '', finalUrl, category || 'Other', tagsStr]
     );
     res.json({ item: result.rows[0], success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// DELETE /api/users/me — account deletion
+app.delete('/api/users/me', auth, async (req, res) => {
+  try {
+    await query('UPDATE users SET is_blocked = true, status = $1, updated_at = NOW() WHERE id = $2', ['deleted', req.userId]);
+    res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
