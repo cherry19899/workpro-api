@@ -39,9 +39,17 @@ app.use(rateLimit({
   skip: (req) => req.path === '/api/health',
 }));
 
-// Stricter rate limits for sensitive endpoints
-const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, message: { error: 'Too many auth attempts, try again later' } });
-const adminLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 100, message: { error: 'Too many admin requests' } });
+// Stricter rate limits for sensitive endpoints (per IP)
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, max: 20,
+  keyGenerator: (req) => req.ip || req.headers['x-forwarded-for'] || 'unknown',
+  message: { error: 'Too many auth attempts, try again later' },
+});
+const adminLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, max: 100,
+  keyGenerator: (req) => req.ip || req.headers['x-forwarded-for'] || 'unknown',
+  message: { error: 'Too many admin requests' },
+});
 app.use('/api/auth', authLimiter);
 app.use('/api/admin', adminLimiter);
 
@@ -292,9 +300,13 @@ app.post('/api/auth/login', async (req, res) => {
 
 app.get('/api/auth/me', auth, async (req, res) => {
   try {
-    const result = await query('SELECT * FROM users WHERE id = $1', [req.userId]);
+    const result = await query(
+      'SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, is_blocked, status, created_at, updated_at FROM users WHERE id = $1',
+      [req.userId]
+    );
     if (!result.rows.length) return res.status(404).json({ error: 'User not found' });
-    res.json(result.rows[0]);
+    const u = result.rows[0];
+    res.json({ ...u, uid: u.id, is_admin: u.role === 'admin' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -928,12 +940,27 @@ app.get('/api/connects/balance', auth, async (req, res) => {
 });
 
 app.post('/api/connects/purchase', auth, checkBlocked, async (req, res) => {
-  // Called after Pi payment is completed for connects
+  // Called after Pi payment is completed for connects — must supply a verified payment_id
   const { amount, payment_id } = req.body;
+  if (!payment_id) return res.status(400).json({ error: 'payment_id required' });
+  const connectsAmount = parseInt(amount || 10);
+  if (isNaN(connectsAmount) || connectsAmount <= 0 || connectsAmount > 1000) {
+    return res.status(400).json({ error: 'Invalid connects amount' });
+  }
   try {
-    await query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [parseInt(amount || 10), req.userId]);
+    // Verify this payment_id exists in our DB and belongs to caller (set during approve step)
+    const payRec = await query(
+      "SELECT id, user_id, status, metadata FROM payments WHERE id = $1",
+      [payment_id]
+    );
+    if (!payRec.rows.length) return res.status(400).json({ error: 'Payment not found' });
+    if (payRec.rows[0].user_id !== req.userId) return res.status(403).json({ error: 'Payment does not belong to you' });
+    if (payRec.rows[0].status === 'completed') return res.status(400).json({ error: 'Payment already processed' });
+
+    await query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [connectsAmount, req.userId]);
+    await query("UPDATE payments SET status = 'completed', updated_at = NOW() WHERE id = $1", [payment_id]);
     const result = await query('SELECT balance_connects FROM users WHERE id = $1', [req.userId]);
-    await audit('connects_purchased', { user_id: req.userId, amount, payment_id });
+    await audit('connects_purchased', { user_id: req.userId, amount: connectsAmount, payment_id });
     res.json({ balance: result.rows[0].balance_connects, success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1405,9 +1432,13 @@ app.put('/api/jobs/:id', auth, async (req, res) => {
 // GET /api/users/me — get current user profile
 app.get('/api/users/me', auth, async (req, res) => {
   try {
-    const result = await query('SELECT * FROM users WHERE id = $1', [req.userId]);
+    const result = await query(
+      'SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, is_blocked, status, created_at, updated_at FROM users WHERE id = $1',
+      [req.userId]
+    );
     if (!result.rows.length) return res.status(404).json({ error: 'User not found' });
-    res.json(result.rows[0]);
+    const u = result.rows[0];
+    res.json({ ...u, uid: u.id, is_admin: u.role === 'admin' });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -2156,7 +2187,10 @@ async function handleAvailability(req, res) {
     ).catch(async () => {
       await query('UPDATE users SET updated_at = NOW() WHERE id = $1', [targetId]).catch(() => {});
     });
-    const result = await query('SELECT * FROM users WHERE id = $1', [targetId]);
+    const result = await query(
+      'SELECT id, username, role, rating, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, status, updated_at FROM users WHERE id = $1',
+      [targetId]
+    );
     const u = result.rows[0] || {};
     res.json({ ...u, uid: u.id, is_admin: u?.role === 'admin', success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -2178,14 +2212,14 @@ app.post('/api/payments/:paymentId/cancelled', auth, async (req, res) => {
 });
 
 // POST /api/payments/clear-pending — called by bundle to clear old pending payments
-app.post('/api/payments/clear-pending', softAuth, async (req, res) => {
+// Uses auth (not softAuth) to prevent spoofing another user's x-user-id
+app.post('/api/payments/clear-pending', auth, async (req, res) => {
   try {
-    if (req.userId) {
-      await query(
-        `UPDATE payments SET status = 'cancelled', updated_at = NOW() WHERE user_id = $1 AND status = 'pending'`,
-        [req.userId]
-      ).catch(() => {});
-    }
+    // Only cancel payments older than 10 minutes to avoid cancelling in-flight payments
+    await query(
+      `UPDATE payments SET status = 'cancelled', updated_at = NOW() WHERE user_id = $1 AND status = 'pending' AND created_at < NOW() - INTERVAL '10 minutes'`,
+      [req.userId]
+    ).catch(() => {});
     res.json({ success: true });
   } catch (err) { res.json({ success: true }); }
 });
@@ -2224,8 +2258,9 @@ app.post('/api/payments/:paymentId/resolve-complete', softAuth, async (req, res)
   } catch (err) { res.json({ success: true, resolved: false }); }
 });
 
-// GET /api/users/:id/connects — get user's connects balance
-app.get('/api/users/:id/connects', async (req, res) => {
+// GET /api/users/:id/connects — get user's connects balance (owner only)
+app.get('/api/users/:id/connects', auth, async (req, res) => {
+  if (req.params.id !== req.userId) return res.status(403).json({ error: 'Forbidden' });
   try {
     const result = await query('SELECT balance_connects FROM users WHERE id = $1', [req.params.id]);
     res.json({ balance: result.rows[0]?.balance_connects || 0, connects: result.rows[0]?.balance_connects || 0 });
