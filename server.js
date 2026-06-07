@@ -1512,6 +1512,15 @@ app.post('/api/users/me/portfolio/items', auth, async (req, res) => {
 // DELETE /api/users/me — account deletion
 app.delete('/api/users/me', auth, async (req, res) => {
   try {
+    const active = await query(
+      `SELECT 1 FROM jobs WHERE (client_id=$1 OR freelancer_id=$1) AND status IN ('in_progress','submitted') LIMIT 1
+       UNION ALL
+       SELECT 1 FROM escrows WHERE (client_id=$1 OR freelancer_id=$1) AND status='funded' LIMIT 1`,
+      [req.userId]
+    );
+    if (active.rows.length > 0) {
+      return res.status(400).json({ error: 'Нельзя удалить аккаунт с активными задачами или эскроу' });
+    }
     await query('UPDATE users SET is_blocked = true, status = $1, updated_at = NOW() WHERE id = $2', ['deleted', req.userId]);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
