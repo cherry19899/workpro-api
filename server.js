@@ -123,8 +123,12 @@ async function piGetPayment(paymentId) {
 
 // ─── Auth Middleware ──────────────────────────────────────────────
 async function auth(req, res, next) {
-  // Accept user ID from headers only — never from body to prevent impersonation
-  const userId = req.headers['x-user-id'] || req.headers['x-pi-token'];
+  // Accept user ID from x-user-id, Authorization: Bearer, or x-pi-token
+  let userId = req.headers['x-user-id'] || req.headers['x-pi-token'];
+  if (!userId && req.headers['authorization']) {
+    const a = req.headers['authorization'];
+    if (a.startsWith('Bearer ')) userId = a.slice(7).trim();
+  }
   if (!userId) return res.status(401).json({ error: 'Access token required' });
   req.userId = userId;
 
@@ -144,12 +148,23 @@ async function auth(req, res, next) {
 
 // softAuth — extracts userId but NEVER rejects (for endpoints where bundle sends no auth)
 function softAuth(req, res, next) {
-  req.userId = req.headers['x-user-id'] || req.headers['x-pi-token'] || null;
+  let uid = req.headers['x-user-id'] || req.headers['x-pi-token'] || null;
+  if (!uid && req.headers['authorization']) {
+    const a = req.headers['authorization'];
+    if (a.startsWith('Bearer ')) uid = a.slice(7).trim();
+  }
+  req.userId = uid;
   next();
 }
 
 async function adminAuth(req, res, next) {
-  const userId = req.headers['x-user-id'];
+  // Accept x-user-id header OR Authorization: Bearer <username> OR ?user_id= query param
+  let userId = req.headers['x-user-id'];
+  if (!userId && req.headers['authorization']) {
+    const auth = req.headers['authorization'];
+    if (auth.startsWith('Bearer ')) userId = auth.slice(7).trim();
+  }
+  if (!userId && req.query.user_id) userId = req.query.user_id;
   if (!userId) return res.status(403).json({ error: 'Admin access required' });
   // Hardcoded fallback for known owner IDs
   if (userId === 'cherry19899' || userId === 'pi_cherry19899') {
