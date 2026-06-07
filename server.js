@@ -1070,7 +1070,15 @@ app.post('/api/admin/users/:id/grant-connects', adminAuth, async (req, res) => {
 
 app.get('/api/admin/escrows', adminAuth, async (req, res) => {
   try {
-    const result = await query('SELECT * FROM escrows ORDER BY created_at DESC');
+    const result = await query(`
+      SELECT e.*,
+        uc.username AS client_username,
+        uf.username AS freelancer_username
+      FROM escrows e
+      LEFT JOIN users uc ON uc.id = e.client_id
+      LEFT JOIN users uf ON uf.id = e.freelancer_id
+      ORDER BY e.created_at DESC
+    `);
     res.json({ escrows: result.rows });
   } catch (err) {
     res.status(500).json({ error: err.message });
