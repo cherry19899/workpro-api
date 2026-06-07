@@ -457,11 +457,18 @@ app.get('/api/jobs/:id', async (req, res) => {
   try {
     const jobResult = await query('SELECT * FROM jobs WHERE id = $1', [req.params.id]);
     if (!jobResult.rows.length) return res.status(404).json({ error: 'Job not found' });
-    const appsResult = await query('SELECT * FROM applications WHERE job_id = $1 ORDER BY created_at DESC', [req.params.id]);
+    const job_row = jobResult.rows[0];
+    const callerId = req.headers['x-user-id'] || null;
+    // Only return application details to the job owner
+    let applications = [];
+    if (callerId && callerId === job_row.posted_by) {
+      const appsResult = await query('SELECT * FROM applications WHERE job_id = $1 ORDER BY created_at DESC', [req.params.id]);
+      applications = appsResult.rows;
+    }
     // Include chat room_id so frontend can show "Open chat" button
     const roomResult = await query('SELECT id FROM chat_rooms WHERE job_id = $1 LIMIT 1', [req.params.id]);
-    const job = { ...jobResult.rows[0], room_id: roomResult.rows[0]?.id || null };
-    res.json({ job, applications: appsResult.rows });
+    const job = { ...job_row, room_id: roomResult.rows[0]?.id || null };
+    res.json({ job, applications });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -686,19 +693,20 @@ app.get('/api/chat/rooms', auth, async (req, res) => {
 });
 
 app.post('/api/chat/rooms', auth, checkBlocked, async (req, res) => {
-  const { client_id, freelancer_id, job_id } = req.body;
+  const { freelancer_id, job_id } = req.body;
+  const cId = req.userId; // always use authenticated user as client
   try {
     // Check if room already exists
     const existing = await query(
       'SELECT * FROM chat_rooms WHERE job_id = $1 AND ((client_id = $2 AND freelancer_id = $3) OR (client_id = $3 AND freelancer_id = $2))',
-      [job_id, client_id, freelancer_id]
+      [job_id, cId, freelancer_id]
     );
     if (existing.rows.length) return res.json({ room: existing.rows[0] });
 
     const roomId = 'room_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
     const result = await query(
       'INSERT INTO chat_rooms (id, client_id, freelancer_id, job_id) VALUES ($1, $2, $3, $4) RETURNING *',
-      [roomId, client_id, freelancer_id, job_id]
+      [roomId, cId, freelancer_id, job_id]
     );
     res.json({ room: result.rows[0] });
   } catch (err) {
@@ -750,6 +758,12 @@ app.post('/api/escrow', auth, checkBlocked, async (req, res) => {
   const { job_id, freelancer_id, amount, payment_id } = req.body;
   if (!job_id || !freelancer_id || !amount) return res.status(400).json({ error: 'job_id, freelancer_id, amount required' });
   try {
+    const jobCheck = await query('SELECT posted_by, hired_freelancer_id FROM jobs WHERE id = $1', [job_id]);
+    if (!jobCheck.rows.length) return res.status(404).json({ error: 'Job not found' });
+    if (jobCheck.rows[0].posted_by !== req.userId) return res.status(403).json({ error: 'Not your job' });
+    if (jobCheck.rows[0].hired_freelancer_id && jobCheck.rows[0].hired_freelancer_id !== freelancer_id) {
+      return res.status(400).json({ error: 'freelancer_id does not match hired freelancer' });
+    }
     const existing = await query('SELECT id FROM escrows WHERE job_id = $1 AND status IN ($2, $3)', [job_id, 'pending', 'funded']);
     if (existing.rows.length) return res.status(400).json({ error: 'Escrow already exists for this job' });
     const result = await query(
@@ -770,7 +784,7 @@ app.post('/api/escrow/:id/release', auth, async (req, res) => {
     if (!result.rows.length) return res.status(404).json({ error: 'Escrow not found' });
     const escrow = result.rows[0];
     if (escrow.client_id !== req.userId) return res.status(403).json({ error: 'Not your escrow' });
-    if (!['funded', 'pending'].includes(escrow.status)) return res.status(400).json({ error: 'Already released' });
+    if (escrow.status !== 'funded') return res.status(400).json({ error: 'Escrow is not funded' });
     const net = parseFloat((escrow.amount * 0.98).toFixed(8)); // 2% platform commission
     await query('UPDATE escrows SET status = $1, updated_at = NOW() WHERE id = $2', ['released', req.params.id]);
     await query('UPDATE users SET balance_pi = balance_pi + $1, total_jobs_completed = total_jobs_completed + 1, updated_at = NOW() WHERE id = $2', [net, escrow.freelancer_id]);
@@ -826,9 +840,10 @@ app.post('/api/payments/:paymentId/complete', auth, async (req, res) => {
     const paymentRecord = await query('SELECT * FROM payments WHERE id = $1', [paymentId]);
     if (paymentRecord.rows.length) {
       const meta = paymentRecord.rows[0].metadata || {};
+      const paymentOwner = paymentRecord.rows[0].user_id || req.userId;
       if (meta.type === 'connects') {
         const amount = parseInt(meta.connects_amount || 10);
-        await query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [amount, req.userId]);
+        await query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [amount, paymentOwner]);
       } else if (meta.type === 'escrow' && meta.job_id && meta.freelancer_id) {
         // Create escrow record — hireFreelancer endpoint updates job status after this
         await query(
@@ -901,7 +916,18 @@ app.post('/api/ratings', auth, checkBlocked, async (req, res) => {
   const { to_user_id, job_id, rating, comment } = req.body;
   if (!to_user_id || !rating) return res.status(400).json({ error: 'to_user_id and rating required' });
   if (rating < 1 || rating > 5) return res.status(400).json({ error: 'Rating must be 1-5' });
+  if (to_user_id === req.userId) return res.status(400).json({ error: 'Cannot rate yourself' });
   try {
+    // Verify rater was a participant in this job
+    if (job_id) {
+      const jobCheck = await query('SELECT posted_by, hired_freelancer_id, status FROM jobs WHERE id = $1', [job_id]);
+      if (jobCheck.rows.length) {
+        const job = jobCheck.rows[0];
+        const isParticipant = job.posted_by === req.userId || job.hired_freelancer_id === req.userId;
+        if (!isParticipant) return res.status(403).json({ error: 'You were not a participant in this job' });
+        if (job.status !== 'completed') return res.status(400).json({ error: 'Job must be completed before rating' });
+      }
+    }
     const existing = await query('SELECT id FROM ratings WHERE from_user_id = $1 AND job_id = $2', [req.userId, job_id]);
     if (existing.rows.length) return res.status(400).json({ error: 'Already rated this job' });
 
@@ -1083,12 +1109,15 @@ app.get('/api/admin/verify', async (req, res) => {
   const key = req.headers['x-admin-key'] || req.headers['authorization'] || req.query.admin_key;
   let token = key || '';
   if (token.startsWith('Bearer ')) token = token.substring(7);
-  res.json({ valid: token === ADMIN_API_KEY, env_set: !!process.env.ADMIN_API_KEY });
+  res.json({ valid: token === ADMIN_API_KEY });
 });
 
 // GET /api/jobs/:id/applications — used by JobDetail.js
 app.get('/api/jobs/:id/applications', auth, async (req, res) => {
   try {
+    const jobResult = await query('SELECT posted_by FROM jobs WHERE id = $1', [req.params.id]);
+    if (!jobResult.rows.length) return res.status(404).json({ error: 'Job not found' });
+    if (jobResult.rows[0].posted_by !== req.userId) return res.status(403).json({ error: 'Forbidden' });
     const result = await query('SELECT * FROM applications WHERE job_id = $1 ORDER BY created_at DESC', [req.params.id]);
     res.json({ applications: result.rows });
   } catch (err) { res.status(500).json({ error: err.message }); }
