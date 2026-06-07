@@ -144,15 +144,16 @@ function softAuth(req, res, next) {
 async function adminAuth(req, res, next) {
   const userId = req.headers['x-user-id'];
   if (!userId) return res.status(403).json({ error: 'Admin access required' });
-  // Owner always has access
+  // Hardcoded fallback for known owner IDs
   if (userId === 'cherry19899' || userId === 'pi_cherry19899') {
     req.isAdmin = true;
     return next();
   }
-  // Check role in DB
+  // Check role or owner username in DB
   try {
-    const result = await query('SELECT role FROM users WHERE id = $1', [userId]);
-    if (result.rows[0]?.role === 'admin') {
+    const result = await query('SELECT role, username FROM users WHERE id = $1', [userId]);
+    const user = result.rows[0];
+    if (user?.role === 'admin' || user?.username === 'cherry19899') {
       req.isAdmin = true;
       return next();
     }
@@ -264,13 +265,18 @@ app.post('/api/auth/login', async (req, res) => {
     const paymentsEnabled = piUser ? piUser.payments_enabled === true : false;
 
     const existing = await query('SELECT * FROM users WHERE id = $1', [uid]);
+    const isOwner = uname === 'cherry19899';
     if (!existing.rows.length) {
       await query(
         'INSERT INTO users (id, username, role, balance_connects, created_at, updated_at) VALUES ($1, $2, $3, 10, NOW(), NOW())',
-        [uid, uname, 'freelancer']
+        [uid, uname, isOwner ? 'admin' : 'freelancer']
       );
     } else {
-      await query('UPDATE users SET username = $1, updated_at = NOW() WHERE id = $2', [uname, uid]);
+      if (isOwner) {
+        await query("UPDATE users SET username = $1, role = 'admin', updated_at = NOW() WHERE id = $2", [uname, uid]);
+      } else {
+        await query('UPDATE users SET username = $1, updated_at = NOW() WHERE id = $2', [uname, uid]);
+      }
     }
 
     const token = jwt.sign({ id: uid, username: uname }, JWT_SECRET, { expiresIn: '7d' });
@@ -934,8 +940,11 @@ app.get('/api/admin/users', adminAuth, async (req, res) => {
 });
 
 app.post('/api/admin/users/:id/block', adminAuth, async (req, res) => {
-  if (req.params.id === 'cherry19899') return res.status(403).json({ error: 'Cannot block owner' });
   try {
+    const target = await query('SELECT username FROM users WHERE id = $1', [req.params.id]);
+    if (req.params.id === 'cherry19899' || target.rows[0]?.username === 'cherry19899') {
+      return res.status(403).json({ error: 'Cannot block owner' });
+    }
     await query('UPDATE users SET is_blocked = true, status = $1, updated_at = NOW() WHERE id = $2', ['blocked', req.params.id]);
     await audit('user_blocked', { user_id: req.params.id });
     res.json({ success: true });
@@ -963,10 +972,11 @@ app.post('/api/admin/users/:id/make-admin', adminAuth, async (req, res) => {
 });
 
 app.post('/api/admin/users/:id/remove-admin', adminAuth, async (req, res) => {
-  if (req.params.id === 'cherry19899' || req.params.id === 'pi_cherry19899') {
-    return res.status(403).json({ error: 'Cannot remove owner admin' });
-  }
   try {
+    const target = await query('SELECT username FROM users WHERE id = $1', [req.params.id]);
+    if (req.params.id === 'cherry19899' || req.params.id === 'pi_cherry19899' || target.rows[0]?.username === 'cherry19899') {
+      return res.status(403).json({ error: 'Cannot remove owner admin' });
+    }
     await query("UPDATE users SET role = 'freelancer', updated_at = NOW() WHERE id = $1", [req.params.id]);
     await audit('user_removed_admin', { user_id: req.params.id, by: req.userId });
     res.json({ success: true });
