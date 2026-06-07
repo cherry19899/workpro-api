@@ -1163,16 +1163,11 @@ app.get('/api/admin/earnings', adminAuth, async (req, res) => {
       query("SELECT COALESCE(SUM(amount*0.02), 0) as total FROM payments WHERE status != 'completed'"),
       query(`
         SELECT p.*,
-          j.title AS job_title,
-          j.budget AS job_amount,
-          uc.username AS client_name,
-          uf.username AS freelancer_name,
+          u.username AS client_name,
           ROUND(p.amount * 0.98, 4) AS freelancer_amount,
           ROUND(p.amount * 0.02, 4) AS developer_fee
         FROM payments p
-        LEFT JOIN jobs j ON j.id = p.job_id
-        LEFT JOIN users uc ON uc.id = p.client_id
-        LEFT JOIN users uf ON uf.id = p.freelancer_id
+        LEFT JOIN users u ON u.id = p.user_id
         ORDER BY p.created_at DESC LIMIT 50
       `),
     ]);
