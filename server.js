@@ -572,7 +572,6 @@ app.post('/api/jobs/:id/complete', auth, checkBlocked, async (req, res) => {
     if (job.hired_freelancer_id) {
       await query('UPDATE users SET total_jobs_completed = total_jobs_completed + 1, updated_at = NOW() WHERE id = $1', [job.hired_freelancer_id]);
     }
-    await query('UPDATE users SET total_jobs_posted = total_jobs_posted + 1, updated_at = NOW() WHERE id = $1', [req.userId]);
     await audit('job_completed', { job_id: req.params.id });
     if (job.hired_freelancer_id) {
       await notify(job.hired_freelancer_id, 'completed', `Задача "${job.title}" принята`,
