@@ -1354,8 +1354,8 @@ app.get('/api/chat/conversations', auth, async (req, res) => {
 });
 
 app.post('/api/chat/conversations', auth, checkBlocked, async (req, res) => {
-  const { client_id, freelancer_id, job_id, other_user_id } = req.body;
-  const cId = client_id || req.userId;
+  const { freelancer_id, job_id, other_user_id } = req.body;
+  const cId = req.userId; // always use authenticated user as client
   const fId = freelancer_id || other_user_id;
   if (!fId || !job_id) return res.status(400).json({ error: 'freelancer_id and job_id required' });
   try {
@@ -2035,11 +2035,11 @@ app.post('/api/users/:id/availability', auth, handleAvailability);
 // ─── Pi Payment additional endpoints ──────────────────────────────────────────────
 
 // POST /api/payments/:paymentId/cancelled — called by bundle when Pi payment is cancelled
-app.post('/api/payments/:paymentId/cancelled', softAuth, async (req, res) => {
+app.post('/api/payments/:paymentId/cancelled', auth, async (req, res) => {
   try {
     await query(
-      `UPDATE payments SET status = 'cancelled', updated_at = NOW() WHERE id = $1`,
-      [req.params.paymentId]
+      `UPDATE payments SET status = 'cancelled', updated_at = NOW() WHERE id = $1 AND user_id = $2`,
+      [req.params.paymentId, req.userId]
     ).catch(() => {});
     res.json({ success: true });
   } catch (err) { res.json({ success: true }); }
