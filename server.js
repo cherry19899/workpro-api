@@ -896,7 +896,20 @@ app.get('/api/admin/earnings', adminAuth, async (req, res) => {
   try {
     const result = await query("SELECT COALESCE(SUM(amount), 0) as total FROM payments WHERE status = 'completed'");
     const transactions = await query('SELECT COUNT(*) FROM payments');
-    res.json({ total_earnings: parseFloat(result.rows[0].total), transactions: parseInt(transactions.rows[0].count) });
+    const recentPayments = await query("SELECT * FROM payments ORDER BY created_at DESC LIMIT 50");
+    const total_earnings = parseFloat(result.rows[0].total);
+    const txCount = parseInt(transactions.rows[0].count);
+    // Include 'summary' key so the frontend fetch interceptor does NOT transform this response
+    res.json({
+      total_earnings,
+      transactions: txCount,
+      payments: recentPayments.rows,
+      summary: {
+        total_earnings,
+        total_transactions: txCount,
+        average_transaction: txCount > 0 ? Math.round(total_earnings / txCount * 100) / 100 : 0,
+      }
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
