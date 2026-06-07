@@ -303,7 +303,8 @@ app.get('/api/users/:id/ratings', async (req, res) => {
 
 // ─── Jobs ──────────────────────────────────────────────
 app.get('/api/jobs', async (req, res) => {
-  const { status, category, posted_by, client_uid, search, limit = 20, page = 1 } = req.query;
+  const { status, category, posted_by, client_uid, search, limit = 20, page = 1,
+          min_budget, max_budget, sort } = req.query;
   const ownerFilter = posted_by || client_uid;
   try {
     let conditions = [];
@@ -314,14 +315,28 @@ app.get('/api/jobs', async (req, res) => {
     if (category && category !== 'all' && category !== 'All') { conditions.push(`category = $${idx++}`); params.push(category); }
     if (ownerFilter) { conditions.push(`posted_by = $${idx++}`); params.push(ownerFilter); }
     if (search) { conditions.push(`(title ILIKE $${idx} OR description ILIKE $${idx})`); params.push(`%${search}%`); idx++; }
+    if (min_budget) { conditions.push(`budget >= $${idx++}`); params.push(parseFloat(min_budget)); }
+    if (max_budget) { conditions.push(`budget <= $${idx++}`); params.push(parseFloat(max_budget)); }
 
     const where = conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
+
+    // Sort order: newest (default), oldest, budget_asc, budget_desc
+    const orderMap = {
+      'newest': 'created_at DESC',
+      'oldest': 'created_at ASC',
+      'budget_asc': 'budget ASC',
+      'budget_desc': 'budget DESC',
+      'budget-asc': 'budget ASC',
+      'budget-desc': 'budget DESC',
+    };
+    const orderBy = orderMap[sort] || 'created_at DESC';
+
     const countResult = await query(`SELECT COUNT(*) FROM jobs ${where}`, params);
     const total = parseInt(countResult.rows[0].count);
 
     const offset = (parseInt(page) - 1) * parseInt(limit);
     const dataResult = await query(
-      `SELECT * FROM jobs ${where} ORDER BY created_at DESC LIMIT $${idx} OFFSET $${idx + 1}`,
+      `SELECT * FROM jobs ${where} ORDER BY ${orderBy} LIMIT $${idx} OFFSET $${idx + 1}`,
       [...params, parseInt(limit), offset]
     );
 
