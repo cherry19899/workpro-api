@@ -267,8 +267,11 @@ app.post('/api/auth/login', async (req, res) => {
     } else {
       if (isOwner) {
         await query("UPDATE users SET username = $1, role = 'admin', updated_at = NOW() WHERE id = $2", [uname, uid]);
-      } else {
+      } else if (piUser) {
+        // Only update username if verified via Pi API
         await query('UPDATE users SET username = $1, updated_at = NOW() WHERE id = $2', [uname, uid]);
+      } else {
+        await query('UPDATE users SET updated_at = NOW() WHERE id = $1', [uid]);
       }
     }
 
@@ -1948,35 +1951,6 @@ app.get('/api/escrows/:id/room', auth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// POST /api/jobs/:id/apply — apply to a job (alternative endpoint to /api/applications)
-app.post('/api/jobs/:id/apply', auth, checkBlocked, async (req, res) => {
-  const { message, cover_letter, bid_amount, proposed_budget, username } = req.body;
-  try {
-    const jobResult = await query('SELECT * FROM jobs WHERE id = $1', [req.params.id]);
-    if (!jobResult.rows.length) return res.status(404).json({ error: 'Job not found' });
-    const job = jobResult.rows[0];
-    if (job.posted_by === req.userId) return res.status(400).json({ error: 'Cannot apply to your own job' });
-
-    // Check connects
-    const userResult = await query('SELECT balance_connects FROM users WHERE id = $1', [req.userId]);
-    const connectsNeeded = job.connects_required || 1;
-    if ((userResult.rows[0]?.balance_connects || 0) < connectsNeeded) {
-      return res.status(400).json({ error: `Insufficient connects. Need ${connectsNeeded}.` });
-    }
-
-    // Deduct connects
-    await query('UPDATE users SET balance_connects = balance_connects - $1 WHERE id = $2', [connectsNeeded, req.userId]);
-
-    const coverLetter = message || cover_letter || '';
-    const bidAmount = parseFloat(bid_amount || proposed_budget) || job.budget;
-    const result = await query(
-      `INSERT INTO applications (job_id, freelancer_id, cover_letter, bid_amount, status)
-       VALUES ($1,$2,$3,$4,'pending') RETURNING *`,
-      [parseInt(req.params.id), req.userId, coverLetter, bidAmount]
-    );
-    res.json({ application: result.rows[0], success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
 
 // POST /api/offers/:id/accept — accept a job offer
 app.post('/api/offers/:id/accept', auth, async (req, res) => {
