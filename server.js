@@ -24,8 +24,8 @@ const PI_API_BASE = 'https://api.minepi.com';
 
 // ─── Middleware ──────────────────────────────────────────────
 app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+app.use(express.json({ limit: '512kb' }));
+app.use(express.urlencoded({ extended: true, limit: '512kb' }));
 app.use(cors({
   origin: [FRONTEND_URL, 'https://cherry19899.github.io', 'http://localhost:3000', 'http://localhost:5173', 'http://localhost:3001'],
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
@@ -499,6 +499,9 @@ app.patch('/api/jobs/:id', auth, async (req, res) => {
 });
 
 app.post('/api/jobs/:id/apply', auth, checkBlocked, async (req, res) => {
+  if (req.body.message && req.body.message.length > 2000) {
+    return res.status(400).json({ error: 'Cover letter too long (max 2000 chars)' });
+  }
   try {
     const jobResult = await query('SELECT * FROM jobs WHERE id = $1', [req.params.id]);
     if (!jobResult.rows.length) return res.status(404).json({ error: 'Job not found' });
@@ -728,6 +731,7 @@ app.get('/api/chat/rooms/:id/messages', auth, async (req, res) => {
 app.post('/api/chat/rooms/:id/messages', auth, checkBlocked, async (req, res) => {
   const { message } = req.body;
   if (!message || !message.trim()) return res.status(400).json({ error: 'Message required' });
+  if (message.length > 2000) return res.status(400).json({ error: 'Message too long (max 2000 chars)' });
   try {
     const room = await query('SELECT * FROM chat_rooms WHERE id = $1 AND (client_id = $2 OR freelancer_id = $2)', [req.params.id, req.userId]);
     if (!room.rows.length) return res.status(403).json({ error: 'Forbidden' });
@@ -1193,6 +1197,7 @@ app.post('/api/chat/start', auth, checkBlocked, async (req, res) => {
 app.post('/api/applications', auth, checkBlocked, async (req, res) => {
   const { job_id, message } = req.body;
   if (!job_id) return res.status(400).json({ error: 'job_id required' });
+  if (message && message.length > 2000) return res.status(400).json({ error: 'Cover letter too long (max 2000 chars)' });
   try {
     const jobResult = await query('SELECT * FROM jobs WHERE id = $1', [job_id]);
     if (!jobResult.rows.length) return res.status(404).json({ error: 'Job not found' });
@@ -1413,6 +1418,7 @@ app.get('/api/chat/conversations/:id/messages', auth, async (req, res) => {
 app.post('/api/chat/conversations/:id/messages', auth, checkBlocked, async (req, res) => {
   const msg = req.body.content || req.body.message;
   if (!msg || !msg.trim()) return res.status(400).json({ error: 'Message required' });
+  if (msg.length > 2000) return res.status(400).json({ error: 'Message too long (max 2000 chars)' });
   try {
     const room = await query('SELECT * FROM chat_rooms WHERE id = $1 AND (client_id = $2 OR freelancer_id = $2)', [req.params.id, req.userId]);
     if (!room.rows.length) return res.status(403).json({ error: 'Forbidden' });
@@ -1854,6 +1860,7 @@ app.post('/api/chat/:roomId/messages', auth, checkBlocked, async (req, res) => {
   const { content, message, text } = req.body;
   const msg = content || message || text || '';
   if (!msg.trim()) return res.status(400).json({ error: 'Message content required' });
+  if (msg.length > 2000) return res.status(400).json({ error: 'Message too long (max 2000 chars)' });
   try {
     const roomCheck = await query('SELECT * FROM chat_rooms WHERE id = $1 AND (client_id = $2 OR freelancer_id = $2)', [req.params.roomId, req.userId]);
     if (!roomCheck.rows.length) return res.status(403).json({ error: 'Not in this room' });
@@ -1951,6 +1958,7 @@ app.post('/api/escrows/:id/fund', auth, async (req, res) => {
 // POST /api/escrows/:id/dispute — open a dispute
 app.post('/api/escrows/:id/dispute', auth, async (req, res) => {
   const { reason } = req.body;
+  if (reason && reason.length > 1000) return res.status(400).json({ error: 'Reason too long (max 1000 chars)' });
   try {
     const result = await query('SELECT * FROM escrows WHERE id = $1', [req.params.id]);
     if (!result.rows.length) return res.status(404).json({ error: 'Escrow not found' });
