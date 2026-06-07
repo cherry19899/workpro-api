@@ -141,13 +141,22 @@ function softAuth(req, res, next) {
   next();
 }
 
-function adminAuth(req, res, next) {
+async function adminAuth(req, res, next) {
   const userId = req.headers['x-user-id'];
-  // Accept both direct ID and Pi-prefixed ID for the admin user
+  if (!userId) return res.status(403).json({ error: 'Admin access required' });
+  // Owner always has access
   if (userId === 'cherry19899' || userId === 'pi_cherry19899') {
     req.isAdmin = true;
     return next();
   }
+  // Check role in DB
+  try {
+    const result = await query('SELECT role FROM users WHERE id = $1', [userId]);
+    if (result.rows[0]?.role === 'admin') {
+      req.isAdmin = true;
+      return next();
+    }
+  } catch (_) {}
   return res.status(403).json({ error: 'Admin access required' });
 }
 
@@ -943,6 +952,25 @@ app.post('/api/admin/users/:id/unblock', adminAuth, async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+app.post('/api/admin/users/:id/make-admin', adminAuth, async (req, res) => {
+  try {
+    await query("UPDATE users SET role = 'admin', updated_at = NOW() WHERE id = $1", [req.params.id]);
+    await audit('user_made_admin', { user_id: req.params.id, by: req.userId });
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/admin/users/:id/remove-admin', adminAuth, async (req, res) => {
+  if (req.params.id === 'cherry19899' || req.params.id === 'pi_cherry19899') {
+    return res.status(403).json({ error: 'Cannot remove owner admin' });
+  }
+  try {
+    await query("UPDATE users SET role = 'freelancer', updated_at = NOW() WHERE id = $1", [req.params.id]);
+    await audit('user_removed_admin', { user_id: req.params.id, by: req.userId });
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.get('/api/admin/jobs', adminAuth, async (req, res) => {
