@@ -593,7 +593,7 @@ app.post('/api/jobs/:id/complete', auth, checkBlocked, async (req, res) => {
     if (job.posted_by !== req.userId) return res.status(403).json({ error: 'Not your job' });
     if (!['in_progress', 'submitted'].includes(job.status)) return res.status(400).json({ error: 'Job is not in progress' });
 
-    const escrow = await query('SELECT * FROM escrows WHERE job_id = $1 AND status IN ($2, $3) LIMIT 1', [req.params.id, 'pending', 'funded']);
+    const escrow = await query('SELECT * FROM escrows WHERE job_id = $1 AND status = $2 LIMIT 1', [req.params.id, 'funded']);
     let paidAmount = 0;
     if (escrow.rows.length) {
       const e = escrow.rows[0];
@@ -621,7 +621,9 @@ app.delete('/api/jobs/:id', auth, async (req, res) => {
   try {
     const jobResult = await query('SELECT * FROM jobs WHERE id = $1', [req.params.id]);
     if (!jobResult.rows.length) return res.status(404).json({ error: 'Job not found' });
-    if (jobResult.rows[0].posted_by !== req.userId) return res.status(403).json({ error: 'Not your job' });
+    const job = jobResult.rows[0];
+    if (job.posted_by !== req.userId) return res.status(403).json({ error: 'Not your job' });
+    if (['in_progress', 'submitted'].includes(job.status)) return res.status(400).json({ error: 'Cannot delete a job that is in progress' });
     await query('DELETE FROM applications WHERE job_id = $1', [req.params.id]);
     await query('DELETE FROM jobs WHERE id = $1', [req.params.id]);
     res.json({ success: true });
@@ -1661,23 +1663,6 @@ app.post('/api/connects/buy', auth, checkBlocked, async (req, res) => {
   const quantity = req.body.quantity || req.body.package_amount;
   const { payment_id, txid, amount, status, pi_amount, user_id } = req.body;
   if (!quantity) return res.status(400).json({ error: 'quantity required' });
-
-  // If this is a granted (admin/dev bonus) call, add directly
-  if (status === 'granted') {
-    try {
-      // UPSERT to ensure user exists, then update balance
-      const uname = req.body?.username || req.userId.replace(/^pi_/, '');
-      await query(
-        `INSERT INTO users (id, username, role, balance_connects, created_at, updated_at)
-         VALUES ($1, $2, 'freelancer', $3, NOW(), NOW())
-         ON CONFLICT (id) DO UPDATE SET balance_connects = users.balance_connects + $3, updated_at = NOW()`,
-        [req.userId, uname, parseInt(quantity)]
-      );
-      const result = await query('SELECT balance_connects FROM users WHERE id = $1', [req.userId]);
-      const bal = result.rows[0]?.balance_connects || 0;
-      return res.json({ success: true, balance: bal, new_balance: bal, balance_connects: bal });
-    } catch (err) { return res.status(500).json({ error: err.message }); }
-  }
 
   // If this is a pending (approval) call, just record and return
   if (status === 'pending') {
