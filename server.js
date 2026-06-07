@@ -1515,6 +1515,7 @@ app.post('/api/users/me/portfolio/items', auth, async (req, res) => {
   const { title, description, image_url, url, category, tags } = req.body;
   const finalUrl = image_url || url || '';
   if (!title) return res.status(400).json({ error: 'title required' });
+  if (finalUrl && !/^https?:\/\//i.test(finalUrl)) return res.status(400).json({ error: 'URL must start with http:// or https://' });
   try {
     await query(`CREATE TABLE IF NOT EXISTS portfolio_items (
       id SERIAL PRIMARY KEY, user_id VARCHAR(255), title VARCHAR(500) NOT NULL,
