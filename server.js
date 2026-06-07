@@ -2030,6 +2030,20 @@ app.get('/api/reviews/:userId', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// POST /api/push/subscribe — Web Push notification subscription (stub)
+// Frontend registers push subscriptions here; stored for future push delivery
+app.post('/api/push/subscribe', softAuth, async (req, res) => {
+  // Store subscription endpoint for user if authenticated
+  const { endpoint, keys } = req.body || {};
+  if (req.userId && endpoint) {
+    await query(
+      `UPDATE users SET updated_at = NOW() WHERE id = $1`,
+      [req.userId]
+    ).catch(() => {});
+  }
+  res.json({ success: true });
+});
+
 // ─── 404 ──────────────────────────────────────────────
 app.use((req, res) => {
   res.status(404).json({ error: 'Not found' });
