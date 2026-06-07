@@ -392,6 +392,11 @@ app.post('/api/jobs', auth, checkBlocked, async (req, res) => {
   if (!title || !description || !budget) {
     return res.status(400).json({ error: 'Title, description, and budget are required' });
   }
+  const budgetNum = parseFloat(budget);
+  if (isNaN(budgetNum) || budgetNum < 1) return res.status(400).json({ error: 'Budget must be at least 1 Pi' });
+  if (budgetNum > 10000) return res.status(400).json({ error: 'Budget cannot exceed 10000 Pi' });
+  if (String(title).length > 200) return res.status(400).json({ error: 'Title too long (max 200 chars)' });
+  if (String(description).length > 5000) return res.status(400).json({ error: 'Description too long (max 5000 chars)' });
   try {
     const userRes = await query('SELECT username FROM users WHERE id = $1', [req.userId]);
     const username = userRes.rows[0]?.username || req.userId;
@@ -468,12 +473,12 @@ app.patch('/api/jobs/:id', auth, async (req, res) => {
     if (!jobResult.rows.length) return res.status(404).json({ error: 'Job not found' });
     const job = jobResult.rows[0];
     const { status } = req.body;
-    const isOwner = job.posted_by === req.userId;
     const isHiredFreelancer = job.hired_freelancer_id === req.userId;
-    // Hired freelancer can only submit work for review; job owner can set any status
-    if (!isOwner && !(isHiredFreelancer && status === 'submitted')) {
+    // Only hired freelancer can use PATCH, and only to submit work for review
+    if (!(isHiredFreelancer && status === 'submitted')) {
       return res.status(403).json({ error: 'Forbidden' });
     }
+    if (job.status !== 'in_progress') return res.status(400).json({ error: 'Job is not in progress' });
     const result = await query('UPDATE jobs SET status = COALESCE($1, status), updated_at = NOW() WHERE id = $2 RETURNING *', [status, req.params.id]);
     // Notify client when freelancer submits work for review
     if (status === 'submitted' && isHiredFreelancer) {
