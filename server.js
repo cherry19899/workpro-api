@@ -39,6 +39,12 @@ app.use(rateLimit({
   skip: (req) => req.path === '/api/health',
 }));
 
+// Stricter rate limits for sensitive endpoints
+const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, message: { error: 'Too many auth attempts, try again later' } });
+const adminLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 100, message: { error: 'Too many admin requests' } });
+app.use('/api/auth', authLimiter);
+app.use('/api/admin', adminLimiter);
+
 // ─── Helpers ──────────────────────────────────────────────
 function now() { return new Date().toISOString(); }
 async function audit(action, data) {
@@ -932,12 +938,16 @@ app.post('/api/ratings', auth, checkBlocked, async (req, res) => {
         if (job.status !== 'completed') return res.status(400).json({ error: 'Job must be completed before rating' });
       }
     }
-    const existing = await query('SELECT id FROM ratings WHERE from_user_id = $1 AND job_id = $2', [req.userId, job_id]);
+    // Use IS NOT DISTINCT FROM to handle NULL job_id correctly (NULL = NULL is false in SQL)
+    const existing = await query(
+      'SELECT id FROM ratings WHERE from_user_id = $1 AND to_user_id = $2 AND job_id IS NOT DISTINCT FROM $3',
+      [req.userId, to_user_id, job_id || null]
+    );
     if (existing.rows.length) return res.status(400).json({ error: 'Already rated this job' });
 
     const result = await query(
       'INSERT INTO ratings (from_user_id, to_user_id, job_id, rating, comment) VALUES ($1, $2, $3, $4, $5) RETURNING *',
-      [req.userId, to_user_id, job_id, parseInt(rating), comment || '']
+      [req.userId, to_user_id, job_id || null, parseInt(rating), comment || '']
     );
     // Update user average rating
     const avgResult = await query('SELECT AVG(rating) as avg FROM ratings WHERE to_user_id = $1', [to_user_id]);
@@ -1070,6 +1080,8 @@ app.post('/api/admin/users/:id/grant-connects', adminAuth, async (req, res) => {
 
 app.get('/api/admin/escrows', adminAuth, async (req, res) => {
   try {
+    const limit = Math.min(parseInt(req.query.limit) || 100, 500);
+    const offset = parseInt(req.query.offset) || 0;
     const result = await query(`
       SELECT e.*,
         uc.username AS client_username,
@@ -1078,8 +1090,10 @@ app.get('/api/admin/escrows', adminAuth, async (req, res) => {
       LEFT JOIN users uc ON uc.id = e.client_id
       LEFT JOIN users uf ON uf.id = e.freelancer_id
       ORDER BY e.created_at DESC
-    `);
-    res.json({ escrows: result.rows });
+      LIMIT $1 OFFSET $2
+    `, [limit, offset]);
+    const total = await query('SELECT COUNT(*) FROM escrows');
+    res.json({ escrows: result.rows, total: parseInt(total.rows[0].count), limit, offset });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1470,8 +1484,23 @@ app.post('/api/reviews', auth, checkBlocked, async (req, res) => {
   const reviewComment = comment || text || '';
   if (!toId || !rating) return res.status(400).json({ error: 'to_user_id and rating required' });
   if (rating < 1 || rating > 5) return res.status(400).json({ error: 'Rating must be 1-5' });
+  if (toId === req.userId) return res.status(400).json({ error: 'Cannot rate yourself' });
   try {
-    const existing = await query('SELECT id FROM ratings WHERE from_user_id = $1 AND job_id = $2', [req.userId, job_id]);
+    // Verify rater was a participant in this job (same guard as /api/ratings)
+    if (job_id) {
+      const jobCheck = await query('SELECT posted_by, hired_freelancer_id, status FROM jobs WHERE id = $1', [job_id]);
+      if (jobCheck.rows.length) {
+        const job = jobCheck.rows[0];
+        const isParticipant = job.posted_by === req.userId || job.hired_freelancer_id === req.userId;
+        if (!isParticipant) return res.status(403).json({ error: 'You were not a participant in this job' });
+        if (job.status !== 'completed') return res.status(400).json({ error: 'Job must be completed before rating' });
+      }
+    }
+    // IS NOT DISTINCT FROM handles NULL job_id correctly
+    const existing = await query(
+      'SELECT id FROM ratings WHERE from_user_id = $1 AND to_user_id = $2 AND job_id IS NOT DISTINCT FROM $3',
+      [req.userId, toId, job_id || null]
+    );
     if (existing.rows.length) return res.status(400).json({ error: 'Already rated this job' });
     const result = await query('INSERT INTO ratings (from_user_id, to_user_id, job_id, rating, comment) VALUES ($1, $2, $3, $4, $5) RETURNING *', [req.userId, toId, job_id || null, parseInt(rating), reviewComment]);
     const avgResult = await query('SELECT AVG(rating) as avg FROM ratings WHERE to_user_id = $1', [toId]);
