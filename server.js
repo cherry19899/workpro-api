@@ -201,6 +201,8 @@ app.get('/api/health', async (req, res) => {
 // PUT /api/me — update profile (used by Profile.js)
 app.put('/api/me', auth, async (req, res) => {
   const { username, bio, skills, display_name } = req.body;
+  if (bio && bio.length > 1000) return res.status(400).json({ error: 'Bio too long (max 1000)' });
+  if (skills && skills.length > 300) return res.status(400).json({ error: 'Skills too long (max 300)' });
   try {
     const uname = display_name || username;
     const skillsStr = Array.isArray(skills) ? skills.join(',') : (skills || null);
@@ -208,18 +210,16 @@ app.put('/api/me', auth, async (req, res) => {
       'UPDATE users SET username = COALESCE($1, username), bio = COALESCE($2, bio), skills = COALESCE($3, skills), updated_at = NOW() WHERE id = $4',
       [uname || null, bio || null, skillsStr, req.userId]
     );
-    const result = await query('SELECT * FROM users WHERE id = $1', [req.userId]);
+    const result = await query('SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, is_blocked, status, created_at, updated_at FROM users WHERE id = $1', [req.userId]);
     const u = result.rows[0];
     res.json({ ...u, uid: u.id, is_admin: u.role === 'admin' });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// GET /api/me — get current user profile (used by Profile.js)
-app.get('/api/me', async (req, res) => {
-  const userId = req.headers['x-user-id'];
-  if (!userId) return res.status(401).json({ error: 'x-user-id header required' });
+// GET /api/me — get current user profile (used by Profile.js) — auth required
+app.get('/api/me', auth, async (req, res) => {
   try {
-    const result = await query('SELECT * FROM users WHERE id = $1', [userId]);
+    const result = await query('SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, is_blocked, status, created_at, updated_at FROM users WHERE id = $1', [req.userId]);
     if (!result.rows.length) return res.status(404).json({ error: 'User not found' });
     const u = result.rows[0];
     res.json({ ...u, uid: u.id, is_admin: u.role === 'admin' });
@@ -232,22 +232,20 @@ app.post('/api/me', async (req, res) => {
   if (!uid) return res.status(400).json({ error: 'uid required' });
   try {
     const uname = username || uid.replace(/^pi_/, '') || uid;
+    const isOwner = uname === 'cherry19899';
     // UPSERT: create or update user
     await query(
       `INSERT INTO users (id, username, role, balance_connects, created_at, updated_at)
-       VALUES ($1, $2, 'freelancer', 10, NOW(), NOW())
+       VALUES ($1, $2, $3, 10, NOW(), NOW())
        ON CONFLICT (id) DO UPDATE SET updated_at = NOW()`,
-      [uid, uname]
+      [uid, uname, isOwner ? 'admin' : 'freelancer']
     );
-    const user = await query('SELECT * FROM users WHERE id = $1', [uid]);
+    const user = await query('SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, status, created_at FROM users WHERE id = $1', [uid]);
     await audit('user_login', { user_id: uid });
     const u = user.rows[0];
-    res.json({
-      ...u,
-      uid: u.id,                          // alias: frontend expects uid
-      is_admin: u.role === 'admin',       // frontend checks is_admin
-      token: 'pi-' + u.id,               // dummy token for compatibility
-    });
+    // Issue a real JWT instead of predictable dummy token
+    const token = jwt.sign({ id: uid, username: uname }, JWT_SECRET, { expiresIn: '7d' });
+    res.json({ ...u, uid: u.id, is_admin: u.role === 'admin', token });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -271,7 +269,7 @@ app.post('/api/auth/login', async (req, res) => {
     const uname = (piUser && piUser.username) || username || uid;
     const paymentsEnabled = piUser ? piUser.payments_enabled === true : false;
 
-    const existing = await query('SELECT * FROM users WHERE id = $1', [uid]);
+    const existing = await query('SELECT id, username, role FROM users WHERE id = $1', [uid]);
     const isOwner = uname === 'cherry19899';
     if (!existing.rows.length) {
       await query(
@@ -282,7 +280,6 @@ app.post('/api/auth/login', async (req, res) => {
       if (isOwner) {
         await query("UPDATE users SET username = $1, role = 'admin', updated_at = NOW() WHERE id = $2", [uname, uid]);
       } else if (piUser) {
-        // Only update username if verified via Pi API
         await query('UPDATE users SET username = $1, updated_at = NOW() WHERE id = $2', [uname, uid]);
       } else {
         await query('UPDATE users SET updated_at = NOW() WHERE id = $1', [uid]);
@@ -290,7 +287,7 @@ app.post('/api/auth/login', async (req, res) => {
     }
 
     const token = jwt.sign({ id: uid, username: uname }, JWT_SECRET, { expiresIn: '7d' });
-    const user = await query('SELECT * FROM users WHERE id = $1', [uid]);
+    const user = await query('SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, is_blocked, status, created_at FROM users WHERE id = $1', [uid]);
     await audit('user_login', { user_id: uid });
     res.json({ token, user: { ...user.rows[0], payments_enabled: paymentsEnabled } });
   } catch (err) {
@@ -549,7 +546,7 @@ app.post('/api/jobs/:id/apply', auth, checkBlocked, async (req, res) => {
     const existingApp = await query('SELECT id FROM applications WHERE job_id = $1 AND freelancer_id = $2', [req.params.id, req.userId]);
     if (existingApp.rows.length) return res.status(400).json({ error: 'Already applied' });
 
-    const userResult = await query('SELECT * FROM users WHERE id = $1', [req.userId]);
+    const userResult = await query('SELECT id, username, balance_connects, is_blocked FROM users WHERE id = $1', [req.userId]);
     const user = userResult.rows[0];
     const cost = job.apply_cost || 1;
     if (!user || user.balance_connects < cost) {
@@ -1038,10 +1035,11 @@ app.get('/api/admin/stats', adminAuth, async (req, res) => {
 app.get('/api/admin/users', adminAuth, async (req, res) => {
   try {
     const search = req.query.search || '';
-    let sql = 'SELECT * FROM users';
+    const safeFields = 'id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, is_blocked, status, created_at, updated_at';
+    let sql = `SELECT ${safeFields} FROM users`;
     const params = [];
     if (search) { sql += ' WHERE username ILIKE $1 OR id ILIKE $1'; params.push(`%${search}%`); }
-    sql += ' ORDER BY created_at DESC';
+    sql += ' ORDER BY created_at DESC LIMIT 500';
     const result = await query(sql, params);
     res.json({ users: result.rows, count: result.rows.length });
   } catch (err) {
@@ -1280,7 +1278,7 @@ app.post('/api/applications', auth, checkBlocked, async (req, res) => {
     if (job.status !== 'open') return res.status(400).json({ error: 'Job is not open' });
     const existing = await query('SELECT id FROM applications WHERE job_id = $1 AND freelancer_id = $2', [job_id, req.userId]);
     if (existing.rows.length) return res.status(400).json({ error: 'Already applied' });
-    const userResult = await query('SELECT * FROM users WHERE id = $1', [req.userId]);
+    const userResult = await query('SELECT id, username, balance_connects, is_blocked FROM users WHERE id = $1', [req.userId]);
     const user = userResult.rows[0];
     const cost = job.apply_cost || 1;
     if (!user || user.balance_connects < cost) return res.status(400).json({ error: 'Not enough connects', required: cost, current: user?.balance_connects || 0 });
@@ -1382,6 +1380,8 @@ app.post('/api/applications/:id/reject', auth, async (req, res) => {
 // PUT /api/applications/:id/status — update application status
 app.put('/api/applications/:id/status', auth, async (req, res) => {
   const { status } = req.body;
+  const ALLOWED = ['pending', 'accepted', 'rejected', 'withdrawn'];
+  if (!ALLOWED.includes(status)) return res.status(400).json({ error: `Invalid status. Allowed: ${ALLOWED.join(', ')}` });
   try {
     const appResult = await query('SELECT a.*, j.posted_by FROM applications a JOIN jobs j ON a.job_id = j.id WHERE a.id = $1', [req.params.id]);
     if (!appResult.rows.length) return res.status(404).json({ error: 'Application not found' });
@@ -1445,6 +1445,13 @@ app.get('/api/users/me', auth, async (req, res) => {
 // PUT /api/users/me — update current user profile
 app.put('/api/users/me', auth, async (req, res) => {
   const { username, bio, skills, availability, avatar, email } = req.body;
+  if (username && username.length > 50) return res.status(400).json({ error: 'Username too long (max 50)' });
+  if (bio && bio.length > 1000) return res.status(400).json({ error: 'Bio too long (max 1000)' });
+  if (skills && skills.length > 300) return res.status(400).json({ error: 'Skills too long (max 300)' });
+  const ALLOWED_AVAILABILITY = ['available', 'busy', 'away', 'unavailable'];
+  if (availability && !ALLOWED_AVAILABILITY.includes(availability)) {
+    return res.status(400).json({ error: 'Invalid availability value' });
+  }
   try {
     const fields = [], vals = [];
     let i = 1;
@@ -1457,8 +1464,10 @@ app.put('/api/users/me', auth, async (req, res) => {
     if (!fields.length) return res.status(400).json({ error: 'Nothing to update' });
     fields.push(`updated_at=NOW()`);
     vals.push(req.userId);
-    const result = await query(`UPDATE users SET ${fields.join(',')} WHERE id=$${i} RETURNING *`, vals);
-    res.json(result.rows[0]);
+    await query(`UPDATE users SET ${fields.join(',')} WHERE id=$${i}`, vals);
+    const result = await query('SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, is_blocked, status, created_at, updated_at FROM users WHERE id = $1', [req.userId]);
+    const u = result.rows[0];
+    res.json({ ...u, uid: u.id, is_admin: u.role === 'admin' });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
