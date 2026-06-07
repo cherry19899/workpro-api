@@ -1008,12 +1008,14 @@ app.post('/api/ratings', auth, checkBlocked, async (req, res) => {
 // ─── Admin ──────────────────────────────────────────────
 app.get('/api/admin/stats', adminAuth, async (req, res) => {
   try {
-    const [users, jobs, applications, escrows, payments, ratings, chats] = await Promise.all([
+    const [users, jobs, applications, escrows, activeEscrows, payments, revenue, ratings, chats] = await Promise.all([
       query('SELECT COUNT(*) FROM users'),
       query('SELECT COUNT(*) FROM jobs'),
       query('SELECT COUNT(*) FROM applications'),
       query('SELECT COUNT(*) FROM escrows'),
+      query("SELECT COUNT(*) FROM escrows WHERE status IN ('pending','funded')"),
       query('SELECT COUNT(*) FROM payments'),
+      query("SELECT COALESCE(SUM(developer_fee),0) AS total FROM payments WHERE status='completed'"),
       query('SELECT COUNT(*) FROM ratings'),
       query('SELECT COUNT(*) FROM chat_rooms'),
     ]);
@@ -1021,11 +1023,15 @@ app.get('/api/admin/stats', adminAuth, async (req, res) => {
     const j = parseInt(jobs.rows[0].count);
     const a = parseInt(applications.rows[0].count);
     const e = parseInt(escrows.rows[0].count);
+    const ae = parseInt(activeEscrows.rows[0].count);
+    const rev = parseFloat(revenue.rows[0].total);
     res.json({
       total_users: u, users: u,
       total_jobs: j, jobs: j,
       total_applications: a, applications: a,
       total_escrows: e, escrows: e,
+      active_escrows: ae,
+      total_revenue: rev,
       payments: parseInt(payments.rows[0].count),
       ratings: parseInt(ratings.rows[0].count),
       chats: parseInt(chats.rows[0].count),
@@ -1131,11 +1137,13 @@ app.get('/api/admin/escrows', adminAuth, async (req, res) => {
     const offset = parseInt(req.query.offset) || 0;
     const result = await query(`
       SELECT e.*,
-        uc.username AS client_username,
-        uf.username AS freelancer_username
+        uc.username AS client_name,
+        uf.username AS freelancer_name,
+        j.title AS job_title
       FROM escrows e
       LEFT JOIN users uc ON uc.id = e.client_id
       LEFT JOIN users uf ON uf.id = e.freelancer_id
+      LEFT JOIN jobs j ON j.id = e.job_id
       ORDER BY e.created_at DESC
       LIMIT $1 OFFSET $2
     `, [limit, offset]);
@@ -1148,19 +1156,37 @@ app.get('/api/admin/escrows', adminAuth, async (req, res) => {
 
 app.get('/api/admin/earnings', adminAuth, async (req, res) => {
   try {
-    const result = await query("SELECT COALESCE(SUM(amount), 0) as total FROM payments WHERE status = 'completed'");
-    const transactions = await query('SELECT COUNT(*) FROM payments');
-    const recentPayments = await query("SELECT * FROM payments ORDER BY created_at DESC LIMIT 50");
+    const [result, transactions, collected, pending, recentPayments] = await Promise.all([
+      query("SELECT COALESCE(SUM(developer_fee), 0) as total FROM payments WHERE status = 'completed'"),
+      query('SELECT COUNT(*) FROM payments'),
+      query("SELECT COALESCE(SUM(developer_fee), 0) as total FROM payments WHERE status = 'completed'"),
+      query("SELECT COALESCE(SUM(developer_fee), 0) as total FROM payments WHERE status != 'completed'"),
+      query(`
+        SELECT p.*,
+          j.title AS job_title,
+          j.budget AS job_amount,
+          uc.username AS client_name,
+          uf.username AS freelancer_name,
+          (p.amount - COALESCE(p.developer_fee, 0)) AS freelancer_amount
+        FROM payments p
+        LEFT JOIN jobs j ON j.id = p.job_id
+        LEFT JOIN users uc ON uc.id = p.client_id
+        LEFT JOIN users uf ON uf.id = p.freelancer_id
+        ORDER BY p.created_at DESC LIMIT 50
+      `),
+    ]);
     const total_earnings = parseFloat(result.rows[0].total);
     const txCount = parseInt(transactions.rows[0].count);
-    // Include 'summary' key so the frontend fetch interceptor does NOT transform this response
     res.json({
       total_earnings,
       transactions: txCount,
       payments: recentPayments.rows,
+      history: recentPayments.rows,
       summary: {
         total_earnings,
         total_transactions: txCount,
+        collected: parseFloat(collected.rows[0].total),
+        pending: parseFloat(pending.rows[0].total),
         average_transaction: txCount > 0 ? Math.round(total_earnings / txCount * 100) / 100 : 0,
       }
     });
