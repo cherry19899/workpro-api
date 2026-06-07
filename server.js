@@ -47,6 +47,34 @@ async function audit(action, data) {
   } catch (_) {}
 }
 
+async function notify(userId, type, title, body, jobId, roomId) {
+  try {
+    await query(
+      `INSERT INTO notifications (user_id, type, title, body, job_id, room_id, is_read, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,false,NOW())`,
+      [userId, type, title, body || null, jobId || null, roomId || null]
+    );
+  } catch (_) {}
+}
+
+// Ensure notifications table exists (idempotent)
+async function ensureNotificationsTable() {
+  try {
+    await query(`CREATE TABLE IF NOT EXISTS notifications (
+      id SERIAL PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      type TEXT NOT NULL,
+      title TEXT NOT NULL,
+      body TEXT,
+      job_id INTEGER,
+      room_id TEXT,
+      is_read BOOLEAN DEFAULT false,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, is_read, created_at DESC)`);
+  } catch (_) {}
+}
+
 // ─── Pi Platform API ──────────────────────────────────────────────
 async function piApiRequest(path, method = 'GET', body = null) {
   const opts = {
@@ -431,6 +459,11 @@ app.patch('/api/jobs/:id', auth, async (req, res) => {
       return res.status(403).json({ error: 'Forbidden' });
     }
     const result = await query('UPDATE jobs SET status = COALESCE($1, status), updated_at = NOW() WHERE id = $2 RETURNING *', [status, req.params.id]);
+    // Notify client when freelancer submits work for review
+    if (status === 'submitted' && isHiredFreelancer) {
+      await notify(job.posted_by, 'submitted', `Фрилансер сдал работу по задаче "${job.title}"`,
+        'Проверьте результат и примите работу или откройте спор.', parseInt(req.params.id), null);
+    }
     res.json({ job: result.rows[0], success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -462,6 +495,8 @@ app.post('/api/jobs/:id/apply', auth, checkBlocked, async (req, res) => {
     );
     await query('UPDATE jobs SET applications = applications + 1, updated_at = NOW() WHERE id = $1', [req.params.id]);
     await audit('job_applied', { job_id: req.params.id, user_id: req.userId });
+    await notify(job.posted_by, 'application', `Новый отклик на задачу "${job.title}"`,
+      `${user.username || 'Фрилансер'} откликнулся на вашу задачу`, parseInt(req.params.id), null);
     const newBalance = (user.balance_connects || 0) - cost;
     res.json({ application: appResult.rows[0], success: true, remaining_connects: newBalance, new_balance: newBalance });
   } catch (err) {
@@ -509,6 +544,8 @@ app.post('/api/jobs/:id/hire', auth, checkBlocked, async (req, res) => {
     }
 
     await audit('job_hired', { job_id: req.params.id, freelancer_id, application_id });
+    await notify(freelancer_id, 'hired', `Вас наняли на задачу "${job.title}"`,
+      'Заказчик выбрал вас. Обсудите детали в чате.', parseInt(req.params.id), roomId);
     res.json({ success: true, room_id: roomId, freelancer_name: freelancerName });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -535,6 +572,10 @@ app.post('/api/jobs/:id/complete', auth, checkBlocked, async (req, res) => {
     }
     await query('UPDATE users SET total_jobs_posted = total_jobs_posted + 1, updated_at = NOW() WHERE id = $1', [req.userId]);
     await audit('job_completed', { job_id: req.params.id });
+    if (job.hired_freelancer_id) {
+      await notify(job.hired_freelancer_id, 'completed', `Задача "${job.title}" принята`,
+        'Заказчик принял работу. Pi монеты зачислены на ваш счёт.', parseInt(req.params.id), null);
+    }
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1429,16 +1470,10 @@ app.delete('/api/users/me/portfolio/items/:id', auth, async (req, res) => {
 });
 
 // ─── Notifications ──────────────────────────────────────────────
-// Simple notifications: unread chat messages count as notifications
 app.get('/api/notifications/unread-count', auth, async (req, res) => {
   try {
-    // Count recent messages in chat rooms where user is participant but not sender
     const result = await query(
-      `SELECT COUNT(*) FROM chat_messages cm
-       JOIN chat_rooms cr ON cr.id = cm.room_id
-       WHERE (cr.client_id = $1 OR cr.freelancer_id = $1)
-         AND cm.sender_id != $1
-         AND cm.created_at > NOW() - INTERVAL '7 days'`,
+      'SELECT COUNT(*) FROM notifications WHERE user_id = $1 AND is_read = false',
       [req.userId]
     );
     const unread_count = parseInt(result.rows[0].count) || 0;
@@ -1451,26 +1486,23 @@ app.get('/api/notifications/unread-count', auth, async (req, res) => {
 app.get('/api/notifications', auth, async (req, res) => {
   try {
     const result = await query(
-      `SELECT cm.id, cm.message as message, cm.message as content, cm.created_at,
-              u.username as from_username, cr.id as room_id
-       FROM chat_messages cm
-       JOIN chat_rooms cr ON cr.id = cm.room_id
-       JOIN users u ON u.id = cm.sender_id
-       WHERE (cr.client_id = $1 OR cr.freelancer_id = $1)
-         AND cm.sender_id != $1
-         AND cm.created_at > NOW() - INTERVAL '7 days'
-       ORDER BY cm.created_at DESC LIMIT 50`,
+      'SELECT * FROM notifications WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50',
       [req.userId]
     );
-    res.json({ notifications: result.rows });
+    const unread = result.rows.filter(r => !r.is_read).length;
+    res.json({ notifications: result.rows, unread_count: unread });
   } catch (err) {
-    res.json({ notifications: [] });
+    res.json({ notifications: [], unread_count: 0 });
   }
 });
 
 app.post('/api/notifications/mark-read', auth, async (req, res) => {
-  // No read tracking in chat_messages table — just return success
-  res.json({ success: true });
+  try {
+    await query('UPDATE notifications SET is_read = true WHERE user_id = $1 AND is_read = false', [req.userId]);
+    res.json({ success: true });
+  } catch (err) {
+    res.json({ success: true });
+  }
 });
 
 // ─── Hire with Pi payment (escrow) ──────────────────────────────────────────────
@@ -1821,6 +1853,10 @@ app.post('/api/escrows/:id/dispute', softAuth, async (req, res) => {
     }
     await query('UPDATE escrows SET status = $1, updated_at = NOW() WHERE id = $2', ['disputed', req.params.id]);
     await audit('escrow_disputed', { escrow_id: req.params.id, reason, user_id: req.userId });
+    // Notify the other party
+    const otherParty = req.userId === escrow.client_id ? escrow.freelancer_id : escrow.client_id;
+    await notify(otherParty, 'dispute', 'Открыт спор по задаче',
+      reason || 'Одна из сторон открыла спор. Пожалуйста, свяжитесь с поддержкой.', escrow.job_id, null);
     res.json({ escrow: { ...escrow, status: 'disputed' }, success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -2086,7 +2122,8 @@ app.use((err, req, res, next) => {
 });
 
 // ─── Start ──────────────────────────────────────────────
-initDb().then(() => {
+initDb().then(async () => {
+  await ensureNotificationsTable();
   app.listen(PORT, () => {
     console.log(`[WorkPro API] v3.1.0 on port ${PORT} (${NODE_ENV})`);
   });
