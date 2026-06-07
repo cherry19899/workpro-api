@@ -1115,6 +1115,7 @@ app.post('/api/escrows/:id/release', auth, async (req, res) => {
     if (!result.rows.length) return res.status(404).json({ error: 'Escrow not found' });
     const escrow = result.rows[0];
     if (escrow.client_id !== req.userId) return res.status(403).json({ error: 'Not your escrow' });
+    if (escrow.status !== 'funded') return res.status(400).json({ error: 'Escrow is not funded' });
     const net2 = parseFloat((escrow.amount * 0.98).toFixed(8)); // 2% platform commission
     await query('UPDATE escrows SET status = $1, updated_at = NOW() WHERE id = $2', ['released', req.params.id]);
     await query('UPDATE users SET balance_pi = balance_pi + $1, total_jobs_completed = total_jobs_completed + 1, updated_at = NOW() WHERE id = $2', [net2, escrow.freelancer_id]);
@@ -1129,6 +1130,7 @@ app.post('/api/escrows/:id/cancel', auth, checkBlocked, async (req, res) => {
     if (!result.rows.length) return res.status(404).json({ error: 'Escrow not found' });
     const escrow = result.rows[0];
     if (escrow.client_id !== req.userId) return res.status(403).json({ error: 'Not your escrow' });
+    if (!['pending', 'funded'].includes(escrow.status)) return res.status(400).json({ error: 'Escrow already settled' });
     await query('UPDATE escrows SET status = $1, updated_at = NOW() WHERE id = $2', ['refunded', req.params.id]);
     await query('UPDATE jobs SET status = $1, updated_at = NOW() WHERE id = $2', ['open', escrow.job_id]);
     res.json({ success: true });
@@ -1169,12 +1171,20 @@ app.post('/api/applications', auth, checkBlocked, async (req, res) => {
     const user = userResult.rows[0];
     const cost = job.apply_cost || 1;
     if (!user || user.balance_connects < cost) return res.status(400).json({ error: 'Not enough connects', required: cost, current: user?.balance_connects || 0 });
-    await query('UPDATE users SET balance_connects = balance_connects - $1, updated_at = NOW() WHERE id = $2', [cost, req.userId]);
-    const appResult = await query(
-      'INSERT INTO applications (job_id, job_title, freelancer_id, freelancer_name, message) VALUES ($1, $2, $3, $4, $5) RETURNING *',
-      [job_id, job.title, req.userId, user.username || req.userId, message || '']
-    );
-    await query('UPDATE jobs SET applications = applications + 1, updated_at = NOW() WHERE id = $1', [job_id]);
+    let appResult;
+    const pgClient = await pool.connect();
+    try {
+      await pgClient.query('BEGIN');
+      await pgClient.query('UPDATE users SET balance_connects = balance_connects - $1, updated_at = NOW() WHERE id = $2', [cost, req.userId]);
+      appResult = await pgClient.query(
+        'INSERT INTO applications (job_id, job_title, freelancer_id, freelancer_name, message) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (job_id, freelancer_id) DO NOTHING RETURNING *',
+        [job_id, job.title, req.userId, user.username || req.userId, message || '']
+      );
+      if (!appResult.rows.length) { await pgClient.query('ROLLBACK'); return res.status(400).json({ error: 'Already applied' }); }
+      await pgClient.query('UPDATE jobs SET applications = applications + 1, updated_at = NOW() WHERE id = $1', [job_id]);
+      await pgClient.query('COMMIT');
+    } catch (txErr) { await pgClient.query('ROLLBACK').catch(() => {}); throw txErr; }
+    finally { pgClient.release(); }
     await audit('job_applied', { job_id, user_id: req.userId });
     const newBal = (user.balance_connects || 0) - cost;
     res.json({ application: appResult.rows[0], success: true, remaining_connects: newBal, new_balance: newBal });
@@ -1198,6 +1208,9 @@ app.get('/api/applications/me', auth, async (req, res) => {
 // GET /api/applications/job/:jobId — applications for a specific job (owner only)
 app.get('/api/applications/job/:jobId', auth, async (req, res) => {
   try {
+    const jobResult = await query('SELECT posted_by FROM jobs WHERE id = $1', [req.params.jobId]);
+    if (!jobResult.rows.length) return res.status(404).json({ error: 'Job not found' });
+    if (jobResult.rows[0].posted_by !== req.userId) return res.status(403).json({ error: 'Forbidden' });
     const result = await query('SELECT * FROM applications WHERE job_id = $1 ORDER BY created_at DESC', [req.params.jobId]);
     res.json({ applications: result.rows });
   } catch (err) { res.status(500).json({ error: err.message }); }
