@@ -578,21 +578,24 @@ app.post('/api/jobs/:id/complete', auth, checkBlocked, async (req, res) => {
     if (!['in_progress', 'submitted'].includes(job.status)) return res.status(400).json({ error: 'Job is not in progress' });
 
     const escrow = await query('SELECT * FROM escrows WHERE job_id = $1 AND status IN ($2, $3) LIMIT 1', [req.params.id, 'pending', 'funded']);
+    let paidAmount = 0;
     if (escrow.rows.length) {
       const e = escrow.rows[0];
+      const net = parseFloat((e.amount * 0.98).toFixed(8)); // 2% platform commission
       await query('UPDATE escrows SET status = $1, updated_at = NOW() WHERE id = $2', ['released', e.id]);
-      await query('UPDATE users SET balance_pi = balance_pi + $1, updated_at = NOW() WHERE id = $2', [e.amount, e.freelancer_id]);
+      await query('UPDATE users SET balance_pi = balance_pi + $1, updated_at = NOW() WHERE id = $2', [net, e.freelancer_id]);
+      paidAmount = net;
     }
     await query('UPDATE jobs SET status = $1, updated_at = NOW() WHERE id = $2', ['completed', req.params.id]);
     if (job.hired_freelancer_id) {
       await query('UPDATE users SET total_jobs_completed = total_jobs_completed + 1, updated_at = NOW() WHERE id = $1', [job.hired_freelancer_id]);
     }
-    await audit('job_completed', { job_id: req.params.id });
+    await audit('job_completed', { job_id: req.params.id, paid: paidAmount });
     if (job.hired_freelancer_id) {
       await notify(job.hired_freelancer_id, 'completed', `Задача "${job.title}" принята`,
-        'Заказчик принял работу. Pi монеты зачислены на ваш счёт.', parseInt(req.params.id), null);
+        `Заказчик принял работу. Зачислено ${paidAmount}π на ваш счёт.`, parseInt(req.params.id), null);
     }
-    res.json({ success: true });
+    res.json({ success: true, paid: paidAmount });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -746,11 +749,11 @@ app.post('/api/escrow/:id/release', softAuth, async (req, res) => {
     const escrow = result.rows[0];
     if (req.userId && escrow.client_id !== req.userId) return res.status(403).json({ error: 'Not your escrow' });
     if (escrow.status === 'released') return res.status(400).json({ error: 'Already released' });
-
+    const net = parseFloat((escrow.amount * 0.98).toFixed(8)); // 2% platform commission
     await query('UPDATE escrows SET status = $1, updated_at = NOW() WHERE id = $2', ['released', req.params.id]);
-    await query('UPDATE users SET balance_pi = balance_pi + $1, total_jobs_completed = total_jobs_completed + 1, updated_at = NOW() WHERE id = $2', [escrow.amount, escrow.freelancer_id]);
+    await query('UPDATE users SET balance_pi = balance_pi + $1, total_jobs_completed = total_jobs_completed + 1, updated_at = NOW() WHERE id = $2', [net, escrow.freelancer_id]);
     await query('UPDATE jobs SET status = $1, updated_at = NOW() WHERE id = $2', ['completed', escrow.job_id]);
-    await audit('escrow_released', { escrow_id: req.params.id, freelancer_id: escrow.freelancer_id, amount: escrow.amount });
+    await audit('escrow_released', { escrow_id: req.params.id, freelancer_id: escrow.freelancer_id, amount: escrow.amount, net_paid: net });
     res.json({ escrow: { ...escrow, status: 'released' }, success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -805,12 +808,11 @@ app.post('/api/payments/:paymentId/complete', auth, async (req, res) => {
         const amount = parseInt(meta.connects_amount || 10);
         await query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [amount, req.userId]);
       } else if (meta.type === 'escrow' && meta.job_id && meta.freelancer_id) {
-        // Create escrow record
+        // Create escrow record — hireFreelancer endpoint updates job status after this
         await query(
           'INSERT INTO escrows (job_id, client_id, freelancer_id, amount, payment_id, status) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING',
-          [meta.job_id, req.userId, meta.freelancer_id, piPayment.amount, paymentId, 'funded']
+          [meta.job_id, req.userId, meta.freelancer_id, piPayment.amount || meta.amount || 0, paymentId, 'funded']
         );
-        await query('UPDATE jobs SET status = $1, updated_at = NOW() WHERE id = $2', ['in_progress', meta.job_id]);
       }
     }
 
@@ -1098,10 +1100,11 @@ app.post('/api/escrows/:id/release', softAuth, async (req, res) => {
     const escrow = result.rows[0];
     // Only enforce ownership if caller identified themselves
     if (req.userId && escrow.client_id !== req.userId) return res.status(403).json({ error: 'Not your escrow' });
+    const net2 = parseFloat((escrow.amount * 0.98).toFixed(8)); // 2% platform commission
     await query('UPDATE escrows SET status = $1, updated_at = NOW() WHERE id = $2', ['released', req.params.id]);
-    await query('UPDATE users SET balance_pi = balance_pi + $1, total_jobs_completed = total_jobs_completed + 1, updated_at = NOW() WHERE id = $2', [escrow.amount, escrow.freelancer_id]);
+    await query('UPDATE users SET balance_pi = balance_pi + $1, total_jobs_completed = total_jobs_completed + 1, updated_at = NOW() WHERE id = $2', [net2, escrow.freelancer_id]);
     await query('UPDATE jobs SET status = $1, updated_at = NOW() WHERE id = $2', ['completed', escrow.job_id]);
-    await audit('escrow_released', { escrow_id: req.params.id });
+    await audit('escrow_released', { escrow_id: req.params.id, net_paid: net2 });
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
