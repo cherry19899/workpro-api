@@ -1164,8 +1164,9 @@ app.get('/api/admin/earnings', adminAuth, async (req, res) => {
       query(`
         SELECT p.*,
           u.username AS client_name,
-          ROUND(p.amount * 0.98, 4) AS freelancer_amount,
-          ROUND(p.amount * 0.02, 4) AS developer_fee
+          p.amount AS job_amount,
+          CAST(ROUND(CAST(p.amount AS numeric) * 0.98, 4) AS float) AS freelancer_amount,
+          CAST(ROUND(CAST(p.amount AS numeric) * 0.02, 4) AS float) AS developer_fee
         FROM payments p
         LEFT JOIN users u ON u.id = p.user_id
         ORDER BY p.created_at DESC LIMIT 50
