@@ -457,7 +457,10 @@ app.get('/api/jobs/:id', async (req, res) => {
     const jobResult = await query('SELECT * FROM jobs WHERE id = $1', [req.params.id]);
     if (!jobResult.rows.length) return res.status(404).json({ error: 'Job not found' });
     const appsResult = await query('SELECT * FROM applications WHERE job_id = $1 ORDER BY created_at DESC', [req.params.id]);
-    res.json({ job: jobResult.rows[0], applications: appsResult.rows });
+    // Include chat room_id so frontend can show "Open chat" button
+    const roomResult = await query('SELECT id FROM chat_rooms WHERE job_id = $1 LIMIT 1', [req.params.id]);
+    const job = { ...jobResult.rows[0], room_id: roomResult.rows[0]?.id || null };
+    res.json({ job, applications: appsResult.rows });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
