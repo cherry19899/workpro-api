@@ -11,7 +11,7 @@ const helmet = require('helmet');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const fetch = require('node-fetch');
-const { query, initDb } = require('./db');
+const { query, initDb, pool } = require('./db');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -57,7 +57,7 @@ async function notify(userId, type, title, body, jobId, roomId) {
   } catch (_) {}
 }
 
-// Ensure notifications table exists (idempotent)
+// Ensure schema patches (idempotent, run on startup)
 async function ensureNotificationsTable() {
   try {
     await query(`CREATE TABLE IF NOT EXISTS notifications (
@@ -74,6 +74,8 @@ async function ensureNotificationsTable() {
     await query(`CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, is_read, created_at DESC)`);
     // Add last_chat_read_at to users if not exists (idempotent)
     await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_chat_read_at TIMESTAMPTZ`);
+    // Ensure unique constraint on applications(job_id, freelancer_id) to prevent duplicate apply race
+    await query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_applications_unique_apply ON applications(job_id, freelancer_id)`);
   } catch (_) {}
 }
 
@@ -107,18 +109,14 @@ async function piGetPayment(paymentId) {
 
 // ─── Auth Middleware ──────────────────────────────────────────────
 async function auth(req, res, next) {
-  // Accept user ID from: x-user-id header, x-pi-token header, or body user_id/reviewer_id
-  const userId = req.headers['x-user-id']
-    || req.headers['x-pi-token']
-    || req.body?.user_id
-    || req.body?.reviewer_id
-    || req.body?.client_id;
+  // Accept user ID from headers only — never from body to prevent impersonation
+  const userId = req.headers['x-user-id'] || req.headers['x-pi-token'];
   if (!userId) return res.status(401).json({ error: 'Access token required' });
   req.userId = userId;
 
   // Auto-register user in DB on first API call (Pi Network users aren't registered by bundle)
   try {
-    const username = req.body?.username || req.headers['x-username'] || userId.replace(/^pi_/, '');
+    const username = req.headers['x-username'] || userId.replace(/^pi_/, '');
     await query(
       `INSERT INTO users (id, username, role, balance_connects, created_at, updated_at)
        VALUES ($1, $2, 'freelancer', 10, NOW(), NOW())
@@ -132,12 +130,7 @@ async function auth(req, res, next) {
 
 // softAuth — extracts userId but NEVER rejects (for endpoints where bundle sends no auth)
 function softAuth(req, res, next) {
-  req.userId = req.headers['x-user-id']
-    || req.headers['x-pi-token']
-    || req.body?.user_id
-    || req.body?.reviewer_id
-    || req.body?.client_id
-    || null;
+  req.userId = req.headers['x-user-id'] || req.headers['x-pi-token'] || null;
   next();
 }
 
@@ -508,12 +501,28 @@ app.post('/api/jobs/:id/apply', auth, checkBlocked, async (req, res) => {
       return res.status(400).json({ error: 'Not enough connects', required: cost, current: user?.balance_connects || 0 });
     }
 
-    await query('UPDATE users SET balance_connects = balance_connects - $1, updated_at = NOW() WHERE id = $2', [cost, req.userId]);
-    const appResult = await query(
-      'INSERT INTO applications (job_id, job_title, freelancer_id, freelancer_name, message) VALUES ($1, $2, $3, $4, $5) RETURNING *',
-      [req.params.id, job.title, req.userId, user.username || req.userId, req.body.message || '']
-    );
-    await query('UPDATE jobs SET applications = applications + 1, updated_at = NOW() WHERE id = $1', [req.params.id]);
+    // Atomic: deduct connects AND insert application in one transaction
+    let appResult;
+    const pgClient = await pool.connect();
+    try {
+      await pgClient.query('BEGIN');
+      await pgClient.query('UPDATE users SET balance_connects = balance_connects - $1, updated_at = NOW() WHERE id = $2', [cost, req.userId]);
+      appResult = await pgClient.query(
+        'INSERT INTO applications (job_id, job_title, freelancer_id, freelancer_name, message) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (job_id, freelancer_id) DO NOTHING RETURNING *',
+        [req.params.id, job.title, req.userId, user.username || req.userId, req.body.message || '']
+      );
+      if (!appResult.rows.length) {
+        await pgClient.query('ROLLBACK');
+        return res.status(400).json({ error: 'Already applied' });
+      }
+      await pgClient.query('UPDATE jobs SET applications = applications + 1, updated_at = NOW() WHERE id = $1', [req.params.id]);
+      await pgClient.query('COMMIT');
+    } catch (txErr) {
+      await pgClient.query('ROLLBACK').catch(() => {});
+      throw txErr;
+    } finally {
+      pgClient.release();
+    }
     await audit('job_applied', { job_id: req.params.id, user_id: req.userId });
     await notify(job.posted_by, 'application', `Новый отклик на задачу "${job.title}"`,
       `${user.username || 'Фрилансер'} откликнулся на вашу задачу`, parseInt(req.params.id), null);
@@ -537,6 +546,7 @@ app.post('/api/jobs/:id/hire', auth, checkBlocked, async (req, res) => {
     const appResult = await query('SELECT * FROM applications WHERE id = $1 AND job_id = $2', [application_id, req.params.id]);
     if (!appResult.rows.length) return res.status(404).json({ error: 'Application not found' });
     const app = appResult.rows[0];
+    if (app.freelancer_id !== freelancer_id) return res.status(400).json({ error: 'freelancer_id does not match application' });
 
     // Accept chosen application, reject all others
     await query('UPDATE applications SET status = $1 WHERE id = $2', ['accepted', application_id]);
@@ -744,14 +754,13 @@ app.post('/api/escrow', auth, checkBlocked, async (req, res) => {
   }
 });
 
-// softAuth: bundle sends no auth header
-app.post('/api/escrow/:id/release', softAuth, async (req, res) => {
+app.post('/api/escrow/:id/release', auth, async (req, res) => {
   try {
     const result = await query('SELECT * FROM escrows WHERE id = $1', [req.params.id]);
     if (!result.rows.length) return res.status(404).json({ error: 'Escrow not found' });
     const escrow = result.rows[0];
-    if (req.userId && escrow.client_id !== req.userId) return res.status(403).json({ error: 'Not your escrow' });
-    if (escrow.status === 'released') return res.status(400).json({ error: 'Already released' });
+    if (escrow.client_id !== req.userId) return res.status(403).json({ error: 'Not your escrow' });
+    if (!['funded', 'pending'].includes(escrow.status)) return res.status(400).json({ error: 'Already released' });
     const net = parseFloat((escrow.amount * 0.98).toFixed(8)); // 2% platform commission
     await query('UPDATE escrows SET status = $1, updated_at = NOW() WHERE id = $2', ['released', req.params.id]);
     await query('UPDATE users SET balance_pi = balance_pi + $1, total_jobs_completed = total_jobs_completed + 1, updated_at = NOW() WHERE id = $2', [net, escrow.freelancer_id]);
@@ -1010,7 +1019,7 @@ app.delete('/api/admin/jobs/:id', adminAuth, async (req, res) => {
 // POST /api/admin/users/:id/grant-connects — admin grants connects to user
 app.post('/api/admin/users/:id/grant-connects', adminAuth, async (req, res) => {
   const { amount } = req.body;
-  const qty = parseInt(amount || 50);
+  const qty = Math.max(1, Math.min(10000, parseInt(amount || 50) || 50));
   try {
     await query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [qty, req.params.id]);
     const result = await query('SELECT balance_connects FROM users WHERE id = $1', [req.params.id]);
@@ -1095,14 +1104,12 @@ app.get('/api/escrows/me', auth, async (req, res) => {
     res.json({ escrows: result.rows });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
-// softAuth: bundle sends no auth header for releaseEscrow
-app.post('/api/escrows/:id/release', softAuth, async (req, res) => {
+app.post('/api/escrows/:id/release', auth, async (req, res) => {
   try {
     const result = await query('SELECT * FROM escrows WHERE id = $1', [req.params.id]);
     if (!result.rows.length) return res.status(404).json({ error: 'Escrow not found' });
     const escrow = result.rows[0];
-    // Only enforce ownership if caller identified themselves
-    if (req.userId && escrow.client_id !== req.userId) return res.status(403).json({ error: 'Not your escrow' });
+    if (escrow.client_id !== req.userId) return res.status(403).json({ error: 'Not your escrow' });
     const net2 = parseFloat((escrow.amount * 0.98).toFixed(8)); // 2% platform commission
     await query('UPDATE escrows SET status = $1, updated_at = NOW() WHERE id = $2', ['released', req.params.id]);
     await query('UPDATE users SET balance_pi = balance_pi + $1, total_jobs_completed = total_jobs_completed + 1, updated_at = NOW() WHERE id = $2', [net2, escrow.freelancer_id]);
@@ -1192,8 +1199,7 @@ app.get('/api/applications/job/:jobId', auth, async (req, res) => {
 });
 
 // POST /api/applications/:id/accept — accept application + create escrow record
-// Uses softAuth: bundle sends no auth, ownership check is skipped when no userId
-app.post('/api/applications/:id/accept', softAuth, async (req, res) => {
+app.post('/api/applications/:id/accept', auth, async (req, res) => {
   try {
     const appResult = await query(
       'SELECT a.*, j.posted_by, j.budget, j.title FROM applications a JOIN jobs j ON a.job_id = j.id WHERE a.id = $1',
@@ -1201,10 +1207,7 @@ app.post('/api/applications/:id/accept', softAuth, async (req, res) => {
     );
     if (!appResult.rows.length) return res.status(404).json({ error: 'Application not found' });
     const app_ = appResult.rows[0];
-    // Only enforce ownership if caller identified themselves
-    if (req.userId && app_.posted_by !== req.userId) return res.status(403).json({ error: 'Forbidden' });
-    // Set userId from job owner if not provided (bundle scenario)
-    if (!req.userId) req.userId = app_.posted_by;
+    if (app_.posted_by !== req.userId) return res.status(403).json({ error: 'Forbidden' });
 
     // Accept the application
     const result = await query('UPDATE applications SET status = $1 WHERE id = $2 RETURNING *', ['accepted', req.params.id]);
@@ -1513,7 +1516,7 @@ app.post('/api/users/me/portfolio/items', auth, async (req, res) => {
 app.delete('/api/users/me', auth, async (req, res) => {
   try {
     const active = await query(
-      `SELECT 1 FROM jobs WHERE (client_id=$1 OR freelancer_id=$1) AND status IN ('in_progress','submitted') LIMIT 1
+      `SELECT 1 FROM jobs WHERE (posted_by=$1 OR hired_freelancer_id=$1) AND status IN ('in_progress','submitted') LIMIT 1
        UNION ALL
        SELECT 1 FROM escrows WHERE (client_id=$1 OR freelancer_id=$1) AND status='funded' LIMIT 1`,
       [req.userId]
@@ -1888,15 +1891,13 @@ app.get('/api/chat/rooms/:id', auth, async (req, res) => {
 });
 
 // POST /api/escrows/:id/fund — fund an escrow after Pi payment
-// softAuth: bundle sends no auth header
-app.post('/api/escrows/:id/fund', softAuth, async (req, res) => {
+app.post('/api/escrows/:id/fund', auth, async (req, res) => {
   const { payment_id, txid } = req.body;
   try {
     const result = await query('SELECT * FROM escrows WHERE id = $1', [req.params.id]);
     if (!result.rows.length) return res.status(404).json({ error: 'Escrow not found' });
     const escrow = result.rows[0];
-    // Only enforce ownership if caller identified themselves
-    if (req.userId && escrow.client_id !== req.userId) return res.status(403).json({ error: 'Not your escrow' });
+    if (escrow.client_id !== req.userId) return res.status(403).json({ error: 'Not your escrow' });
     await query('UPDATE escrows SET status = $1, payment_id = $2, updated_at = NOW() WHERE id = $3', ['funded', payment_id || escrow.payment_id, req.params.id]);
     await audit('escrow_funded', { escrow_id: req.params.id, payment_id, txid });
     res.json({ escrow: { ...escrow, status: 'funded' }, success: true });
@@ -1904,15 +1905,13 @@ app.post('/api/escrows/:id/fund', softAuth, async (req, res) => {
 });
 
 // POST /api/escrows/:id/dispute — open a dispute
-// softAuth: bundle sends no auth header
-app.post('/api/escrows/:id/dispute', softAuth, async (req, res) => {
+app.post('/api/escrows/:id/dispute', auth, async (req, res) => {
   const { reason } = req.body;
   try {
     const result = await query('SELECT * FROM escrows WHERE id = $1', [req.params.id]);
     if (!result.rows.length) return res.status(404).json({ error: 'Escrow not found' });
     const escrow = result.rows[0];
-    // Only enforce ownership if caller identified themselves
-    if (req.userId && escrow.client_id !== req.userId && escrow.freelancer_id !== req.userId) {
+    if (escrow.client_id !== req.userId && escrow.freelancer_id !== req.userId) {
       return res.status(403).json({ error: 'Not your escrow' });
     }
     await query('UPDATE escrows SET status = $1, updated_at = NOW() WHERE id = $2', ['disputed', req.params.id]);
@@ -2042,8 +2041,7 @@ app.get('/api/reviews/:id', async (req, res) => {
 // Bundle sends POST (not PUT), so we handle both
 async function handleAvailability(req, res) {
   const { available, availability } = req.body;
-  // Only enforce identity check if caller identified themselves
-  if (req.userId && req.params.id !== req.userId) return res.status(403).json({ error: 'Forbidden' });
+  if (req.params.id !== req.userId) return res.status(403).json({ error: 'Forbidden' });
   const targetId = req.params.id;
   try {
     const isAvailable = available !== undefined ? available : (availability === 'available');
@@ -2059,8 +2057,8 @@ async function handleAvailability(req, res) {
     res.json({ ...u, uid: u.id, is_admin: u?.role === 'admin', success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 }
-app.put('/api/users/:id/availability', softAuth, handleAvailability);
-app.post('/api/users/:id/availability', softAuth, handleAvailability);
+app.put('/api/users/:id/availability', auth, handleAvailability);
+app.post('/api/users/:id/availability', auth, handleAvailability);
 
 // ─── Pi Payment additional endpoints ──────────────────────────────────────────────
 
