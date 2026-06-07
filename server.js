@@ -351,6 +351,21 @@ app.post('/api/jobs', auth, checkBlocked, async (req, res) => {
   }
 });
 
+// GET /api/jobs/user/:userId — jobs posted by a specific user (MUST be before /:id)
+app.get('/api/jobs/user/:userId', async (req, res) => {
+  try {
+    const userId = req.params.userId;
+    const result = await query(
+      `SELECT j.*, u.username as client_username
+       FROM jobs j LEFT JOIN users u ON u.id = j.posted_by
+       WHERE j.posted_by = $1
+       ORDER BY j.created_at DESC`,
+      [userId]
+    );
+    res.json({ jobs: result.rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // GET /api/jobs/my — client's own posted jobs (must be before /:id to avoid conflict)
 app.get('/api/jobs/my', auth, async (req, res) => {
   try {
