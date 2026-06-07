@@ -303,21 +303,40 @@ app.get('/api/auth/me', auth, async (req, res) => {
 // ─── Users ──────────────────────────────────────────────
 app.get('/api/users', async (req, res) => {
   try {
-    const result = await query('SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, created_at FROM users ORDER BY created_at DESC');
-    res.json({ users: result.rows, count: result.rowCount });
+    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+    const offset = parseInt(req.query.offset) || 0;
+    // Never expose role (hides who is admin) or any sensitive fields
+    const result = await query(
+      'SELECT id, username, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, created_at FROM users ORDER BY created_at DESC LIMIT $1 OFFSET $2',
+      [limit, offset]
+    );
+    const total = await query('SELECT COUNT(*) FROM users');
+    res.json({ users: result.rows, count: result.rowCount, total: parseInt(total.rows[0].count), limit, offset });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
 app.get('/api/users/:id', async (req, res) => {
-  const userId = req.params.id === 'me' ? (req.headers['x-user-id'] || '') : req.params.id;
+  const callerId = req.headers['x-user-id'] || null;
+  const userId = req.params.id === 'me' ? (callerId || '') : req.params.id;
   if (!userId) return res.status(401).json({ error: 'User ID required' });
   try {
     const result = await query('SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, is_blocked, status, created_at FROM users WHERE id = $1', [userId]);
     if (!result.rows.length) return res.status(404).json({ error: 'User not found' });
     const u = result.rows[0];
-    res.json({ ...u, uid: u.id, is_admin: u.role === 'admin' });
+    const isOwner = callerId === u.id;
+    // Sensitive fields only for the owner themselves
+    if (!isOwner) {
+      delete u.balance_connects;
+      delete u.balance_pi;
+      delete u.is_blocked;
+      delete u.status;
+    }
+    // Never expose internal role string publicly — use boolean flag
+    const is_admin = u.role === 'admin';
+    delete u.role;
+    res.json({ ...u, uid: u.id, is_admin });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1192,7 +1211,13 @@ app.post('/api/escrows/:id/cancel', auth, checkBlocked, async (req, res) => {
     if (escrow.client_id !== req.userId) return res.status(403).json({ error: 'Not your escrow' });
     if (!['pending', 'funded'].includes(escrow.status)) return res.status(400).json({ error: 'Escrow already settled' });
     await query('UPDATE escrows SET status = $1, updated_at = NOW() WHERE id = $2', ['refunded', req.params.id]);
-    await query('UPDATE jobs SET status = $1, updated_at = NOW() WHERE id = $2', ['open', escrow.job_id]);
+    await query('UPDATE jobs SET status = $1, hired_freelancer_id = NULL, updated_at = NOW() WHERE id = $2', ['open', escrow.job_id]);
+    // If escrow was funded, return Pi to client's internal balance
+    if (escrow.status === 'funded') {
+      await query('UPDATE users SET balance_pi = balance_pi + $1, updated_at = NOW() WHERE id = $2', [escrow.amount, escrow.client_id]);
+      await notify(escrow.client_id, 'payment', 'Эскроу отменён', `${escrow.amount}π возвращено на ваш счёт.`, escrow.job_id, null);
+      await audit('escrow_cancelled_refunded', { escrow_id: req.params.id, amount: escrow.amount, client_id: escrow.client_id });
+    }
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -1341,20 +1366,34 @@ app.put('/api/applications/:id/status', auth, async (req, res) => {
 
 // PUT /api/jobs/:id — update job
 app.put('/api/jobs/:id', auth, async (req, res) => {
-  const { title, description, category, budget, skills, deadline, status } = req.body;
+  // status is NOT accepted here — use dedicated endpoints (hire/complete/patch) for status transitions
+  const { title, description, category, budget, skills, deadline } = req.body;
   try {
     const jobResult = await query('SELECT * FROM jobs WHERE id = $1', [req.params.id]);
     if (!jobResult.rows.length) return res.status(404).json({ error: 'Job not found' });
-    if (jobResult.rows[0].posted_by !== req.userId) return res.status(403).json({ error: 'Not your job' });
+    const job = jobResult.rows[0];
+    if (job.posted_by !== req.userId) return res.status(403).json({ error: 'Not your job' });
+    // Only allow editing while job is still open (not hired/in-progress/completed)
+    if (job.status !== 'open') return res.status(400).json({ error: 'Can only edit open jobs' });
     const fields = [], vals = [];
     let i = 1;
-    if (title !== undefined) { fields.push(`title=$${i++}`); vals.push(title); }
-    if (description !== undefined) { fields.push(`description=$${i++}`); vals.push(description); }
+    if (title !== undefined) {
+      if (String(title).length > 200) return res.status(400).json({ error: 'Title too long (max 200)' });
+      fields.push(`title=$${i++}`); vals.push(title);
+    }
+    if (description !== undefined) {
+      if (String(description).length > 5000) return res.status(400).json({ error: 'Description too long (max 5000)' });
+      fields.push(`description=$${i++}`); vals.push(description);
+    }
     if (category !== undefined) { fields.push(`category=$${i++}`); vals.push(category); }
-    if (budget !== undefined) { fields.push(`budget=$${i++}`); vals.push(parseFloat(budget)); }
+    if (budget !== undefined) {
+      const b = parseFloat(budget);
+      if (isNaN(b) || b < 1) return res.status(400).json({ error: 'Budget must be at least 1 Pi' });
+      if (b > 10000) return res.status(400).json({ error: 'Budget cannot exceed 10000 Pi' });
+      fields.push(`budget=$${i++}`); vals.push(b);
+    }
     if (skills !== undefined) { fields.push(`skills=$${i++}`); vals.push(skills); }
     if (deadline !== undefined) { fields.push(`deadline=$${i++}`); vals.push(deadline || null); }
-    if (status !== undefined) { fields.push(`status=$${i++}`); vals.push(status); }
     if (!fields.length) return res.status(400).json({ error: 'Nothing to update' });
     fields.push(`updated_at=NOW()`);
     vals.push(req.params.id);
@@ -1546,8 +1585,13 @@ app.post('/api/escrow/:id/refund', auth, checkBlocked, async (req, res) => {
     if (escrow.client_id !== req.userId) return res.status(403).json({ error: 'Not your escrow' });
     if (escrow.status === 'released' || escrow.status === 'refunded') return res.status(400).json({ error: 'Already processed' });
     await query('UPDATE escrows SET status = $1, updated_at = NOW() WHERE id = $2', ['refunded', req.params.id]);
-    await query('UPDATE jobs SET status = $1, updated_at = NOW() WHERE id = $2', ['open', escrow.job_id]);
-    await audit('escrow_refunded', { escrow_id: req.params.id });
+    await query('UPDATE jobs SET status = $1, hired_freelancer_id = NULL, updated_at = NOW() WHERE id = $2', ['open', escrow.job_id]);
+    // Return Pi to client if escrow was funded
+    if (escrow.status === 'funded') {
+      await query('UPDATE users SET balance_pi = balance_pi + $1, updated_at = NOW() WHERE id = $2', [escrow.amount, escrow.client_id]);
+      await notify(escrow.client_id, 'payment', 'Возврат средств', `${escrow.amount}π возвращено на ваш счёт.`, escrow.job_id, null);
+    }
+    await audit('escrow_refunded', { escrow_id: req.params.id, status_was: escrow.status, amount: escrow.amount });
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
