@@ -222,7 +222,7 @@ app.post('/api/me', async (req, res) => {
     await query(
       `INSERT INTO users (id, username, role, balance_connects, created_at, updated_at)
        VALUES ($1, $2, 'freelancer', 10, NOW(), NOW())
-       ON CONFLICT (id) DO UPDATE SET username = $2, updated_at = NOW()`,
+       ON CONFLICT (id) DO UPDATE SET updated_at = NOW()`,
       [uid, uname]
     );
     const user = await query('SELECT * FROM users WHERE id = $1', [uid]);
