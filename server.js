@@ -1868,6 +1868,11 @@ app.post('/api/applications/:id/view', auth, async (req, res) => {
 // GET /api/chat/:roomId/messages — messages in a chat room (uses chat_messages table)
 app.get('/api/chat/:roomId/messages', auth, async (req, res) => {
   try {
+    const roomCheck = await query(
+      'SELECT id FROM chat_rooms WHERE id = $1 AND (client_id = $2 OR freelancer_id = $2)',
+      [req.params.roomId, req.userId]
+    );
+    if (!roomCheck.rows.length) return res.status(403).json({ error: 'Access denied' });
     const result = await query(
       `SELECT cm.*, u.username as sender_username,
               cm.message as content, cm.message as text
@@ -1907,6 +1912,7 @@ app.post('/api/escrows/:id/fund', auth, async (req, res) => {
     if (!result.rows.length) return res.status(404).json({ error: 'Escrow not found' });
     const escrow = result.rows[0];
     if (escrow.client_id !== req.userId) return res.status(403).json({ error: 'Not your escrow' });
+    if (escrow.status !== 'pending') return res.status(400).json({ error: 'Escrow already funded or settled' });
     await query('UPDATE escrows SET status = $1, payment_id = $2, updated_at = NOW() WHERE id = $3', ['funded', payment_id || escrow.payment_id, req.params.id]);
     await audit('escrow_funded', { escrow_id: req.params.id, payment_id, txid });
     res.json({ escrow: { ...escrow, status: 'funded' }, success: true });
@@ -1936,7 +1942,7 @@ app.post('/api/escrows/:id/dispute', auth, async (req, res) => {
 // GET /api/escrows/:id/room — chat room for an escrow
 app.get('/api/escrows/:id/room', auth, async (req, res) => {
   try {
-    const escResult = await query('SELECT * FROM escrows WHERE id = $1', [req.params.id]);
+    const escResult = await query('SELECT * FROM escrows WHERE id = $1 AND (client_id = $2 OR freelancer_id = $2)', [req.params.id, req.userId]);
     if (!escResult.rows.length) return res.status(404).json({ error: 'Escrow not found' });
     const escrow = escResult.rows[0];
     // Find or create chat room between client and freelancer
