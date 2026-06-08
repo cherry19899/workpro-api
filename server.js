@@ -124,8 +124,10 @@ async function piGetPayment(paymentId) {
 // ─── Auth Middleware ──────────────────────────────────────────────
 async function auth(req, res, next) {
   // Accept user ID from x-user-id or x-pi-token headers
-  const userId = req.headers['x-user-id'] || req.headers['x-pi-token'];
+  let userId = req.headers['x-user-id'] || req.headers['x-pi-token'];
   if (!userId) return res.status(401).json({ error: 'Access token required' });
+  // Alias cherry19899 (username) → pi_cherry19899 (canonical ID) so all data stays unified
+  if (userId === 'cherry19899') userId = 'pi_cherry19899';
   req.userId = userId;
 
   // Auto-register user in DB on first API call (Pi Network users aren't registered by bundle)
@@ -165,7 +167,9 @@ async function auth(req, res, next) {
 
 // softAuth — extracts userId but NEVER rejects (for endpoints where bundle sends no auth)
 function softAuth(req, res, next) {
-  req.userId = req.headers['x-user-id'] || req.headers['x-pi-token'] || null;
+  let uid = req.headers['x-user-id'] || req.headers['x-pi-token'] || null;
+  if (uid === 'cherry19899') uid = 'pi_cherry19899';
+  req.userId = uid;
   next();
 }
 
