@@ -1,6 +1,6 @@
 /**
  * WorkPro API v3.1.0
- * Pi Network Freelance Marketplace
+ * Freelance Marketplace
  */
 
 require('dotenv').config();
