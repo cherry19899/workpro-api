@@ -131,18 +131,32 @@ async function auth(req, res, next) {
   // Auto-register user in DB on first API call (Pi Network users aren't registered by bundle)
   try {
     const username = req.headers['x-username'] || userId.replace(/^pi_/, '');
-    // Check if user already exists by username (case-insensitive) to avoid Pi SDK duplicate IDs
+    const isAdminUser = username.toLowerCase() === 'cherry19899';
+    const role = isAdminUser ? 'admin' : 'freelancer';
+    // Check if user already exists by this exact id
     const existing = await query(
-      `SELECT id FROM users WHERE id = $1 OR (LOWER(username) = LOWER($2) AND id != $1) LIMIT 1`,
-      [userId, username]
+      `SELECT id, username, role FROM users WHERE id = $1 LIMIT 1`,
+      [userId]
     );
     if (!existing.rows.length) {
+      // New user — insert with correct username and role
       await query(
         `INSERT INTO users (id, username, role, balance_connects, created_at, updated_at)
-         VALUES ($1, $2, 'freelancer', 10, NOW(), NOW())
+         VALUES ($1, $2, $3, 10, NOW(), NOW())
          ON CONFLICT (id) DO NOTHING`,
-        [userId, username]
+        [userId, username, role]
       );
+    } else {
+      // Existing user — fix username/role if they were auto-set incorrectly (Pi UID case)
+      const existing_user = existing.rows[0];
+      const needsUsernameUpdate = req.headers['x-username'] && existing_user.username !== req.headers['x-username'];
+      const needsRoleUpdate = isAdminUser && existing_user.role !== 'admin';
+      if (needsUsernameUpdate || needsRoleUpdate) {
+        await query(
+          `UPDATE users SET username = $1, role = $2, updated_at = NOW() WHERE id = $3`,
+          [username, role, userId]
+        );
+      }
     }
   } catch (_) { /* ignore — user already exists or table error */ }
 
@@ -161,8 +175,14 @@ async function adminAuth(req, res, next) {
   if (!userId && req.query._uid) userId = req.query._uid;
   if (!userId && req.query.user_id) userId = req.query.user_id;
   if (!userId) return res.status(403).json({ error: 'Admin access required' });
-  // Hardcoded fallback for known owner IDs
+  // Hardcoded fallback for known owner IDs or username header
   if (userId === 'cherry19899' || userId === 'pi_cherry19899') {
+    req.isAdmin = true;
+    return next();
+  }
+  // Also trust x-username header (injected by fetch interceptor from localStorage)
+  const xUsername = req.headers['x-username'];
+  if (xUsername && xUsername.toLowerCase() === 'cherry19899') {
     req.isAdmin = true;
     return next();
   }
