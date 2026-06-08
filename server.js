@@ -287,6 +287,8 @@ app.post('/api/me', async (req, res) => {
         if (r1.rowCount > 0 || r2.rowCount > 0) console.log(`[Migration] cherry19899→pi_cherry19899: jobs=${r1.rowCount} apps=${r2.rowCount}`);
       } catch (mErr) { console.error('[Migration] error:', mErr.message); }
     }
+    // Always sync total_jobs_posted from real DB count to fix drift
+    await query(`UPDATE users SET total_jobs_posted = (SELECT COUNT(*) FROM jobs WHERE posted_by = $1), updated_at = NOW() WHERE id = $1`, [uid]).catch(() => {});
     const user = await query('SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, status, created_at FROM users WHERE id = $1', [uid]);
     await audit('user_login', { user_id: uid });
     const u = user.rows[0];
@@ -2008,6 +2010,33 @@ app.get('/api/jobs/user/:userId', async (req, res) => {
       [userId]
     );
     res.json({ jobs: result.rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /api/offers — client sends a direct offer to a freelancer
+app.post('/api/offers', auth, checkBlocked, async (req, res) => {
+  const { to_user_id, job_id, amount, message } = req.body;
+  if (!to_user_id || !job_id) return res.status(400).json({ error: 'to_user_id and job_id required' });
+  try {
+    // Verify the job belongs to the requester
+    const jobRes = await query('SELECT * FROM jobs WHERE id = $1', [job_id]);
+    if (!jobRes.rows.length) return res.status(404).json({ error: 'Job not found' });
+    const job = jobRes.rows[0];
+    if (job.posted_by !== req.userId) return res.status(403).json({ error: 'Not your job' });
+    const freelancerRes = await query('SELECT id, username FROM users WHERE id = $1', [to_user_id]);
+    if (!freelancerRes.rows.length) return res.status(404).json({ error: 'Freelancer not found' });
+    const freelancer = freelancerRes.rows[0];
+    const callerRes = await query('SELECT username FROM users WHERE id = $1', [req.userId]);
+    const callerName = callerRes.rows[0]?.username || req.userId;
+    // Create application record with status='offer'
+    const result = await query(
+      `INSERT INTO applications (job_id, job_title, freelancer_id, freelancer_name, message, bid_amount, status, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, 'offer', NOW()) RETURNING *`,
+      [job_id, job.title, to_user_id, freelancer.username, message || '', amount || job.budget]
+    );
+    await notify(to_user_id, 'offer', `Вам отправлено предложение по задаче "${job.title}"`,
+      `${callerName} предлагает вам работу. Сумма: ${amount || job.budget} π`, job_id, null);
+    res.json({ offer: result.rows[0], success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 

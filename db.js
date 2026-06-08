@@ -121,7 +121,7 @@ async function initDb() {
       id SERIAL PRIMARY KEY, action VARCHAR(255) NOT NULL, data JSONB DEFAULT '{}',
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )`);
-    await query(`INSERT INTO users (id, username, role, kyc_verified, status) VALUES ('cherry19899', 'cherry19899', 'admin', true, 'active') ON CONFLICT (id) DO NOTHING`);
+    await query(`INSERT INTO users (id, username, role, kyc_verified, status) VALUES ('pi_cherry19899', 'cherry19899', 'admin', true, 'active') ON CONFLICT (id) DO NOTHING`);
     console.log('[DB] PostgreSQL initialized');
   } catch (err) {
     console.error('[DB] PostgreSQL init error:', err.message);
