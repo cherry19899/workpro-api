@@ -390,7 +390,7 @@ app.get('/api/jobs', async (req, res) => {
     let idx = 1;
 
     if (status) { conditions.push(`status = $${idx++}`); params.push(status); }
-    if (category && category !== 'all' && category !== 'All') { conditions.push(`category = $${idx++}`); params.push(category); }
+    if (category && category !== 'all' && category !== 'All') { conditions.push(`LOWER(category) = LOWER($${idx++})`); params.push(category); }
     if (ownerFilter) { conditions.push(`posted_by = $${idx++}`); params.push(ownerFilter); }
     if (search) { conditions.push(`(title ILIKE $${idx} OR description ILIKE $${idx})`); params.push(`%${search}%`); idx++; }
     if (min_budget) { conditions.push(`budget >= $${idx++}`); params.push(parseFloat(min_budget)); }
