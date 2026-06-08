@@ -1932,7 +1932,7 @@ app.get('/api/escrows/user/:userId', auth, async (req, res) => {
     const userId = req.userId;
     const result = await query(
       `SELECT e.*, j.title as job_title,
-              c.username as client_username, f.username as freelancer_username
+              c.username as client_name, f.username as freelancer_name
        FROM escrows e
        LEFT JOIN jobs j ON j.id = e.job_id
        LEFT JOIN users c ON c.id = e.client_id
