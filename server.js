@@ -430,6 +430,34 @@ app.get('/api/users/:id/ratings', async (req, res) => {
 });
 
 // ─── Jobs ──────────────────────────────────────────────
+// Normalize images before DB write: array→JSON string, {}→null, falsy→null
+function serializeImages(images) {
+  if (!images) return null;
+  if (typeof images === 'string') {
+    const s = images.trim();
+    if (!s || s === '{}' || s === '[]' || s === 'null') return null;
+    return s;
+  }
+  if (Array.isArray(images)) return images.length > 0 ? JSON.stringify(images) : null;
+  if (typeof images === 'object') {
+    const keys = Object.keys(images);
+    return keys.length > 0 ? JSON.stringify(images) : null;
+  }
+  return null;
+}
+// Parse images on DB read: JSON string→array, null→null
+function parseImages(images) {
+  if (!images || images === '[object Object]') return null;
+  if (typeof images === 'string') {
+    try { return JSON.parse(images); } catch(e) { return null; }
+  }
+  return images;
+}
+function parseJobRow(job) {
+  if (!job) return job;
+  return { ...job, images: parseImages(job.images) };
+}
+
 app.get('/api/jobs', async (req, res) => {
   const { status, category, posted_by, client_uid, search, limit = 20, page = 1,
           min_budget, max_budget, sort } = req.query;
@@ -471,7 +499,7 @@ app.get('/api/jobs', async (req, res) => {
       [...params, parseInt(limit), offset]
     );
 
-    res.json({ jobs: dataResult.rows, total, page: parseInt(page), total_pages: Math.ceil(total / parseInt(limit)) });
+    res.json({ jobs: dataResult.rows.map(parseJobRow), total, page: parseInt(page), total_pages: Math.ceil(total / parseInt(limit)) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -493,7 +521,7 @@ app.post('/api/jobs', auth, checkBlocked, async (req, res) => {
     const username = userRes.rows[0]?.username || req.userId;
     const result = await query(
       'INSERT INTO jobs (title, description, category, budget, skills, images, deadline, posted_by, posted_by_name, apply_cost, connects_spent) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10) RETURNING *',
-      [title, description, (category || 'other').toLowerCase(), budgetNum, skills || null, images || null, deadline || null, req.userId, username, applyCost]
+      [title, description, (category || 'other').toLowerCase(), budgetNum, skills || null, serializeImages(images), deadline || null, req.userId, username, applyCost]
     );
     await query('UPDATE users SET total_jobs_posted = total_jobs_posted + 1, updated_at = NOW() WHERE id = $1', [req.userId]);
     await audit('job_created', { job_id: result.rows[0].id, user_id: req.userId });
@@ -514,7 +542,7 @@ app.get('/api/jobs/user/:userId', async (req, res) => {
        ORDER BY j.created_at DESC`,
       [userId]
     );
-    res.json({ jobs: result.rows });
+    res.json({ jobs: result.rows.map(parseJobRow) });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -529,7 +557,7 @@ app.get('/api/jobs/as-freelancer', auth, async (req, res) => {
        ORDER BY j.updated_at DESC`,
       [req.userId]
     );
-    res.json({ jobs: result.rows });
+    res.json({ jobs: result.rows.map(parseJobRow) });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -540,7 +568,7 @@ app.get('/api/jobs/my', auth, async (req, res) => {
       'SELECT j.*, u.username as client_username FROM jobs j LEFT JOIN users u ON u.id = j.posted_by WHERE j.posted_by = $1 ORDER BY j.created_at DESC',
       [req.userId]
     );
-    res.json({ jobs: result.rows });
+    res.json({ jobs: result.rows.map(parseJobRow) });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -558,7 +586,7 @@ app.get('/api/jobs/:id', async (req, res) => {
     }
     // Include chat room_id so frontend can show "Open chat" button
     const roomResult = await query('SELECT id FROM chat_rooms WHERE job_id = $1 LIMIT 1', [req.params.id]);
-    const job = { ...job_row, room_id: roomResult.rows[0]?.id || null };
+    const job = parseJobRow({ ...job_row, room_id: roomResult.rows[0]?.id || null });
     res.json({ job, applications });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1478,7 +1506,7 @@ app.put('/api/applications/:id/status', auth, async (req, res) => {
 // PUT /api/jobs/:id — update job
 app.put('/api/jobs/:id', auth, async (req, res) => {
   // status is NOT accepted here — use dedicated endpoints (hire/complete/patch) for status transitions
-  const { title, description, category, budget, skills, deadline } = req.body;
+  const { title, description, category, budget, skills, deadline, images } = req.body;
   try {
     const jobResult = await query('SELECT * FROM jobs WHERE id = $1', [req.params.id]);
     if (!jobResult.rows.length) return res.status(404).json({ error: 'Job not found' });
@@ -1508,11 +1536,12 @@ app.put('/api/jobs/:id', auth, async (req, res) => {
     }
     if (skills !== undefined) { fields.push(`skills=$${i++}`); vals.push(skills); }
     if (deadline !== undefined) { fields.push(`deadline=$${i++}`); vals.push(deadline || null); }
+    if (images !== undefined) { fields.push(`images=$${i++}`); vals.push(serializeImages(images)); }
     if (!fields.length) return res.status(400).json({ error: 'Nothing to update' });
     fields.push(`updated_at=NOW()`);
     vals.push(req.params.id);
     const result = await query(`UPDATE jobs SET ${fields.join(',')} WHERE id=$${i} RETURNING *`, vals);
-    res.json({ job: result.rows[0], success: true });
+    res.json({ job: parseJobRow(result.rows[0]), success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
