@@ -284,6 +284,8 @@ app.post('/api/me', async (req, res) => {
             [old.balance_connects || 0, old.bio || '', old.skills || '']);
           await query(`DELETE FROM users WHERE id = 'cherry19899'`);
         }
+        // Migrate notifications sent to old user_id
+        await query(`UPDATE notifications SET user_id = 'pi_cherry19899' WHERE user_id = 'cherry19899'`);
         if (r1.rowCount > 0 || r2.rowCount > 0) console.log(`[Migration] cherry19899→pi_cherry19899: jobs=${r1.rowCount} apps=${r2.rowCount}`);
       } catch (mErr) { console.error('[Migration] error:', mErr.message); }
     }
@@ -1838,7 +1840,7 @@ app.post('/api/applications/:id/hire', auth, checkBlocked, async (req, res) => {
   const { payment_id, txid, amount } = req.body;
   try {
     const appResult = await query(
-      'SELECT a.*, j.posted_by, j.budget FROM applications a JOIN jobs j ON a.job_id = j.id WHERE a.id = $1',
+      'SELECT a.*, j.posted_by, j.budget, j.title as job_title FROM applications a JOIN jobs j ON a.job_id = j.id WHERE a.id = $1',
       [req.params.id]
     );
     if (!appResult.rows.length) return res.status(404).json({ error: 'Application not found' });
@@ -1856,8 +1858,15 @@ app.post('/api/applications/:id/hire', auth, checkBlocked, async (req, res) => {
        VALUES ($1,$2,$3,$4,$5,'funded') ON CONFLICT DO NOTHING RETURNING *`,
       [app_.job_id, req.userId, freelancerId, escrowAmount, payment_id || null]
     );
-    // Mark job as in-progress
-    await query("UPDATE jobs SET status='in_progress', updated_at=NOW() WHERE id=$1", [app_.job_id]);
+    // Mark job as in-progress and set hired_freelancer_id
+    const freelancerNameRes = await query('SELECT username FROM users WHERE id = $1', [freelancerId]);
+    const freelancerName = freelancerNameRes.rows[0]?.username || freelancerId;
+    await query(
+      "UPDATE jobs SET status='in_progress', hired_freelancer_id=$1, hired_freelancer_name=$2, updated_at=NOW() WHERE id=$3",
+      [freelancerId, freelancerName, app_.job_id]
+    );
+    await notify(freelancerId, 'hired', `Вас наняли на задачу "${app_.job_title || app_.job_id}"`,
+      'Заказчик выбрал вас и создал эскроу. Можете приступать к работе.', parseInt(app_.job_id), null);
     await audit('hire_with_escrow', { app_id: req.params.id, job_id: app_.job_id, freelancer_id: freelancerId, amount: escrowAmount });
     res.json({ success: true, escrow: escrow.rows[0] || { job_id: app_.job_id, status: 'funded' } });
   } catch (err) { res.status(500).json({ error: err.message }); }
