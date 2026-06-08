@@ -129,4 +129,5 @@ async function initDb() {
   }
 }
 
-module.exports = { query, initDb, pool, usePg, db, saveJsonDb };
+function getPool() { return pool; }
+module.exports = { query, initDb, pool, getPool, usePg, db, saveJsonDb };

@@ -11,7 +11,7 @@ const helmet = require('helmet');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const fetch = require('node-fetch');
-const { query, initDb, pool } = require('./db');
+const { query, initDb, getPool } = require('./db');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -588,7 +588,7 @@ app.post('/api/jobs/:id/apply', auth, checkBlocked, async (req, res) => {
 
     // Atomic: deduct connects AND insert application in one transaction
     let appResult;
-    const pgClient = await pool.connect();
+    const pgClient = await getPool().connect();
     try {
       await pgClient.query('BEGIN');
       await pgClient.query('UPDATE users SET balance_connects = balance_connects - $1, updated_at = NOW() WHERE id = $2', [cost, req.userId]);
@@ -1343,7 +1343,7 @@ app.post('/api/applications', auth, checkBlocked, async (req, res) => {
     const cost = job.apply_cost || 1;
     if (!user || user.balance_connects < cost) return res.status(400).json({ error: 'Not enough connects', required: cost, current: user?.balance_connects || 0 });
     let appResult;
-    const pgClient = await pool.connect();
+    const pgClient = await getPool().connect();
     try {
       await pgClient.query('BEGIN');
       await pgClient.query('UPDATE users SET balance_connects = balance_connects - $1, updated_at = NOW() WHERE id = $2', [cost, req.userId]);
