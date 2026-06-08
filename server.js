@@ -449,7 +449,7 @@ app.post('/api/jobs', auth, checkBlocked, async (req, res) => {
     const username = userRes.rows[0]?.username || req.userId;
     const result = await query(
       'INSERT INTO jobs (title, description, category, budget, skills, images, deadline, posted_by, posted_by_name) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *',
-      [title, description, category || 'Other', parseFloat(budget), skills || null, images || null, deadline || null, req.userId, username]
+      [title, description, (category || 'other').toLowerCase(), parseFloat(budget), skills || null, images || null, deadline || null, req.userId, username]
     );
     await query('UPDATE users SET total_jobs_posted = total_jobs_posted + 1, updated_at = NOW() WHERE id = $1', [req.userId]);
     await audit('job_created', { job_id: result.rows[0].id, user_id: req.userId });
@@ -1452,7 +1452,7 @@ app.put('/api/jobs/:id', auth, async (req, res) => {
       if (String(description).length > 5000) return res.status(400).json({ error: 'Description too long (max 5000)' });
       fields.push(`description=$${i++}`); vals.push(description);
     }
-    if (category !== undefined) { fields.push(`category=$${i++}`); vals.push(category); }
+    if (category !== undefined) { fields.push(`category=$${i++}`); vals.push(category ? category.toLowerCase() : category); }
     if (budget !== undefined) {
       const b = parseFloat(budget);
       if (isNaN(b) || b < 1) return res.status(400).json({ error: 'Budget must be at least 1 Pi' });
