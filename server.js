@@ -525,7 +525,7 @@ app.post('/api/jobs', auth, checkBlocked, async (req, res) => {
     );
     await query('UPDATE users SET total_jobs_posted = total_jobs_posted + 1, updated_at = NOW() WHERE id = $1', [req.userId]);
     await audit('job_created', { job_id: result.rows[0].id, user_id: req.userId });
-    res.json({ job: result.rows[0], success: true });
+    res.json({ job: parseJobRow(result.rows[0]), success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
