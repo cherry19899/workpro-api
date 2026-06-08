@@ -291,6 +291,8 @@ app.post('/api/me', async (req, res) => {
     }
     // Always sync total_jobs_posted from real DB count to fix drift
     await query(`UPDATE users SET total_jobs_posted = (SELECT COUNT(*) FROM jobs WHERE posted_by = $1), updated_at = NOW() WHERE id = $1`, [uid]).catch(() => {});
+    // Recalculate apply_cost for all jobs that still have the old default (1) — one-time migration
+    await query(`UPDATE jobs SET apply_cost = CEIL(budget / 50.0), connects_spent = CEIL(budget / 50.0) WHERE apply_cost = 1 AND budget > 50`).catch(() => {});
     const user = await query('SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, status, created_at FROM users WHERE id = $1', [uid]);
     await audit('user_login', { user_id: uid });
     const u = user.rows[0];
@@ -485,12 +487,13 @@ app.post('/api/jobs', auth, checkBlocked, async (req, res) => {
   if (budgetNum > 10000) return res.status(400).json({ error: 'Budget cannot exceed 10000 Pi' });
   if (String(title).length > 200) return res.status(400).json({ error: 'Title too long (max 200 chars)' });
   if (String(description).length > 5000) return res.status(400).json({ error: 'Description too long (max 5000 chars)' });
+  const applyCost = Math.ceil(budgetNum / 50); // 1-50π→1, 51-100π→2, 101-150π→3, ...
   try {
     const userRes = await query('SELECT username FROM users WHERE id = $1', [req.userId]);
     const username = userRes.rows[0]?.username || req.userId;
     const result = await query(
-      'INSERT INTO jobs (title, description, category, budget, skills, images, deadline, posted_by, posted_by_name) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *',
-      [title, description, (category || 'other').toLowerCase(), parseFloat(budget), skills || null, images || null, deadline || null, req.userId, username]
+      'INSERT INTO jobs (title, description, category, budget, skills, images, deadline, posted_by, posted_by_name, apply_cost, connects_spent) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10) RETURNING *',
+      [title, description, (category || 'other').toLowerCase(), budgetNum, skills || null, images || null, deadline || null, req.userId, username, applyCost]
     );
     await query('UPDATE users SET total_jobs_posted = total_jobs_posted + 1, updated_at = NOW() WHERE id = $1', [req.userId]);
     await audit('job_created', { job_id: result.rows[0].id, user_id: req.userId });
@@ -1499,6 +1502,9 @@ app.put('/api/jobs/:id', auth, async (req, res) => {
       if (isNaN(b) || b < 1) return res.status(400).json({ error: 'Budget must be at least 1 Pi' });
       if (b > 10000) return res.status(400).json({ error: 'Budget cannot exceed 10000 Pi' });
       fields.push(`budget=$${i++}`); vals.push(b);
+      const newCost = Math.ceil(b / 50);
+      fields.push(`apply_cost=$${i++}`); vals.push(newCost);
+      fields.push(`connects_spent=$${i++}`); vals.push(newCost);
     }
     if (skills !== undefined) { fields.push(`skills=$${i++}`); vals.push(skills); }
     if (deadline !== undefined) { fields.push(`deadline=$${i++}`); vals.push(deadline || null); }
