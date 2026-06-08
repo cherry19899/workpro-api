@@ -702,7 +702,7 @@ app.post('/api/jobs/:id/complete', auth, checkBlocked, async (req, res) => {
       const e = escrow.rows[0];
       const net = parseFloat((e.amount * 0.98).toFixed(8)); // 2% platform commission
       await query('UPDATE escrows SET status = $1, updated_at = NOW() WHERE id = $2', ['released', e.id]);
-      await query('UPDATE users SET balance_pi = balance_pi + $1, updated_at = NOW() WHERE id = $2', [net, e.freelancer_id]);
+      await query('UPDATE users SET balance_pi = COALESCE(balance_pi, 0) + $1, updated_at = NOW() WHERE id = $2', [net, e.freelancer_id]);
       paidAmount = net;
     }
     await query('UPDATE jobs SET status = $1, updated_at = NOW() WHERE id = $2', ['completed', req.params.id]);
@@ -879,7 +879,7 @@ app.post('/api/escrow/:id/release', auth, async (req, res) => {
     if (escrow.status !== 'funded') return res.status(400).json({ error: 'Escrow is not funded' });
     const net = parseFloat((escrow.amount * 0.98).toFixed(8)); // 2% platform commission
     await query('UPDATE escrows SET status = $1, updated_at = NOW() WHERE id = $2', ['released', req.params.id]);
-    await query('UPDATE users SET balance_pi = balance_pi + $1, total_jobs_completed = total_jobs_completed + 1, updated_at = NOW() WHERE id = $2', [net, escrow.freelancer_id]);
+    await query('UPDATE users SET balance_pi = COALESCE(balance_pi, 0) + $1, total_jobs_completed = total_jobs_completed + 1, updated_at = NOW() WHERE id = $2', [net, escrow.freelancer_id]);
     await query('UPDATE jobs SET status = $1, updated_at = NOW() WHERE id = $2', ['completed', escrow.job_id]);
     await audit('escrow_released', { escrow_id: req.params.id, freelancer_id: escrow.freelancer_id, amount: escrow.amount, net_paid: net });
     res.json({ escrow: { ...escrow, status: 'released' }, success: true });
@@ -1303,7 +1303,7 @@ app.post('/api/escrows/:id/release', auth, async (req, res) => {
     if (escrow.status !== 'funded') return res.status(400).json({ error: 'Escrow is not funded' });
     const net2 = parseFloat((escrow.amount * 0.98).toFixed(8)); // 2% platform commission
     await query('UPDATE escrows SET status = $1, updated_at = NOW() WHERE id = $2', ['released', req.params.id]);
-    await query('UPDATE users SET balance_pi = balance_pi + $1, total_jobs_completed = total_jobs_completed + 1, updated_at = NOW() WHERE id = $2', [net2, escrow.freelancer_id]);
+    await query('UPDATE users SET balance_pi = COALESCE(balance_pi, 0) + $1, total_jobs_completed = total_jobs_completed + 1, updated_at = NOW() WHERE id = $2', [net2, escrow.freelancer_id]);
     await query('UPDATE jobs SET status = $1, updated_at = NOW() WHERE id = $2', ['completed', escrow.job_id]);
     await audit('escrow_released', { escrow_id: req.params.id, net_paid: net2 });
     res.json({ success: true });
@@ -1320,7 +1320,7 @@ app.post('/api/escrows/:id/cancel', auth, checkBlocked, async (req, res) => {
     await query('UPDATE jobs SET status = $1, hired_freelancer_id = NULL, updated_at = NOW() WHERE id = $2', ['open', escrow.job_id]);
     // If escrow was funded, return Pi to client's internal balance
     if (escrow.status === 'funded') {
-      await query('UPDATE users SET balance_pi = balance_pi + $1, updated_at = NOW() WHERE id = $2', [escrow.amount, escrow.client_id]);
+      await query('UPDATE users SET balance_pi = COALESCE(balance_pi, 0) + $1, updated_at = NOW() WHERE id = $2', [escrow.amount, escrow.client_id]);
       await notify(escrow.client_id, 'payment', 'Эскроу отменён', `${escrow.amount}π возвращено на ваш счёт.`, escrow.job_id, null);
       await audit('escrow_cancelled_refunded', { escrow_id: req.params.id, amount: escrow.amount, client_id: escrow.client_id });
     }
@@ -1709,7 +1709,7 @@ app.post('/api/escrow/:id/refund', auth, checkBlocked, async (req, res) => {
     await query('UPDATE jobs SET status = $1, hired_freelancer_id = NULL, updated_at = NOW() WHERE id = $2', ['open', escrow.job_id]);
     // Return Pi to client if escrow was funded
     if (escrow.status === 'funded') {
-      await query('UPDATE users SET balance_pi = balance_pi + $1, updated_at = NOW() WHERE id = $2', [escrow.amount, escrow.client_id]);
+      await query('UPDATE users SET balance_pi = COALESCE(balance_pi, 0) + $1, updated_at = NOW() WHERE id = $2', [escrow.amount, escrow.client_id]);
       await notify(escrow.client_id, 'payment', 'Возврат средств', `${escrow.amount}π возвращено на ваш счёт.`, escrow.job_id, null);
     }
     await audit('escrow_refunded', { escrow_id: req.params.id, status_was: escrow.status, amount: escrow.amount });
