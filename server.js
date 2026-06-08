@@ -270,26 +270,21 @@ app.post('/api/me', async (req, res) => {
        ON CONFLICT (id) DO UPDATE SET updated_at = NOW()`,
       [uid, uname, isOwner ? 'admin' : 'freelancer']
     );
-    // Migrate legacy 'cherry19899' records to 'pi_cherry19899' on first pi_ login
+    // Migrate legacy 'cherry19899' records to 'pi_cherry19899' (idempotent, runs every login)
     if (uid === 'pi_cherry19899') {
       try {
-        const legacyExists = await query(`SELECT id FROM users WHERE id = 'cherry19899'`);
-        if (legacyExists.rows.length > 0) {
-          await query(`UPDATE jobs SET posted_by = 'pi_cherry19899' WHERE posted_by = 'cherry19899'`);
-          await query(`UPDATE applications SET freelancer_id = 'pi_cherry19899' WHERE freelancer_id = 'cherry19899'`);
-          await query(`UPDATE escrows SET client_id = 'pi_cherry19899' WHERE client_id = 'cherry19899'`);
-          await query(`UPDATE escrows SET freelancer_id = 'pi_cherry19899' WHERE freelancer_id = 'cherry19899'`);
-          // Merge balance_connects from old user if higher
-          const oldUser = legacyExists.rows[0];
-          const oldFull = await query(`SELECT balance_connects, bio, skills, rating FROM users WHERE id = 'cherry19899'`);
-          if (oldFull.rows.length > 0) {
-            const old = oldFull.rows[0];
-            await query(`UPDATE users SET balance_connects = GREATEST(balance_connects, $1), bio = COALESCE(NULLIF(bio,''), $2), skills = COALESCE(NULLIF(skills,''), $3) WHERE id = 'pi_cherry19899'`,
-              [old.balance_connects || 0, old.bio || '', old.skills || '']);
-          }
+        const r1 = await query(`UPDATE jobs SET posted_by = 'pi_cherry19899' WHERE posted_by = 'cherry19899'`);
+        const r2 = await query(`UPDATE applications SET freelancer_id = 'pi_cherry19899' WHERE freelancer_id = 'cherry19899'`);
+        await query(`UPDATE escrows SET client_id = 'pi_cherry19899' WHERE client_id = 'cherry19899'`);
+        await query(`UPDATE escrows SET freelancer_id = 'pi_cherry19899' WHERE freelancer_id = 'cherry19899'`);
+        const legacyUser = await query(`SELECT balance_connects, bio, skills FROM users WHERE id = 'cherry19899'`);
+        if (legacyUser.rows.length > 0) {
+          const old = legacyUser.rows[0];
+          await query(`UPDATE users SET balance_connects = GREATEST(balance_connects, $1), bio = COALESCE(NULLIF(bio,''), $2), skills = COALESCE(NULLIF(skills,''), $3) WHERE id = 'pi_cherry19899'`,
+            [old.balance_connects || 0, old.bio || '', old.skills || '']);
           await query(`DELETE FROM users WHERE id = 'cherry19899'`);
-          console.log('[Migration] cherry19899 → pi_cherry19899 complete');
         }
+        if (r1.rowCount > 0 || r2.rowCount > 0) console.log(`[Migration] cherry19899→pi_cherry19899: jobs=${r1.rowCount} apps=${r2.rowCount}`);
       } catch (mErr) { console.error('[Migration] error:', mErr.message); }
     }
     const user = await query('SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, status, created_at FROM users WHERE id = $1', [uid]);
