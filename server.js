@@ -292,7 +292,7 @@ app.post('/api/me', async (req, res) => {
     // Always sync total_jobs_posted from real DB count to fix drift
     await query(`UPDATE users SET total_jobs_posted = (SELECT COUNT(*) FROM jobs WHERE posted_by = $1), updated_at = NOW() WHERE id = $1`, [uid]).catch(() => {});
     // Recalculate apply_cost for all jobs that still have the old default (1) — one-time migration
-    await query(`UPDATE jobs SET apply_cost = CEIL(budget / 50.0), connects_spent = CEIL(budget / 50.0) WHERE apply_cost = 1 AND budget > 50`).catch(() => {});
+    await query(`UPDATE jobs SET apply_cost = CEIL(budget::numeric / 50.0)::int, connects_spent = CEIL(budget::numeric / 50.0)::int WHERE CEIL(budget::numeric / 50.0)::int != apply_cost`).catch((e) => console.error('[Migration] apply_cost fix error:', e.message));
     const user = await query('SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, status, created_at FROM users WHERE id = $1', [uid]);
     await audit('user_login', { user_id: uid });
     const u = user.rows[0];
