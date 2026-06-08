@@ -2010,7 +2010,9 @@ app.post('/api/connects/buy', auth, checkBlocked, async (req, res) => {
 // GET /api/applications/user/:userId — list applications for a user
 app.get('/api/applications/user/:userId', auth, async (req, res) => {
   try {
-    if (req.params.userId !== req.userId) return res.status(403).json({ error: 'Forbidden' });
+    // Alias cherry19899 → pi_cherry19899 in URL param for consistency
+    const paramUserId = req.params.userId === 'cherry19899' ? 'pi_cherry19899' : req.params.userId;
+    if (paramUserId !== req.userId) return res.status(403).json({ error: 'Forbidden' });
     const userId = req.userId;
     const result = await query(
       `SELECT a.*, j.title as job_title, j.budget, j.status as job_status,
@@ -2029,7 +2031,8 @@ app.get('/api/applications/user/:userId', auth, async (req, res) => {
 // GET /api/escrows/user/:userId — list escrows for a user
 app.get('/api/escrows/user/:userId', auth, async (req, res) => {
   try {
-    if (req.params.userId !== req.userId) return res.status(403).json({ error: 'Forbidden' });
+    const paramUserId = req.params.userId === 'cherry19899' ? 'pi_cherry19899' : req.params.userId;
+    if (paramUserId !== req.userId) return res.status(403).json({ error: 'Forbidden' });
     const userId = req.userId;
     const result = await query(
       `SELECT e.*, j.title as job_title,
