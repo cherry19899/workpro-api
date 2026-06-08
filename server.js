@@ -131,12 +131,19 @@ async function auth(req, res, next) {
   // Auto-register user in DB on first API call (Pi Network users aren't registered by bundle)
   try {
     const username = req.headers['x-username'] || userId.replace(/^pi_/, '');
-    await query(
-      `INSERT INTO users (id, username, role, balance_connects, created_at, updated_at)
-       VALUES ($1, $2, 'freelancer', 10, NOW(), NOW())
-       ON CONFLICT (id) DO NOTHING`,
+    // Check if user already exists by username (case-insensitive) to avoid Pi SDK duplicate IDs
+    const existing = await query(
+      `SELECT id FROM users WHERE id = $1 OR (LOWER(username) = LOWER($2) AND id != $1) LIMIT 1`,
       [userId, username]
     );
+    if (!existing.rows.length) {
+      await query(
+        `INSERT INTO users (id, username, role, balance_connects, created_at, updated_at)
+         VALUES ($1, $2, 'freelancer', 10, NOW(), NOW())
+         ON CONFLICT (id) DO NOTHING`,
+        [userId, username]
+      );
+    }
   } catch (_) { /* ignore — user already exists or table error */ }
 
   next();
@@ -1047,11 +1054,15 @@ app.get('/api/admin/stats', adminAuth, async (req, res) => {
 app.get('/api/admin/users', adminAuth, async (req, res) => {
   try {
     const search = req.query.search || '';
+    // DISTINCT ON LOWER(username): deduplicate by username (case-insensitive), prefer admin role then newest
     const safeFields = 'id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, is_blocked, status, created_at, updated_at';
-    let sql = `SELECT ${safeFields} FROM users`;
-    const params = [];
-    if (search) { sql += ' WHERE username ILIKE $1 OR id ILIKE $1'; params.push(`%${search}%`); }
-    sql += ' ORDER BY created_at DESC LIMIT 500';
+    let sql, params = [];
+    if (search) {
+      sql = `SELECT ${safeFields} FROM (SELECT DISTINCT ON (LOWER(username)) ${safeFields} FROM users WHERE username ILIKE $1 OR id ILIKE $1 ORDER BY LOWER(username), CASE role WHEN 'admin' THEN 0 ELSE 1 END, updated_at DESC) sub ORDER BY created_at DESC LIMIT 500`;
+      params.push(`%${search}%`);
+    } else {
+      sql = `SELECT ${safeFields} FROM (SELECT DISTINCT ON (LOWER(username)) ${safeFields} FROM users ORDER BY LOWER(username), CASE role WHEN 'admin' THEN 0 ELSE 1 END, updated_at DESC) sub ORDER BY created_at DESC LIMIT 500`;
+    }
     const result = await query(sql, params);
     res.json({ users: result.rows, count: result.rows.length });
   } catch (err) {
