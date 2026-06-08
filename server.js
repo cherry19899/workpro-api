@@ -398,7 +398,7 @@ app.get('/api/jobs', async (req, res) => {
 
     const where = conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
 
-    // Sort order: newest (default), oldest, budget_asc, budget_desc
+    // Sort order: newest (default), oldest, budget_asc, budget_desc, budget_low, budget_high, popular
     const orderMap = {
       'newest': 'created_at DESC',
       'oldest': 'created_at ASC',
@@ -406,6 +406,9 @@ app.get('/api/jobs', async (req, res) => {
       'budget_desc': 'budget DESC',
       'budget-asc': 'budget ASC',
       'budget-desc': 'budget DESC',
+      'budget_low': 'budget ASC',
+      'budget_high': 'budget DESC',
+      'popular': 'applications DESC, created_at DESC',
     };
     const orderBy = orderMap[sort] || 'created_at DESC';
 
