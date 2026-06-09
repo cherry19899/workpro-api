@@ -503,7 +503,14 @@ app.get('/api/jobs', async (req, res) => {
       [...params, parseInt(limit), offset]
     );
 
-    res.json({ jobs: dataResult.rows.map(parseJobRow), total, page: parseInt(page), total_pages: Math.ceil(total / parseInt(limit)) });
+    // Workaround: bundle v200 has inverted filter hiding 'open' jobs in Find Work feed.
+    // Remap status open→in_progress in the LIST response only.
+    // Individual job detail (/api/jobs/:id) is unaffected, keeping 'open' for Apply logic.
+    const jobs = dataResult.rows.map(parseJobRow).map(function(j) {
+      if (j.status === 'open') return Object.assign({}, j, { status: 'in_progress', _open: true });
+      return j;
+    });
+    res.json({ jobs, total, page: parseInt(page), total_pages: Math.ceil(total / parseInt(limit)) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
