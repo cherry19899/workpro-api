@@ -24,8 +24,8 @@ const PI_API_BASE = 'https://api.minepi.com';
 
 // ─── Middleware ──────────────────────────────────────────────
 app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
-app.use(express.json({ limit: '512kb' }));
-app.use(express.urlencoded({ extended: true, limit: '512kb' }));
+app.use(express.json({ limit: '4mb' }));
+app.use(express.urlencoded({ extended: true, limit: '4mb' }));
 app.use(cors({
   origin: [FRONTEND_URL, 'https://cherry19899.github.io', 'http://localhost:3000', 'http://localhost:5173', 'http://localhost:3001'],
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
@@ -50,8 +50,16 @@ const adminLimiter = rateLimit({
   keyGenerator: (req) => req.ip || req.headers['x-forwarded-for'] || 'unknown',
   message: { error: 'Too many admin requests' },
 });
+// Strict limiter for connects/payments to prevent abuse
+const connectsLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, max: 20,
+  keyGenerator: (req) => req.headers['x-user-id'] || req.ip || 'unknown',
+  message: { error: 'Too many connect operations, try again later' },
+});
 app.use('/api/auth', authLimiter);
 app.use('/api/admin', adminLimiter);
+app.use('/api/connects/purchase', connectsLimiter);
+app.use('/api/payments', connectsLimiter);
 
 // ─── Helpers ──────────────────────────────────────────────
 function now() { return new Date().toISOString(); }
@@ -130,35 +138,27 @@ async function auth(req, res, next) {
   if (userId === 'cherry19899') userId = 'pi_cherry19899';
   req.userId = userId;
 
-  // Auto-register user in DB on first API call (Pi Network users aren't registered by bundle)
+  // Auto-register user in DB on first API call
   try {
     const username = req.headers['x-username'] || userId.replace(/^pi_/, '');
-    const isAdminUser = username.toLowerCase() === 'cherry19899';
-    const role = isAdminUser ? 'admin' : 'freelancer';
-    // Check if user already exists by this exact id
     const existing = await query(
-      `SELECT id, username, role FROM users WHERE id = $1 LIMIT 1`,
+      `SELECT id, username FROM users WHERE id = $1 LIMIT 1`,
       [userId]
     );
     if (!existing.rows.length) {
-      // New user — insert with correct username and role
+      // New user — default role is freelancer; admin role is only granted via DB
       await query(
         `INSERT INTO users (id, username, role, balance_connects, created_at, updated_at)
-         VALUES ($1, $2, $3, 10, NOW(), NOW())
+         VALUES ($1, $2, 'freelancer', 10, NOW(), NOW())
          ON CONFLICT (id) DO NOTHING`,
-        [userId, username, role]
+        [userId, username]
       );
-    } else {
-      // Existing user — fix username/role if they were auto-set incorrectly (Pi UID case)
-      const existing_user = existing.rows[0];
-      const needsUsernameUpdate = req.headers['x-username'] && existing_user.username !== req.headers['x-username'];
-      const needsRoleUpdate = isAdminUser && existing_user.role !== 'admin';
-      if (needsUsernameUpdate || needsRoleUpdate) {
-        await query(
-          `UPDATE users SET username = $1, role = $2, updated_at = NOW() WHERE id = $3`,
-          [username, role, userId]
-        );
-      }
+    } else if (req.headers['x-username'] && existing.rows[0].username !== req.headers['x-username']) {
+      // Sync username only (never change role via header)
+      await query(
+        `UPDATE users SET username = $1, updated_at = NOW() WHERE id = $2`,
+        [req.headers['x-username'], userId]
+      );
     }
   } catch (_) { /* ignore — user already exists or table error */ }
 
@@ -178,23 +178,14 @@ async function adminAuth(req, res, next) {
   let userId = req.headers['x-user-id'];
   if (!userId && req.query._uid) userId = req.query._uid;
   if (!userId && req.query.user_id) userId = req.query.user_id;
+  if (userId === 'cherry19899') userId = 'pi_cherry19899';
   if (!userId) return res.status(403).json({ error: 'Admin access required' });
-  // Hardcoded fallback for known owner IDs or username header
-  if (userId === 'cherry19899' || userId === 'pi_cherry19899') {
-    req.isAdmin = true;
-    return next();
-  }
-  // Also trust x-username header (injected by fetch interceptor from localStorage)
-  const xUsername = req.headers['x-username'];
-  if (xUsername && xUsername.toLowerCase() === 'cherry19899') {
-    req.isAdmin = true;
-    return next();
-  }
-  // Check role or owner username in DB
+
+  // SECURITY: Never trust username headers for admin access — always verify role in DB
   try {
-    const result = await query('SELECT role, username FROM users WHERE id = $1', [userId]);
+    const result = await query('SELECT role FROM users WHERE id = $1', [userId]);
     const user = result.rows[0];
-    if (user?.role === 'admin' || user?.username === 'cherry19899') {
+    if (user?.role === 'admin') {
       req.isAdmin = true;
       return next();
     }
@@ -256,7 +247,8 @@ app.get('/api/me', auth, async (req, res) => {
     const result = await query('SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, is_blocked, status, created_at, updated_at FROM users WHERE id = $1', [req.userId]);
     if (!result.rows.length) return res.status(404).json({ error: 'User not found' });
     const u = result.rows[0];
-    res.json({ ...u, uid: u.id, is_admin: u.role === 'admin' });
+    const levelInfo = computeLevel(u.total_jobs_completed, u.rating);
+    res.json({ ...u, uid: u.id, is_admin: u.role === 'admin', level: levelInfo });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -266,13 +258,12 @@ app.post('/api/me', async (req, res) => {
   if (!uid) return res.status(400).json({ error: 'uid required' });
   try {
     const uname = username || uid.replace(/^pi_/, '') || uid;
-    const isOwner = uname === 'cherry19899';
-    // UPSERT: create or update user
+    // UPSERT: create or update user — role is never changed here (only via adminAuth-protected endpoints)
     await query(
       `INSERT INTO users (id, username, role, balance_connects, created_at, updated_at)
-       VALUES ($1, $2, $3, 10, NOW(), NOW())
-       ON CONFLICT (id) DO UPDATE SET updated_at = NOW()`,
-      [uid, uname, isOwner ? 'admin' : 'freelancer']
+       VALUES ($1, $2, 'freelancer', 10, NOW(), NOW())
+       ON CONFLICT (id) DO UPDATE SET username = EXCLUDED.username, updated_at = NOW()`,
+      [uid, uname]
     );
     // Migrate legacy 'cherry19899' records to 'pi_cherry19899' (idempotent, runs every login)
     if (uid === 'pi_cherry19899') {
@@ -327,20 +318,16 @@ app.post('/api/auth/login', async (req, res) => {
     const paymentsEnabled = piUser ? piUser.payments_enabled === true : false;
 
     const existing = await query('SELECT id, username, role FROM users WHERE id = $1', [uid]);
-    const isOwner = uname === 'cherry19899';
     if (!existing.rows.length) {
+      // New user — default role is freelancer; admin is only assigned via DB directly
       await query(
         'INSERT INTO users (id, username, role, balance_connects, created_at, updated_at) VALUES ($1, $2, $3, 10, NOW(), NOW())',
-        [uid, uname, isOwner ? 'admin' : 'freelancer']
+        [uid, uname, 'freelancer']
       );
+    } else if (piUser) {
+      await query('UPDATE users SET username = $1, updated_at = NOW() WHERE id = $2', [uname, uid]);
     } else {
-      if (isOwner) {
-        await query("UPDATE users SET username = $1, role = 'admin', updated_at = NOW() WHERE id = $2", [uname, uid]);
-      } else if (piUser) {
-        await query('UPDATE users SET username = $1, updated_at = NOW() WHERE id = $2', [uname, uid]);
-      } else {
-        await query('UPDATE users SET updated_at = NOW() WHERE id = $1', [uid]);
-      }
+      await query('UPDATE users SET updated_at = NOW() WHERE id = $1', [uid]);
     }
 
     const token = jwt.sign({ id: uid, username: uname }, JWT_SECRET, { expiresIn: '7d' });
@@ -411,6 +398,10 @@ app.get('/api/users/:id', async (req, res) => {
 app.post('/api/users/:id', auth, async (req, res) => {
   if (req.userId !== req.params.id) return res.status(403).json({ error: 'Forbidden' });
   const { username, email, bio, skills, availability, avatar } = req.body;
+  // Limit base64 avatar to 2MB to prevent DoS
+  if (avatar && avatar.length > 2 * 1024 * 1024 * 1.37) {
+    return res.status(400).json({ error: 'Фото слишком большое (макс. 2MB)' });
+  }
   try {
     const result = await query(
       'UPDATE users SET username = COALESCE($1, username), email = COALESCE($2, email), bio = COALESCE($3, bio), skills = COALESCE($4, skills), availability = COALESCE($5, availability), avatar = COALESCE($6, avatar), updated_at = NOW() WHERE id = $7 RETURNING id, username, email, role, bio, skills, avatar, availability, balance_connects, rating, kyc_verified',
@@ -872,6 +863,15 @@ app.post('/api/chat/rooms/:id/messages', auth, checkBlocked, async (req, res) =>
       [req.params.id, req.userId, senderName, message.trim()]
     );
     await query('UPDATE chat_rooms SET updated_at = NOW() WHERE id = $1', [req.params.id]);
+
+    // Notify the other party in the chat room
+    const otherUserId = room.rows[0].client_id === req.userId
+      ? room.rows[0].freelancer_id
+      : room.rows[0].client_id;
+    if (otherUserId) {
+      await notify(otherUserId, 'message', `Новое сообщение от ${senderName}`, message.trim().substring(0, 100), null, req.params.id);
+    }
+
     res.json({ message: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -923,6 +923,7 @@ app.post('/api/escrow/:id/release', auth, async (req, res) => {
     await query('UPDATE escrows SET status = $1, updated_at = NOW() WHERE id = $2', ['released', req.params.id]);
     await query('UPDATE users SET balance_pi = COALESCE(balance_pi, 0) + $1, total_jobs_completed = total_jobs_completed + 1, updated_at = NOW() WHERE id = $2', [net, escrow.freelancer_id]);
     await query('UPDATE jobs SET status = $1, updated_at = NOW() WHERE id = $2', ['completed', escrow.job_id]);
+    await notify(escrow.freelancer_id, 'payment', 'Оплата получена', `${net}π зачислено на ваш счёт после завершения задачи.`, escrow.job_id, null);
     await audit('escrow_released', { escrow_id: req.params.id, freelancer_id: escrow.freelancer_id, amount: escrow.amount, net_paid: net });
     res.json({ escrow: { ...escrow, status: 'released' }, success: true });
   } catch (err) {
@@ -935,9 +936,16 @@ app.post('/api/payments/:paymentId/approve', auth, async (req, res) => {
   const { paymentId } = req.params;
   const { metadata } = req.body;
   try {
-    // Try to verify payment with Pi Platform (non-fatal if Pi API unavailable)
     let piPayment = { amount: 0 };
-    try { piPayment = await piApprovePayment(paymentId); } catch (_) {}
+    // When PI_API_KEY is configured, verification with Pi Platform is mandatory
+    if (PI_API_KEY) {
+      try {
+        piPayment = await piApprovePayment(paymentId);
+      } catch (piErr) {
+        console.error('[Payment] Pi approval failed:', piErr.message);
+        return res.status(502).json({ error: 'Pi payment verification failed. Try again.' });
+      }
+    }
 
     // Store in DB (UPSERT — idempotent)
     await query(
@@ -960,9 +968,16 @@ app.post('/api/payments/:paymentId/complete', auth, async (req, res) => {
   const { txid, metadata } = req.body;
   if (!txid) return res.status(400).json({ error: 'txid required' });
   try {
-    // Verify with Pi Platform (non-fatal)
     let piPayment = { amount: 0 };
-    try { piPayment = await piCompletePayment(paymentId, txid); } catch (_) {}
+    // When PI_API_KEY is configured, completion with Pi Platform is mandatory
+    if (PI_API_KEY) {
+      try {
+        piPayment = await piCompletePayment(paymentId, txid);
+      } catch (piErr) {
+        console.error('[Payment] Pi complete failed:', piErr.message);
+        return res.status(502).json({ error: 'Pi payment completion failed. Try again.' });
+      }
+    }
 
     // Update payment record
     await query(
@@ -976,7 +991,9 @@ app.post('/api/payments/:paymentId/complete', auth, async (req, res) => {
       const meta = paymentRecord.rows[0].metadata || {};
       const paymentOwner = paymentRecord.rows[0].user_id || req.userId;
       if (meta.type === 'connects') {
-        const amount = parseInt(meta.connects_amount || 10);
+        // SECURITY: derives connects from Pi amount paid, not client-supplied metadata
+        const piAmountPaid = parseFloat(piPayment.amount || paymentRecord.rows[0].amount || 0);
+        const amount = piAmountPaid > 0 ? Math.floor(piAmountPaid * 10) : parseInt(meta.connects_amount || 10);
         await query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [amount, paymentOwner]);
       } else if (meta.type === 'escrow' && meta.job_id && meta.freelancer_id) {
         // Create escrow record — hireFreelancer endpoint updates job status after this
@@ -1048,7 +1065,9 @@ app.post('/api/connects/purchase', auth, checkBlocked, async (req, res) => {
     );
     if (!payRec.rows.length) return res.status(400).json({ error: 'Payment not found' });
     if (payRec.rows[0].user_id !== req.userId) return res.status(403).json({ error: 'Payment does not belong to you' });
+    // Must be in 'approved' state — not yet processed, but verified by Pi
     if (payRec.rows[0].status === 'completed') return res.status(400).json({ error: 'Payment already processed' });
+    if (payRec.rows[0].status !== 'approved') return res.status(400).json({ error: 'Payment not approved by Pi yet' });
 
     await query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [connectsAmount, req.userId]);
     await query("UPDATE payments SET status = 'completed', updated_at = NOW() WHERE id = $1", [payment_id]);
@@ -1092,10 +1111,33 @@ app.post('/api/ratings', auth, checkBlocked, async (req, res) => {
     const avgResult = await query('SELECT AVG(rating) as avg FROM ratings WHERE to_user_id = $1', [to_user_id]);
     const newAvg = Math.round(parseFloat(avgResult.rows[0].avg) * 10) / 10;
     await query('UPDATE users SET rating = $1, updated_at = NOW() WHERE id = $2', [newAvg, to_user_id]);
+    await notify(to_user_id, 'payment', 'Новый отзыв', `Вы получили оценку ${rating}/5. Средний рейтинг: ${newAvg}`, job_id || null, null);
     res.json({ rating: result.rows[0], success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// ─── Level System ──────────────────────────────────────────────
+// Levels: Новичок (0) → Восходящий (3+jobs, 4.0+) → Профи (10+jobs, 4.3+) → Эксперт (25+jobs, 4.5+) → Легенда (50+jobs, 4.7+)
+function computeLevel(completedJobs, rating) {
+  const r = parseFloat(rating) || 0;
+  const j = parseInt(completedJobs) || 0;
+  if (j >= 50 && r >= 4.7) return { level: 5, title: 'Легенда', emoji: '🏆', nextJobs: null, nextRating: null };
+  if (j >= 25 && r >= 4.5) return { level: 4, title: 'Эксперт', emoji: '💎', nextJobs: 50, nextRating: 4.7 };
+  if (j >= 10 && r >= 4.3) return { level: 3, title: 'Профи', emoji: '🥇', nextJobs: 25, nextRating: 4.5 };
+  if (j >= 3 && r >= 4.0) return { level: 2, title: 'Восходящий талант', emoji: '⭐', nextJobs: 10, nextRating: 4.3 };
+  return { level: 1, title: 'Новичок', emoji: '🌱', nextJobs: 3, nextRating: 4.0 };
+}
+
+app.get('/api/users/:id/level', async (req, res) => {
+  try {
+    const result = await query('SELECT total_jobs_completed, rating FROM users WHERE id = $1', [req.params.id]);
+    if (!result.rows.length) return res.status(404).json({ error: 'User not found' });
+    const u = result.rows[0];
+    const levelInfo = computeLevel(u.total_jobs_completed, u.rating);
+    res.json({ ...levelInfo, completed_jobs: u.total_jobs_completed, rating: u.rating });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ─── Admin ──────────────────────────────────────────────

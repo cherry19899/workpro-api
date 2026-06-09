@@ -8,7 +8,7 @@ services:
       - key: NODE_ENV
         value: production
       - key: PI_API_KEY
-        value: nzfwvq0xw4ep2mvlallq9baoyc1jjywvke8bz7trwpxfzgiafgobmjbeanlebs4j
+        sync: false  # Set via Render dashboard — never commit API keys to git
       - key: FRONTEND_URL
         value: https://cherry19899.github.io
       - key: DATABASE_URL
