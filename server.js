@@ -14,10 +14,15 @@ const fetch = require('node-fetch');
 const { query, initDb, getPool } = require('./db');
 
 const app = express();
+// Render sits behind a proxy — needed so req.ip reflects the real client for rate limiting
+app.set('trust proxy', 1);
 const PORT = process.env.PORT || 3000;
 const NODE_ENV = process.env.NODE_ENV || 'production';
 const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(64).toString('hex');
 const ADMIN_API_KEY = process.env.ADMIN_API_KEY || 'admin-secret-key';
+if (ADMIN_API_KEY === 'admin-secret-key') {
+  console.warn('[SECURITY] ADMIN_API_KEY is the default value — set a strong ADMIN_API_KEY env var, otherwise the admin panel is publicly accessible.');
+}
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://cherry19899.github.io';
 const PI_API_KEY = process.env.PI_API_KEY || '';
 const PI_API_BASE = 'https://api.minepi.com';
@@ -53,12 +58,14 @@ const adminLimiter = rateLimit({
 // Strict limiter for connects/payments to prevent abuse
 const connectsLimiter = rateLimit({
   windowMs: 60 * 60 * 1000, max: 20,
-  keyGenerator: (req) => req.headers['x-user-id'] || req.ip || 'unknown',
+  // Key by IP, NOT x-user-id — the user header is client-controlled and trivially rotated to bypass the cap
+  keyGenerator: (req) => req.ip || req.headers['x-forwarded-for'] || 'unknown',
   message: { error: 'Too many connect operations, try again later' },
 });
 app.use('/api/auth', authLimiter);
 app.use('/api/admin', adminLimiter);
 app.use('/api/connects/purchase', connectsLimiter);
+app.use('/api/connects/buy', connectsLimiter);
 app.use('/api/payments', connectsLimiter);
 
 // ─── Helpers ──────────────────────────────────────────────
@@ -174,23 +181,21 @@ function softAuth(req, res, next) {
 }
 
 async function adminAuth(req, res, next) {
-  // Accept x-user-id header OR ?_uid= query param (Pi Browser WebView compat)
-  let userId = req.headers['x-user-id'];
-  if (!userId && req.query._uid) userId = req.query._uid;
-  if (!userId && req.query.user_id) userId = req.query.user_id;
+  // SECURITY: the x-user-id header is client-controlled — anyone could send the owner's
+  // id and pass a DB role check. Admin access therefore REQUIRES the shared ADMIN_API_KEY
+  // secret, sent as `x-admin-key`, `Authorization: Bearer <key>`, or `?admin_key=`.
+  // The frontend admin panel attaches it from localStorage.workpro_admin_token.
+  let key = req.headers['x-admin-key'] || req.headers['authorization'] || req.query.admin_key || '';
+  if (typeof key === 'string' && key.startsWith('Bearer ')) key = key.slice(7);
+  if (!key || key !== ADMIN_API_KEY) {
+    return res.status(403).json({ error: 'Admin access required' });
+  }
+  // Resolve acting user id for audit logging only — the secret is what authorizes.
+  let userId = req.headers['x-user-id'] || req.query._uid || req.query.user_id || null;
   if (userId === 'cherry19899') userId = 'pi_cherry19899';
-  if (!userId) return res.status(403).json({ error: 'Admin access required' });
-
-  // SECURITY: Never trust username headers for admin access — always verify role in DB
-  try {
-    const result = await query('SELECT role FROM users WHERE id = $1', [userId]);
-    const user = result.rows[0];
-    if (user?.role === 'admin') {
-      req.isAdmin = true;
-      return next();
-    }
-  } catch (_) {}
-  return res.status(403).json({ error: 'Admin access required' });
+  req.userId = userId;
+  req.isAdmin = true;
+  return next();
 }
 
 async function checkBlocked(req, res, next) {
@@ -1051,16 +1056,12 @@ app.get('/api/connects/balance', auth, async (req, res) => {
 
 app.post('/api/connects/purchase', auth, checkBlocked, async (req, res) => {
   // Called after Pi payment is completed for connects — must supply a verified payment_id
-  const { amount, payment_id } = req.body;
+  const { payment_id } = req.body;
   if (!payment_id) return res.status(400).json({ error: 'payment_id required' });
-  const connectsAmount = parseInt(amount || 10);
-  if (isNaN(connectsAmount) || connectsAmount <= 0 || connectsAmount > 1000) {
-    return res.status(400).json({ error: 'Invalid connects amount' });
-  }
   try {
     // Verify this payment_id exists in our DB and belongs to caller (set during approve step)
     const payRec = await query(
-      "SELECT id, user_id, status, metadata FROM payments WHERE id = $1",
+      "SELECT id, user_id, status, amount FROM payments WHERE id = $1",
       [payment_id]
     );
     if (!payRec.rows.length) return res.status(400).json({ error: 'Payment not found' });
@@ -1068,6 +1069,14 @@ app.post('/api/connects/purchase', auth, checkBlocked, async (req, res) => {
     // Must be in 'approved' state — not yet processed, but verified by Pi
     if (payRec.rows[0].status === 'completed') return res.status(400).json({ error: 'Payment already processed' });
     if (payRec.rows[0].status !== 'approved') return res.status(400).json({ error: 'Payment not approved by Pi yet' });
+
+    // Connects credited strictly from the Pi-verified amount recorded at approve time
+    // (10 connects per 1 Pi) — never from a client-supplied number.
+    const piAmount = parseFloat(payRec.rows[0].amount || 0);
+    const connectsAmount = Math.floor(piAmount * 10);
+    if (!(connectsAmount > 0)) {
+      return res.status(400).json({ error: 'Payment amount too small to credit any connects' });
+    }
 
     await query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [connectsAmount, req.userId]);
     await query("UPDATE payments SET status = 'completed', updated_at = NOW() WHERE id = $1", [payment_id]);
@@ -1965,20 +1974,23 @@ app.post('/api/payments/approve', auth, async (req, res) => {
   const { payment_id, metadata } = req.body;
   if (!payment_id) return res.status(400).json({ error: 'payment_id required' });
   try {
-    // Call Pi Platform API to approve (non-fatal if unavailable)
+    // Pi verification is mandatory when configured. piApprovePayment throws on a
+    // non-OK Pi response (e.g. payment_not_found), so a forged payment id can never
+    // be recorded as 'approved' — which would otherwise let it be redeemed for connects.
     let approveData = { amount: 0 };
-    try {
-      const approveRes = await fetch(`https://api.minepi.com/v2/payments/${payment_id}/approve`, {
-        method: 'POST',
-        headers: { 'Authorization': `Key ${process.env.PI_API_KEY}`, 'Content-Type': 'application/json' }
-      });
-      approveData = await approveRes.json();
-    } catch (_) {}
-    // Record in DB using id as primary key (UPSERT)
+    if (PI_API_KEY) {
+      try {
+        approveData = await piApprovePayment(payment_id);
+      } catch (piErr) {
+        console.error('[Payment] approve failed:', piErr.message);
+        return res.status(502).json({ error: 'Pi payment verification failed' });
+      }
+    }
+    // Record in DB using id as primary key (UPSERT). Store the Pi-verified amount.
     await query(
       `INSERT INTO payments (id, user_id, amount, status, metadata, payment_id)
        VALUES ($1,$2,$3,'approved',$4,$5)
-       ON CONFLICT (id) DO UPDATE SET status='approved', updated_at=NOW()`,
+       ON CONFLICT (id) DO UPDATE SET status='approved', amount=EXCLUDED.amount, updated_at=NOW()`,
       [payment_id, req.userId, approveData.amount || 0, JSON.stringify(metadata || {}), payment_id]
     ).catch(() => {});
     res.json({ success: true, payment: approveData });
@@ -2008,16 +2020,16 @@ app.post('/api/payments/complete', auth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// POST /api/connects/buy — alias for connects/purchase, called from Connects.js and bundle
+// POST /api/connects/buy — credit connects ONLY after a Pi-verified payment.
+// Connects are minted server-side strictly from the amount Pi confirms was paid —
+// never from a client-supplied quantity, and never without a verified payment.
 app.post('/api/connects/buy', auth, checkBlocked, async (req, res) => {
-  // Support both Connects.js format (quantity) and bundle format (package_amount)
-  const quantity = req.body.quantity || req.body.package_amount;
-  const { payment_id, txid, amount, status, pi_amount, user_id } = req.body;
-  if (!quantity) return res.status(400).json({ error: 'quantity required' });
+  const { payment_id, txid, amount, status } = req.body;
 
-  // If this is a pending (approval) call, just record and return
+  // Approval / pending step: record intent only. NEVER credit connects here.
   if (status === 'pending') {
     const pid = payment_id || ('connects_' + req.userId + '_' + Date.now());
+    const quantity = parseInt(req.body.quantity || req.body.package_amount) || 0;
     await query(
       `INSERT INTO payments (id, user_id, payment_id, amount, status, metadata)
        VALUES ($1,$2,$3,$4,'pending',$5)
@@ -2027,28 +2039,64 @@ app.post('/api/connects/buy', auth, checkBlocked, async (req, res) => {
     return res.json({ success: true, status: 'pending' });
   }
 
-  // Completed — add connects
+  // Completion step: a real Pi payment (payment_id + txid) is mandatory.
+  if (!payment_id || !txid) {
+    return res.status(400).json({ error: 'payment_id and txid required to credit connects' });
+  }
+  if (!PI_API_KEY) {
+    return res.status(503).json({ error: 'Payments are not configured on the server' });
+  }
   try {
-    if (payment_id && txid) {
-      // Approve + complete with Pi
-      await fetch(`https://api.minepi.com/v2/payments/${payment_id}/approve`, {
-        method: 'POST',
-        headers: { 'Authorization': `Key ${process.env.PI_API_KEY}` }
-      }).catch(() => {});
-      await fetch(`https://api.minepi.com/v2/payments/${payment_id}/complete`, {
-        method: 'POST',
-        headers: { 'Authorization': `Key ${process.env.PI_API_KEY}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ txid })
-      }).catch(() => {});
+    // Reject if this payment was already credited, or belongs to someone else
+    const payRec = await query('SELECT id, user_id, status FROM payments WHERE id = $1', [payment_id]);
+    if (payRec.rows.length) {
+      if (payRec.rows[0].user_id && payRec.rows[0].user_id !== req.userId) {
+        return res.status(403).json({ error: 'Payment does not belong to you' });
+      }
+      if (payRec.rows[0].status === 'completed') {
+        return res.status(400).json({ error: 'Payment already processed' });
+      }
     }
-    await query(
-      'UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2',
-      [parseInt(quantity), req.userId]
-    );
+
+    // Verify with Pi Platform — approve then complete. Throw (→ 502) on any failure
+    // so a forged/unpaid payment id can never reach the credit step.
+    let piPayment;
+    try {
+      await piApprovePayment(payment_id).catch(() => {}); // may already be approved
+      piPayment = await piCompletePayment(payment_id, txid);
+    } catch (piErr) {
+      console.error('[Connects] Pi verification failed:', piErr.message);
+      return res.status(502).json({ error: 'Pi payment verification failed' });
+    }
+
+    // Credit is derived ONLY from the Pi-confirmed amount (10 connects per 1 Pi).
+    const piAmount = parseFloat(piPayment.amount || 0);
+    const credited = Math.floor(piAmount * 10);
+    if (!(credited > 0)) {
+      return res.status(400).json({ error: 'Payment amount too small to credit any connects' });
+    }
+
+    // Atomic: mark payment completed + credit connects (idempotent on payment id)
+    const pgClient = await getPool().connect();
+    try {
+      await pgClient.query('BEGIN');
+      await pgClient.query(
+        `INSERT INTO payments (id, user_id, payment_id, amount, status, txid, metadata)
+         VALUES ($1,$2,$1,$3,'completed',$4,$5)
+         ON CONFLICT (id) DO UPDATE SET status='completed', txid=$4, amount=$3, updated_at=NOW()`,
+        [payment_id, req.userId, piAmount, txid, JSON.stringify({ type: 'connects', credited })]
+      );
+      await pgClient.query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [credited, req.userId]);
+      await pgClient.query('COMMIT');
+    } catch (txErr) {
+      await pgClient.query('ROLLBACK').catch(() => {});
+      throw txErr;
+    } finally { pgClient.release(); }
+
     const result = await query('SELECT balance_connects FROM users WHERE id = $1', [req.userId]);
     const balance = result.rows[0]?.balance_connects || 0;
-    await audit('connects_purchased', { user_id: req.userId, quantity, payment_id });
-    res.json({ success: true, balance, balance_connects: balance, new_balance: balance, remaining_connects: balance });
+    await audit('connects_purchased', { user_id: req.userId, credited, payment_id, txid });
+    res.json({ success: true, credited, balance, balance_connects: balance, new_balance: balance, remaining_connects: balance });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
