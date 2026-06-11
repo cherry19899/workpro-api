@@ -600,7 +600,7 @@ app.get('/api/jobs/:id', async (req, res) => {
   }
 });
 
-app.patch('/api/jobs/:id', auth, async (req, res) => {
+app.patch('/api/jobs/:id', auth, checkBlocked, async (req, res) => {
   try {
     const jobResult = await query('SELECT * FROM jobs WHERE id = $1', [req.params.id]);
     if (!jobResult.rows.length) return res.status(404).json({ error: 'Job not found' });
@@ -749,8 +749,10 @@ app.post('/api/jobs/:id/complete', auth, checkBlocked, async (req, res) => {
     }
     await audit('job_completed', { job_id: req.params.id, paid: paidAmount });
     if (job.hired_freelancer_id) {
-      await notify(job.hired_freelancer_id, 'completed', `Задача "${job.title}" принята`,
-        `Заказчик принял работу. Зачислено ${paidAmount}π на ваш счёт.`, parseInt(req.params.id), null);
+      const payMsg = paidAmount > 0
+        ? `Заказчик принял работу. Зачислено ${paidAmount}π на ваш счёт.`
+        : 'Заказчик принял работу. Оплата была согласована отдельно.';
+      await notify(job.hired_freelancer_id, 'completed', `Задача "${job.title}" принята`, payMsg, parseInt(req.params.id), null);
     }
     res.json({ success: true, paid: paidAmount });
   } catch (err) {
@@ -758,7 +760,7 @@ app.post('/api/jobs/:id/complete', auth, checkBlocked, async (req, res) => {
   }
 });
 
-app.delete('/api/jobs/:id', auth, async (req, res) => {
+app.delete('/api/jobs/:id', auth, checkBlocked, async (req, res) => {
   try {
     const jobResult = await query('SELECT * FROM jobs WHERE id = $1', [req.params.id]);
     if (!jobResult.rows.length) return res.status(404).json({ error: 'Job not found' });
@@ -1120,7 +1122,7 @@ app.post('/api/ratings', auth, checkBlocked, async (req, res) => {
     const avgResult = await query('SELECT AVG(rating) as avg FROM ratings WHERE to_user_id = $1', [to_user_id]);
     const newAvg = Math.round(parseFloat(avgResult.rows[0].avg) * 10) / 10;
     await query('UPDATE users SET rating = $1, updated_at = NOW() WHERE id = $2', [newAvg, to_user_id]);
-    await notify(to_user_id, 'payment', 'Новый отзыв', `Вы получили оценку ${rating}/5. Средний рейтинг: ${newAvg}`, job_id || null, null);
+    await notify(to_user_id, 'rating', 'Новый отзыв', `Вы получили оценку ${rating}/5. Средний рейтинг: ${newAvg}`, job_id || null, null);
     res.json({ rating: result.rows[0], success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1428,8 +1430,8 @@ app.post('/api/chat/start', auth, checkBlocked, async (req, res) => {
   try {
     const jobId = job_id || 0;
     const existing = await query(
-      'SELECT * FROM chat_rooms WHERE (client_id = $1 AND freelancer_id = $2) OR (client_id = $2 AND freelancer_id = $1)',
-      [req.userId, other_user_id]
+      'SELECT * FROM chat_rooms WHERE job_id = $3 AND ((client_id = $1 AND freelancer_id = $2) OR (client_id = $2 AND freelancer_id = $1))',
+      [req.userId, other_user_id, jobId]
     );
     if (existing.rows.length) return res.json({ conversation: existing.rows[0], id: existing.rows[0].id });
     const roomId = 'room_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
@@ -1471,6 +1473,8 @@ app.post('/api/applications', auth, checkBlocked, async (req, res) => {
     } catch (txErr) { await pgClient.query('ROLLBACK').catch(() => {}); throw txErr; }
     finally { pgClient.release(); }
     await audit('job_applied', { job_id, user_id: req.userId });
+    await notify(job.posted_by, 'application', `Новый отклик на задачу "${job.title}"`,
+      `${user.username || 'Фрилансер'} откликнулся на вашу задачу`, parseInt(job_id), null);
     const newBal = (user.balance_connects || 0) - cost;
     res.json({ application: appResult.rows[0], success: true, remaining_connects: newBal, new_balance: newBal });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -1787,8 +1791,11 @@ app.get('/api/reviews', async (req, res) => {
 // GET /api/admin/jobs/all — alias for /api/admin/jobs
 app.get('/api/admin/jobs/all', adminAuth, async (req, res) => {
   try {
-    const result = await query('SELECT j.*, u.username as posted_by_name FROM jobs j LEFT JOIN users u ON u.id = j.posted_by ORDER BY j.created_at DESC');
-    res.json({ jobs: result.rows });
+    const limit = Math.min(parseInt(req.query.limit) || 200, 1000);
+    const offset = parseInt(req.query.offset) || 0;
+    const result = await query('SELECT j.*, u.username as posted_by_name FROM jobs j LEFT JOIN users u ON u.id = j.posted_by ORDER BY j.created_at DESC LIMIT $1 OFFSET $2', [limit, offset]);
+    const total = await query('SELECT COUNT(*) FROM jobs');
+    res.json({ jobs: result.rows, total: parseInt(total.rows[0].count), limit, offset });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -1803,7 +1810,8 @@ app.post('/api/escrow/:id/refund', auth, checkBlocked, async (req, res) => {
     if (escrow.client_id !== req.userId) return res.status(403).json({ error: 'Not your escrow' });
     if (escrow.status === 'released' || escrow.status === 'refunded') return res.status(400).json({ error: 'Already processed' });
     await query('UPDATE escrows SET status = $1, updated_at = NOW() WHERE id = $2', ['refunded', req.params.id]);
-    await query('UPDATE jobs SET status = $1, hired_freelancer_id = NULL, updated_at = NOW() WHERE id = $2', ['open', escrow.job_id]);
+    // Clear hired_freelancer_id so job returns to truly-open state
+    await query('UPDATE jobs SET status = $1, hired_freelancer_id = NULL, hired_freelancer_name = NULL, updated_at = NOW() WHERE id = $2', ['open', escrow.job_id]);
     // Return Pi to client if escrow was funded
     if (escrow.status === 'funded') {
       await query('UPDATE users SET balance_pi = COALESCE(balance_pi, 0) + $1, updated_at = NOW() WHERE id = $2', [escrow.amount, escrow.client_id]);
@@ -2143,21 +2151,6 @@ app.get('/api/escrows/user/:userId', auth, async (req, res) => {
       [userId]
     );
     res.json({ escrows: result.rows });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// GET /api/jobs/user/:userId — list jobs posted by a user (public)
-app.get('/api/jobs/user/:userId', async (req, res) => {
-  try {
-    const userId = req.params.userId;
-    const result = await query(
-      `SELECT j.*, u.username as client_username
-       FROM jobs j LEFT JOIN users u ON u.id = j.posted_by
-       WHERE j.posted_by = $1 OR LOWER(u.username) = LOWER($1)
-       ORDER BY j.created_at DESC`,
-      [userId]
-    );
-    res.json({ jobs: result.rows });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -2528,24 +2521,6 @@ app.get('/api/users/:id/connects', auth, async (req, res) => {
     const result = await query('SELECT balance_connects FROM users WHERE id = $1', [req.params.id]);
     res.json({ balance: result.rows[0]?.balance_connects || 0, connects: result.rows[0]?.balance_connects || 0 });
   } catch (err) { res.json({ balance: 0, connects: 0 }); }
-});
-
-// GET /api/reviews/stats/:userId — get review stats for a user (bundle calls this form)
-// Must come BEFORE /api/reviews/:userId wildcard below
-app.get('/api/reviews/stats/:userId', async (req, res) => {
-  try {
-    const userId = req.params.userId;
-    const [totalResult, avgResult, distResult] = await Promise.all([
-      query('SELECT COUNT(*) FROM ratings WHERE to_user_id = $1', [userId]),
-      query('SELECT AVG(rating) as avg FROM ratings WHERE to_user_id = $1', [userId]),
-      query('SELECT rating, COUNT(*) as count FROM ratings WHERE to_user_id = $1 GROUP BY rating ORDER BY rating DESC', [userId]),
-    ]);
-    const total = parseInt(totalResult.rows[0].count);
-    const avg = parseFloat(avgResult.rows[0].avg || 0).toFixed(1);
-    const distribution = {};
-    distResult.rows.forEach(r => { distribution[r.rating] = parseInt(r.count); });
-    res.json({ total, avg: parseFloat(avg), distribution, rating: parseFloat(avg) });
-  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // GET /api/reviews/:userId — list reviews for a user (bundle calls /api/reviews/${userId})
