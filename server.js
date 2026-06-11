@@ -545,7 +545,7 @@ app.get('/api/jobs/user/:userId', async (req, res) => {
     const result = await query(
       `SELECT j.*, u.username as client_username
        FROM jobs j LEFT JOIN users u ON u.id = j.posted_by
-       WHERE j.posted_by = $1
+       WHERE j.posted_by = $1 OR LOWER(u.username) = LOWER($1)
        ORDER BY j.created_at DESC`,
       [userId]
     );
@@ -2153,7 +2153,7 @@ app.get('/api/jobs/user/:userId', async (req, res) => {
     const result = await query(
       `SELECT j.*, u.username as client_username
        FROM jobs j LEFT JOIN users u ON u.id = j.posted_by
-       WHERE j.posted_by = $1
+       WHERE j.posted_by = $1 OR LOWER(u.username) = LOWER($1)
        ORDER BY j.created_at DESC`,
       [userId]
     );
