@@ -849,7 +849,7 @@ app.get('/api/chat/rooms/:id/messages', auth, async (req, res) => {
   try {
     const room = await query('SELECT * FROM chat_rooms WHERE id = $1 AND (client_id = $2 OR freelancer_id = $2)', [req.params.id, req.userId]);
     if (!room.rows.length) return res.status(403).json({ error: 'Forbidden' });
-    const result = await query('SELECT * FROM chat_messages WHERE room_id = $1 ORDER BY created_at ASC LIMIT 100', [req.params.id]);
+    const result = await query('SELECT * FROM chat_messages WHERE room_id = $1 ORDER BY created_at ASC LIMIT 200', [req.params.id]);
     res.json({ messages: result.rows });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -2535,16 +2535,32 @@ app.get('/api/reviews/:userId', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// POST /api/push/subscribe — Web Push notification subscription (stub)
-// Frontend registers push subscriptions here; stored for future push delivery
+// POST /api/push/subscribe — Web Push notification subscription
 app.post('/api/push/subscribe', softAuth, async (req, res) => {
-  // Store subscription endpoint for user if authenticated
   const { endpoint, keys } = req.body || {};
   if (req.userId && endpoint) {
     await query(
-      `UPDATE users SET updated_at = NOW() WHERE id = $1`,
-      [req.userId]
-    ).catch(() => {});
+      `INSERT INTO push_subscriptions (user_id, endpoint, keys, updated_at)
+       VALUES ($1, $2, $3, NOW())
+       ON CONFLICT (user_id) DO UPDATE SET endpoint=$2, keys=$3, updated_at=NOW()`,
+      [req.userId, endpoint, JSON.stringify(keys || {})]
+    ).catch(() => {
+      // Table may not exist yet — create it and retry
+      query(`CREATE TABLE IF NOT EXISTS push_subscriptions (
+        id SERIAL PRIMARY KEY,
+        user_id TEXT UNIQUE NOT NULL,
+        endpoint TEXT NOT NULL,
+        keys JSONB,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )`).then(() =>
+        query(
+          `INSERT INTO push_subscriptions (user_id, endpoint, keys, updated_at)
+           VALUES ($1, $2, $3, NOW())
+           ON CONFLICT (user_id) DO UPDATE SET endpoint=$2, keys=$3, updated_at=NOW()`,
+          [req.userId, endpoint, JSON.stringify(keys || {})]
+        )
+      ).catch(() => {});
+    });
   }
   res.json({ success: true });
 });
