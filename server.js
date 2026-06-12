@@ -291,6 +291,7 @@ app.get('/api/me', auth, async (req, res) => {
 app.post('/api/me', async (req, res) => {
   const { uid, username, accessToken } = req.body;
   if (!uid) return res.status(400).json({ error: 'uid required' });
+  if (username && username.length > 50) return res.status(400).json({ error: 'Username too long (max 50)' });
   try {
     // Verify Pi accessToken when provided; for new accounts it is required
     if (accessToken) {
@@ -355,6 +356,7 @@ app.post('/api/me', async (req, res) => {
 app.post('/api/auth/login', async (req, res) => {
   const { userId, username, accessToken } = req.body;
   if (!userId) return res.status(400).json({ error: 'userId required' });
+  if (username && username.length > 50) return res.status(400).json({ error: 'Username too long (max 50)' });
 
   try {
     // accessToken is required to create or authenticate any account
