@@ -333,8 +333,10 @@ app.post('/api/me', async (req, res) => {
       try {
         const piUser = await piApiRequest('/v2/me', 'GET', null, accessToken);
         const piUid = piUser && (piUser.uid || piUser.username);
-        const normalizedPiUid = piUid && (piUid.startsWith('pi_') ? piUid : 'pi_' + piUid);
-        if (normalizedPiUid && normalizedPiUid !== uid && piUid !== uid) {
+        // Require Pi to return a uid — a response with no uid bypasses verification otherwise
+        if (!piUid) return res.status(403).json({ error: 'Pi identity verification failed: no uid returned' });
+        const normalizedPiUid = piUid.startsWith('pi_') ? piUid : 'pi_' + piUid;
+        if (normalizedPiUid !== uid && piUid !== uid) {
           return res.status(403).json({ error: 'Token does not match uid' });
         }
       } catch (e) {
@@ -402,8 +404,10 @@ app.post('/api/auth/login', async (req, res) => {
       }
       // Verify the token belongs to the claimed userId
       const piUid = piUser && (piUser.uid || piUser.username);
-      const normalizedPiUid = piUid && (piUid.startsWith('pi_') ? piUid : 'pi_' + piUid);
-      if (normalizedPiUid && normalizedPiUid !== userId && piUid !== userId) {
+      // Require Pi to return a uid — a response with no uid bypasses verification otherwise
+      if (!piUid) return res.status(403).json({ error: 'Pi identity verification failed: no uid returned' });
+      const normalizedPiUid = piUid.startsWith('pi_') ? piUid : 'pi_' + piUid;
+      if (normalizedPiUid !== userId && piUid !== userId) {
         return res.status(403).json({ error: 'Token does not match userId' });
       }
     } else {
