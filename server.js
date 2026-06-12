@@ -124,6 +124,16 @@ async function ensureNotificationsTable() {
     await query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_applications_unique_apply ON applications(job_id, freelancer_id)`);
     // One-time migration: recalculate apply_cost for jobs still at old default
     await query(`UPDATE jobs SET apply_cost = CEIL(budget::numeric / 50.0)::int, connects_spent = CEIL(budget::numeric / 50.0)::int WHERE CEIL(budget::numeric / 50.0)::int != apply_cost`).catch((e) => console.error('[Migration] apply_cost fix error:', e.message));
+    await query(`CREATE TABLE IF NOT EXISTS portfolios (
+      id SERIAL PRIMARY KEY, user_id VARCHAR(255) UNIQUE, headline TEXT, summary TEXT,
+      experience_years INTEGER DEFAULT 0, website TEXT, github TEXT, linkedin TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`);
+    await query(`CREATE TABLE IF NOT EXISTS portfolio_items (
+      id SERIAL PRIMARY KEY, user_id VARCHAR(255), title VARCHAR(500) NOT NULL,
+      description TEXT, image_url TEXT, category VARCHAR(100), tags TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`);
   } catch (_) {}
 }
 
@@ -2163,11 +2173,6 @@ app.put('/api/users/me/portfolio', auth, checkBlocked, async (req, res) => {
     return res.status(400).json({ error: 'experience_years must be 0–60' });
   }
   try {
-    await query(`CREATE TABLE IF NOT EXISTS portfolios (
-      id SERIAL PRIMARY KEY, user_id VARCHAR(255) UNIQUE, headline TEXT, summary TEXT,
-      experience_years INTEGER DEFAULT 0, website TEXT, github TEXT, linkedin TEXT,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )`).catch(() => {});
     await query(
       `INSERT INTO portfolios (user_id, headline, summary, experience_years, website, github, linkedin)
        VALUES ($1,$2,$3,$4,$5,$6,$7)
@@ -2190,11 +2195,6 @@ app.post('/api/users/me/portfolio/items', auth, checkBlocked, async (req, res) =
   if (tagsRaw.length > 500) return res.status(400).json({ error: 'Tags too long (max 500 chars combined)' });
   if (finalUrl && !/^https?:\/\//i.test(finalUrl)) return res.status(400).json({ error: 'URL must start with http:// or https://' });
   try {
-    await query(`CREATE TABLE IF NOT EXISTS portfolio_items (
-      id SERIAL PRIMARY KEY, user_id VARCHAR(255), title VARCHAR(500) NOT NULL,
-      description TEXT, image_url TEXT, category VARCHAR(100), tags TEXT,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )`).catch(() => {});
     const result = await query(
       'INSERT INTO portfolio_items (user_id, title, description, image_url, category, tags) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *',
       [req.userId, title, description || '', finalUrl, category || 'Other', tagsRaw]
