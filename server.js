@@ -1203,11 +1203,31 @@ app.post('/api/connects/purchase', auth, checkBlocked, async (req, res) => {
       return res.status(400).json({ error: 'Payment amount too small to credit any connects' });
     }
 
-    await query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [connectsAmount, req.userId]);
-    await query("UPDATE payments SET status = 'completed', updated_at = NOW() WHERE id = $1", [payment_id]);
-    const result = await query('SELECT balance_connects FROM users WHERE id = $1', [req.userId]);
+    // Atomic: mark payment completed and credit connects; idempotent via UPDATE WHERE status='approved'
+    const pgClient2 = await getPool().connect();
+    let newBalance;
+    try {
+      await pgClient2.query('BEGIN');
+      const updated = await pgClient2.query(
+        "UPDATE payments SET status = 'completed', updated_at = NOW() WHERE id = $1 AND status = 'approved' RETURNING id",
+        [payment_id]
+      );
+      if (!updated.rows.length) {
+        await pgClient2.query('ROLLBACK');
+        return res.status(400).json({ error: 'Payment already processed' });
+      }
+      const balRes = await pgClient2.query(
+        'UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2 RETURNING balance_connects',
+        [connectsAmount, req.userId]
+      );
+      newBalance = balRes.rows[0]?.balance_connects || 0;
+      await pgClient2.query('COMMIT');
+    } catch (txErr) {
+      await pgClient2.query('ROLLBACK').catch(() => {});
+      throw txErr;
+    } finally { pgClient2.release(); }
     await audit('connects_purchased', { user_id: req.userId, amount: connectsAmount, payment_id });
-    res.json({ balance: result.rows[0].balance_connects, success: true });
+    res.json({ balance: newBalance, success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
