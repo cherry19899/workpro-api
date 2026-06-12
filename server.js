@@ -2500,6 +2500,7 @@ app.post('/api/offers', auth, checkBlocked, async (req, res) => {
     if (!jobRes.rows.length) return res.status(404).json({ error: 'Job not found' });
     const job = jobRes.rows[0];
     if (job.posted_by !== req.userId) return res.status(403).json({ error: 'Not your job' });
+    if (to_user_id === req.userId) return res.status(400).json({ error: 'Cannot send offer to yourself' });
     const freelancerRes = await query('SELECT id, username FROM users WHERE id = $1', [to_user_id]);
     if (!freelancerRes.rows.length) return res.status(404).json({ error: 'Freelancer not found' });
     const freelancer = freelancerRes.rows[0];
@@ -2853,11 +2854,30 @@ app.post('/api/payments/:paymentId/resolve-complete', auth, async (req, res) => 
       }
     }
 
-    // Mark as completed in our DB
+    // Mark as completed in our DB (idempotent)
     await query(
       `UPDATE payments SET status = 'completed', txid = COALESCE($1, txid), updated_at = NOW() WHERE id = $2`,
       [txid, paymentId]
     ).catch(() => {});
+
+    // Run the same business logic as /complete to avoid stale credited connects or escrow
+    const paymentRecord = await query('SELECT * FROM payments WHERE id = $1', [paymentId]).catch(() => ({ rows: [] }));
+    if (paymentRecord.rows.length) {
+      const meta = paymentRecord.rows[0].metadata || {};
+      const paymentOwner = paymentRecord.rows[0].user_id || req.userId;
+      if (meta.type === 'connects') {
+        const piAmountPaid = parseFloat(txid ? (paymentRecord.rows[0].amount || 0) : 0);
+        const amount = Math.floor(piAmountPaid * 10);
+        if (amount > 0) {
+          await query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [amount, paymentOwner]).catch(() => {});
+        }
+      } else if (meta.type === 'escrow' && meta.job_id && meta.freelancer_id) {
+        await query(
+          'INSERT INTO escrows (job_id, client_id, freelancer_id, amount, payment_id, status) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING',
+          [meta.job_id, paymentOwner, meta.freelancer_id, paymentRecord.rows[0].amount || meta.amount || 0, paymentId, 'funded']
+        ).catch(() => {});
+      }
+    }
 
     res.json({ success: true, resolved: true, txid });
   } catch (err) { res.json({ success: true, resolved: false }); }
