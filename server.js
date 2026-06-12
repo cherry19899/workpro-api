@@ -512,7 +512,10 @@ app.post('/api/users/:id', auth, checkBlocked, async (req, res) => {
   const { username, email, bio, skills, availability, avatar } = req.body;
   if (username && username.length > 50) return res.status(400).json({ error: 'Username too long (max 50)' });
   if (bio && bio.length > 1000) return res.status(400).json({ error: 'Bio too long (max 1000)' });
+  if (skills && skills.length > 300) return res.status(400).json({ error: 'Skills too long (max 300)' });
   if (email && (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))) return res.status(400).json({ error: 'Invalid email address' });
+  const ALLOWED_AVAILABILITY = ['available', 'busy', 'away', 'unavailable'];
+  if (availability && !ALLOWED_AVAILABILITY.includes(availability)) return res.status(400).json({ error: 'Invalid availability value' });
   // Limit base64 avatar to 2MB to prevent DoS
   if (avatar && avatar.length > 2 * 1024 * 1024 * 1.37) {
     return res.status(400).json({ error: 'Фото слишком большое (макс. 2MB)' });
