@@ -1395,7 +1395,7 @@ app.post('/api/ratings', auth, checkBlocked, async (req, res) => {
   if (to_user_id === req.userId) return res.status(400).json({ error: 'Cannot rate yourself' });
   if (comment && comment.length > 1000) return res.status(400).json({ error: 'Comment too long (max 1000)' });
   try {
-    // Verify rater was a participant in this job
+    // Verify rater was a participant in a completed job with this user
     if (job_id) {
       const jobCheck = await query('SELECT posted_by, hired_freelancer_id, status FROM jobs WHERE id = $1', [job_id]);
       if (jobCheck.rows.length) {
@@ -1404,6 +1404,15 @@ app.post('/api/ratings', auth, checkBlocked, async (req, res) => {
         if (!isParticipant) return res.status(403).json({ error: 'You were not a participant in this job' });
         if (job.status !== 'completed') return res.status(400).json({ error: 'Job must be completed before rating' });
       }
+    } else {
+      // No job_id provided — verify they share at least one completed job
+      const sharedJob = await query(
+        `SELECT id FROM jobs WHERE status='completed' AND (
+          (posted_by=$1 AND hired_freelancer_id=$2) OR (posted_by=$2 AND hired_freelancer_id=$1)
+        ) LIMIT 1`,
+        [req.userId, to_user_id]
+      );
+      if (!sharedJob.rows.length) return res.status(403).json({ error: 'You have no completed job with this user' });
     }
     // Use IS NOT DISTINCT FROM to handle NULL job_id correctly (NULL = NULL is false in SQL)
     const existing = await query(
@@ -2155,7 +2164,7 @@ app.post('/api/reviews', auth, checkBlocked, async (req, res) => {
   if (toId === req.userId) return res.status(400).json({ error: 'Cannot rate yourself' });
   if (reviewComment.length > 1000) return res.status(400).json({ error: 'Comment too long (max 1000)' });
   try {
-    // Verify rater was a participant in this job (same guard as /api/ratings)
+    // Verify rater was a participant in a completed job with this user
     if (job_id) {
       const jobCheck = await query('SELECT posted_by, hired_freelancer_id, status FROM jobs WHERE id = $1', [job_id]);
       if (jobCheck.rows.length) {
@@ -2164,6 +2173,14 @@ app.post('/api/reviews', auth, checkBlocked, async (req, res) => {
         if (!isParticipant) return res.status(403).json({ error: 'You were not a participant in this job' });
         if (job.status !== 'completed') return res.status(400).json({ error: 'Job must be completed before rating' });
       }
+    } else {
+      const sharedJob = await query(
+        `SELECT id FROM jobs WHERE status='completed' AND (
+          (posted_by=$1 AND hired_freelancer_id=$2) OR (posted_by=$2 AND hired_freelancer_id=$1)
+        ) LIMIT 1`,
+        [req.userId, toId]
+      );
+      if (!sharedJob.rows.length) return res.status(403).json({ error: 'You have no completed job with this user' });
     }
     // IS NOT DISTINCT FROM handles NULL job_id correctly
     const existing = await query(
