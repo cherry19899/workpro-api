@@ -63,6 +63,7 @@ const connectsLimiter = rateLimit({
   message: { error: 'Too many connect operations, try again later' },
 });
 app.use('/api/auth', authLimiter);
+app.use('/api/me', authLimiter); // POST /api/me is a login endpoint — same rate limit
 app.use('/api/admin', adminLimiter);
 app.use('/api/connects/purchase', connectsLimiter);
 app.use('/api/connects/buy', connectsLimiter);
