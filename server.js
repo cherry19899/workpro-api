@@ -2242,15 +2242,15 @@ app.post('/api/escrow/:id/refund', auth, checkBlocked, async (req, res) => {
     if (!result.rows.length) return res.status(404).json({ error: 'Escrow not found' });
     const escrow = result.rows[0];
     if (escrow.client_id !== req.userId) return res.status(403).json({ error: 'Not your escrow' });
-    if (escrow.status === 'released' || escrow.status === 'refunded') return res.status(400).json({ error: 'Already processed' });
+    if (!['pending', 'funded'].includes(escrow.status)) return res.status(400).json({ error: 'Cannot refund escrow with status: ' + escrow.status });
     const wasFunded = escrow.status === 'funded';
-    // Atomic: update escrow WHERE not already released/refunded
+    // Atomic: update escrow WHERE pending|funded only (disputed/released/refunded are excluded)
     const pgClient7 = await getPool().connect();
     try {
       await pgClient7.query('BEGIN');
       const updated = await pgClient7.query(
-        "UPDATE escrows SET status='refunded', updated_at=NOW() WHERE id=$1 AND status NOT IN ('released','refunded') RETURNING id",
-        [req.params.id]
+        "UPDATE escrows SET status='refunded', updated_at=NOW() WHERE id=$1 AND status = ANY($2) RETURNING id",
+        [req.params.id, ['pending', 'funded']]
       );
       if (!updated.rows.length) { await pgClient7.query('ROLLBACK'); return res.status(400).json({ error: 'Already processed' }); }
       await pgClient7.query('UPDATE jobs SET status = $1, hired_freelancer_id = NULL, hired_freelancer_name = NULL, updated_at = NOW() WHERE id = $2', ['open', escrow.job_id]);
