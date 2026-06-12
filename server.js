@@ -50,30 +50,30 @@ app.use(rateLimit({
 // Stricter rate limits for sensitive endpoints (per IP)
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, max: 20,
-  keyGenerator: (req) => req.ip || req.headers['x-forwarded-for'] || 'unknown',
+  keyGenerator: (req) => req.ip || req.socket?.remoteAddress || 'unknown',
   message: { error: 'Too many auth attempts, try again later' },
 });
 const adminLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, max: 100,
-  keyGenerator: (req) => req.ip || req.headers['x-forwarded-for'] || 'unknown',
+  keyGenerator: (req) => req.ip || req.socket?.remoteAddress || 'unknown',
   message: { error: 'Too many admin requests' },
 });
 // Strict limiter for connects/payments to prevent abuse
 const connectsLimiter = rateLimit({
   windowMs: 60 * 60 * 1000, max: 20,
   // Key by IP, NOT x-user-id — the user header is client-controlled and trivially rotated to bypass the cap
-  keyGenerator: (req) => req.ip || req.headers['x-forwarded-for'] || 'unknown',
+  keyGenerator: (req) => req.ip || req.socket?.remoteAddress || 'unknown',
   message: { error: 'Too many connect operations, try again later' },
 });
 // Strict limiter for chat message sending — 30 messages per minute per IP
 const messageLimiter = rateLimit({
   windowMs: 60 * 1000, max: 30,
-  keyGenerator: (req) => req.ip || req.headers['x-forwarded-for'] || 'unknown',
+  keyGenerator: (req) => req.ip || req.socket?.remoteAddress || 'unknown',
   message: { error: 'Too many messages, slow down' },
 });
 const jobPostLimiter = rateLimit({
   windowMs: 60 * 60 * 1000, max: 10,
-  keyGenerator: (req) => req.ip || req.headers['x-forwarded-for'] || 'unknown',
+  keyGenerator: (req) => req.ip || req.socket?.remoteAddress || 'unknown',
   message: { error: 'Too many jobs posted, try again later' },
 });
 app.use('/api/auth', authLimiter);
