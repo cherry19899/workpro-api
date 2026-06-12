@@ -472,10 +472,10 @@ app.get('/api/users', softAuth, async (req, res) => {
     const offset = parseInt(req.query.offset) || 0;
     // Never expose role (hides who is admin) or any sensitive fields
     const result = await query(
-      'SELECT id, username, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, created_at FROM users ORDER BY created_at DESC LIMIT $1 OFFSET $2',
+      "SELECT id, username, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, created_at FROM users WHERE status != 'deleted' ORDER BY created_at DESC LIMIT $1 OFFSET $2",
       [limit, offset]
     );
-    const total = await query('SELECT COUNT(*) FROM users');
+    const total = await query("SELECT COUNT(*) FROM users WHERE status != 'deleted'");
     res.json({ users: result.rows, count: result.rowCount, total: parseInt(total.rows[0].count), limit, offset });
   } catch (err) {
     serverError(err, res);
@@ -2023,7 +2023,8 @@ app.put('/api/jobs/:id', auth, checkBlocked, async (req, res) => {
     if (!fields.length) return res.status(400).json({ error: 'Nothing to update' });
     fields.push(`updated_at=NOW()`);
     vals.push(req.params.id);
-    const result = await query(`UPDATE jobs SET ${fields.join(',')} WHERE id=$${i} RETURNING *`, vals);
+    const result = await query(`UPDATE jobs SET ${fields.join(',')} WHERE id=$${i} AND status='open' RETURNING *`, vals);
+    if (!result.rows.length) return res.status(400).json({ error: 'Job is no longer open and cannot be edited' });
     res.json({ job: parseJobRow(result.rows[0]), success: true });
   } catch (err) { serverError(err, res); }
 });
