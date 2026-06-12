@@ -365,9 +365,27 @@ app.post('/api/me', async (req, res) => {
     await audit('user_login', { user_id: uid });
     const u = user.rows[0];
     // Issue a real JWT instead of predictable dummy token
-    const token = jwt.sign({ id: uid, username: uname }, JWT_SECRET, { expiresIn: '7d' });
+    const token = jwt.sign({ id: uid, username: uname }, JWT_SECRET, { expiresIn: '30d' });
     res.json({ ...u, uid: u.id, is_admin: u.role === 'admin', token });
   } catch (err) { serverError(err, res); }
+});
+
+// POST /api/auth/refresh — exchange any JWT (including expired) for a fresh 30-day token
+// Verifies signature but ignores expiration; user must still exist in DB
+app.post('/api/auth/refresh', async (req, res) => {
+  const authHeader = req.headers['authorization'] || '';
+  if (!authHeader.startsWith('Bearer ')) return res.status(401).json({ error: 'Token required' });
+  const token = authHeader.slice(7);
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET, { ignoreExpiration: true });
+    const user = await query('SELECT id, username, role FROM users WHERE id = $1 LIMIT 1', [decoded.id]);
+    if (!user.rows.length) return res.status(401).json({ error: 'User not found' });
+    const u = user.rows[0];
+    const newToken = jwt.sign({ id: u.id, username: u.username }, JWT_SECRET, { expiresIn: '30d' });
+    res.json({ token: newToken, is_admin: u.role === 'admin' });
+  } catch (err) {
+    return res.status(401).json({ error: 'Invalid token' });
+  }
 });
 
 // ─── Auth ──────────────────────────────────────────────
@@ -418,7 +436,7 @@ app.post('/api/auth/login', async (req, res) => {
       await query('UPDATE users SET updated_at = NOW() WHERE id = $1', [uid]);
     }
 
-    const token = jwt.sign({ id: uid, username: uname }, JWT_SECRET, { expiresIn: '7d' });
+    const token = jwt.sign({ id: uid, username: uname }, JWT_SECRET, { expiresIn: '30d' });
     const user = await query('SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, is_blocked, status, created_at FROM users WHERE id = $1', [uid]);
     await audit('user_login', { user_id: uid });
     res.json({ token, user: { ...user.rows[0], payments_enabled: paymentsEnabled } });
