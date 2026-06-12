@@ -599,6 +599,8 @@ app.post('/api/jobs', auth, checkBlocked, jobPostLimiter, async (req, res) => {
   if (budgetNum > 10000) return res.status(400).json({ error: 'Budget cannot exceed 10000 Pi' });
   if (String(title).length > 200) return res.status(400).json({ error: 'Title too long (max 200 chars)' });
   if (String(description).length > 5000) return res.status(400).json({ error: 'Description too long (max 5000 chars)' });
+  if (images && Array.isArray(images) && images.length > 10) return res.status(400).json({ error: 'Too many images (max 10)' });
+  if (skills && String(skills).length > 500) return res.status(400).json({ error: 'Skills too long (max 500)' });
   const applyCost = Math.ceil(budgetNum / 50); // 1-50π→1, 51-100π→2, 101-150π→3, ...
   try {
     const userRes = await query('SELECT username FROM users WHERE id = $1', [req.userId]);
@@ -1831,9 +1833,15 @@ app.put('/api/jobs/:id', auth, async (req, res) => {
       fields.push(`apply_cost=$${i++}`); vals.push(newCost);
       fields.push(`connects_spent=$${i++}`); vals.push(newCost);
     }
-    if (skills !== undefined) { fields.push(`skills=$${i++}`); vals.push(skills); }
+    if (skills !== undefined) {
+      if (skills && String(skills).length > 500) return res.status(400).json({ error: 'Skills too long (max 500)' });
+      fields.push(`skills=$${i++}`); vals.push(skills);
+    }
     if (deadline !== undefined) { fields.push(`deadline=$${i++}`); vals.push(deadline || null); }
-    if (images !== undefined) { fields.push(`images=$${i++}`); vals.push(serializeImages(images)); }
+    if (images !== undefined) {
+      if (Array.isArray(images) && images.length > 10) return res.status(400).json({ error: 'Too many images (max 10)' });
+      fields.push(`images=$${i++}`); vals.push(serializeImages(images));
+    }
     if (!fields.length) return res.status(400).json({ error: 'Nothing to update' });
     fields.push(`updated_at=NOW()`);
     vals.push(req.params.id);
