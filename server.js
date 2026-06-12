@@ -1893,6 +1893,10 @@ app.post('/api/applications/:id/accept', auth, checkBlocked, async (req, res) =>
     if (!appResult.rows.length) return res.status(404).json({ error: 'Application not found' });
     const app_ = appResult.rows[0];
     if (app_.posted_by !== req.userId) return res.status(403).json({ error: 'Forbidden' });
+    const jobStatusCheck = await query('SELECT status FROM jobs WHERE id = $1', [app_.job_id]);
+    if (!jobStatusCheck.rows.length || ['completed', 'cancelled'].includes(jobStatusCheck.rows[0].status)) {
+      return res.status(400).json({ error: 'Cannot accept application — job is already completed or cancelled' });
+    }
 
     // Accept the application
     const result = await query('UPDATE applications SET status = $1 WHERE id = $2 RETURNING *', ['accepted', req.params.id]);
