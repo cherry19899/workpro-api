@@ -1732,7 +1732,7 @@ app.get('/api/applications/job/:jobId', auth, async (req, res) => {
 });
 
 // POST /api/applications/:id/accept — accept application + create escrow record
-app.post('/api/applications/:id/accept', auth, async (req, res) => {
+app.post('/api/applications/:id/accept', auth, checkBlocked, async (req, res) => {
   try {
     const appResult = await query(
       'SELECT a.*, j.posted_by, j.budget, j.title FROM applications a JOIN jobs j ON a.job_id = j.id WHERE a.id = $1',
@@ -1771,7 +1771,7 @@ app.post('/api/applications/:id/accept', auth, async (req, res) => {
 });
 
 // POST /api/applications/:id/reject — alias used by JobDetail.js
-app.post('/api/applications/:id/reject', auth, async (req, res) => {
+app.post('/api/applications/:id/reject', auth, checkBlocked, async (req, res) => {
   try {
     const appResult = await query('SELECT a.*, j.posted_by FROM applications a JOIN jobs j ON a.job_id = j.id WHERE a.id = $1', [req.params.id]);
     if (!appResult.rows.length) return res.status(404).json({ error: 'Application not found' });
@@ -1795,7 +1795,7 @@ app.post('/api/applications/:id/withdraw', auth, async (req, res) => {
 });
 
 // PUT /api/applications/:id/status — update application status (job owner only: accepted/rejected)
-app.put('/api/applications/:id/status', auth, async (req, res) => {
+app.put('/api/applications/:id/status', auth, checkBlocked, async (req, res) => {
   const { status } = req.body;
   const OWNER_ALLOWED = ['accepted', 'rejected'];
   if (!OWNER_ALLOWED.includes(status)) return res.status(400).json({ error: `Invalid status. Job owners may set: ${OWNER_ALLOWED.join(', ')}` });
@@ -1809,7 +1809,7 @@ app.put('/api/applications/:id/status', auth, async (req, res) => {
 });
 
 // PUT /api/jobs/:id — update job
-app.put('/api/jobs/:id', auth, async (req, res) => {
+app.put('/api/jobs/:id', auth, checkBlocked, async (req, res) => {
   // status is NOT accepted here — use dedicated endpoints (hire/complete/patch) for status transitions
   const { title, description, category, budget, skills, deadline, images } = req.body;
   try {
