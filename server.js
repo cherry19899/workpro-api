@@ -341,6 +341,8 @@ app.post('/api/me', async (req, res) => {
     // Migrate legacy 'cherry19899' records to 'pi_cherry19899' (idempotent, runs every login)
     if (uid === 'pi_cherry19899') {
       try {
+        // Canonical owner always gets admin role
+        await query(`UPDATE users SET role = 'admin' WHERE id = 'pi_cherry19899' AND role != 'admin'`).catch(() => {});
         const r1 = await query(`UPDATE jobs SET posted_by = 'pi_cherry19899' WHERE posted_by = 'cherry19899'`);
         const r2 = await query(`UPDATE applications SET freelancer_id = 'pi_cherry19899' WHERE freelancer_id = 'cherry19899'`);
         await query(`UPDATE escrows SET client_id = 'pi_cherry19899' WHERE client_id = 'cherry19899'`);
@@ -3191,6 +3193,8 @@ app.use((err, req, res, next) => {
 // ─── Start ──────────────────────────────────────────────
 initDb().then(async () => {
   await ensureNotificationsTable();
+  // Ensure the canonical owner always has admin role
+  await query(`UPDATE users SET role = 'admin' WHERE id = 'pi_cherry19899' AND role != 'admin'`).catch(() => {});
   app.listen(PORT, () => {
     console.log(`[WorkPro API] v3.1.0 on port ${PORT} (${NODE_ENV})`);
   });
