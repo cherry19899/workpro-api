@@ -1022,6 +1022,11 @@ app.post('/api/chat/rooms', auth, checkBlocked, async (req, res) => {
   const cId = req.userId; // always use authenticated user as client
   if (!freelancer_id || !job_id) return res.status(400).json({ error: 'freelancer_id and job_id required' });
   try {
+    // Validate target user exists
+    if (freelancer_id !== cId) {
+      const targetExists = await query('SELECT id FROM users WHERE id = $1 LIMIT 1', [freelancer_id]);
+      if (!targetExists.rows.length) return res.status(404).json({ error: 'User not found' });
+    }
     // Verify caller is actually involved in this job (poster or applicant/hired freelancer)
     const jobCheck = await query('SELECT posted_by, hired_freelancer_id FROM jobs WHERE id = $1', [job_id]);
     if (!jobCheck.rows.length) return res.status(404).json({ error: 'Job not found' });
@@ -2105,6 +2110,11 @@ app.post('/api/chat/conversations', auth, checkBlocked, async (req, res) => {
   const fId = freelancer_id || other_user_id;
   if (!fId || !job_id) return res.status(400).json({ error: 'freelancer_id and job_id required' });
   try {
+    // Validate target user exists
+    if (fId !== cId) {
+      const targetExists = await query('SELECT id FROM users WHERE id = $1 LIMIT 1', [fId]);
+      if (!targetExists.rows.length) return res.status(404).json({ error: 'User not found' });
+    }
     // Verify caller is actually involved in this job (poster or applicant/hired freelancer)
     const jobCheck = await query('SELECT posted_by, hired_freelancer_id FROM jobs WHERE id = $1', [job_id]);
     if (!jobCheck.rows.length) return res.status(404).json({ error: 'Job not found' });
