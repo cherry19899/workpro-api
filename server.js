@@ -2880,6 +2880,9 @@ app.post('/api/escrows/:id/dispute', auth, checkBlocked, async (req, res) => {
     if (escrow.client_id !== req.userId && escrow.freelancer_id !== req.userId) {
       return res.status(403).json({ error: 'Not your escrow' });
     }
+    if (!['funded', 'pending'].includes(escrow.status)) {
+      return res.status(400).json({ error: `Cannot dispute an escrow with status '${escrow.status}'` });
+    }
     await query('UPDATE escrows SET status = $1, updated_at = NOW() WHERE id = $2', ['disputed', req.params.id]);
     await audit('escrow_disputed', { escrow_id: req.params.id, reason, user_id: req.userId });
     // Notify the other party
