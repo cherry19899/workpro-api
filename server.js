@@ -282,6 +282,25 @@ app.post('/api/me', async (req, res) => {
   const { uid, username, accessToken } = req.body;
   if (!uid) return res.status(400).json({ error: 'uid required' });
   try {
+    // Verify Pi accessToken when provided; for new accounts it is required
+    if (accessToken) {
+      try {
+        const piUser = await piApiRequest('/v2/me', 'GET', null, accessToken);
+        const piUid = piUser && (piUser.uid || piUser.username);
+        const normalizedPiUid = piUid && (piUid.startsWith('pi_') ? piUid : 'pi_' + piUid);
+        if (normalizedPiUid && normalizedPiUid !== uid && piUid !== uid) {
+          return res.status(403).json({ error: 'Token does not match uid' });
+        }
+      } catch (e) {
+        return res.status(401).json({ error: 'Pi token verification failed. Please re-authenticate.' });
+      }
+    } else {
+      // No accessToken: only allow existing accounts (prevent account hijacking)
+      const existing = await query('SELECT id FROM users WHERE id = $1', [uid]);
+      if (!existing.rows.length) {
+        return res.status(401).json({ error: 'accessToken required for new account registration' });
+      }
+    }
     const uname = username || uid.replace(/^pi_/, '') || uid;
     // UPSERT: create or update user — role is never changed here (only via adminAuth-protected endpoints)
     await query(
@@ -328,13 +347,25 @@ app.post('/api/auth/login', async (req, res) => {
   if (!userId) return res.status(400).json({ error: 'userId required' });
 
   try {
-    // Verify with Pi Platform if accessToken provided
+    // accessToken is required to create or authenticate any account
     let piUser = null;
     if (accessToken) {
       try {
         piUser = await piApiRequest('/v2/me', 'GET', null, accessToken);
       } catch (e) {
-        // Non-fatal: proceed with provided data
+        return res.status(401).json({ error: 'Pi token verification failed. Please re-authenticate.' });
+      }
+      // Verify the token belongs to the claimed userId
+      const piUid = piUser && (piUser.uid || piUser.username);
+      const normalizedPiUid = piUid && (piUid.startsWith('pi_') ? piUid : 'pi_' + piUid);
+      if (normalizedPiUid && normalizedPiUid !== userId && piUid !== userId) {
+        return res.status(403).json({ error: 'Token does not match userId' });
+      }
+    } else {
+      // No accessToken: only allow if user already exists in DB (no new account creation without Pi token)
+      const existing = await query('SELECT id FROM users WHERE id = $1', [userId]);
+      if (!existing.rows.length) {
+        return res.status(401).json({ error: 'accessToken required for new account registration' });
       }
     }
 
@@ -395,8 +426,8 @@ app.get('/api/users', softAuth, async (req, res) => {
   }
 });
 
-app.get('/api/users/:id', async (req, res) => {
-  const callerId = req.headers['x-user-id'] || null;
+app.get('/api/users/:id', softAuth, async (req, res) => {
+  const callerId = req.userId || null;
   const userId = req.params.id === 'me' ? (callerId || '') : req.params.id;
   if (!userId) return res.status(401).json({ error: 'User ID required' });
   try {
