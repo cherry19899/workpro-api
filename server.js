@@ -1782,6 +1782,8 @@ app.post('/api/chat/start', auth, checkBlocked, async (req, res) => {
   const { other_user_id, job_id } = req.body;
   if (!other_user_id) return res.status(400).json({ error: 'other_user_id required' });
   try {
+    const otherExists = await query('SELECT id FROM users WHERE id = $1 LIMIT 1', [other_user_id]);
+    if (!otherExists.rows.length) return res.status(404).json({ error: 'User not found' });
     const jobId = job_id || 0;
     // For job-linked rooms: require caller to be owner or hired freelancer (same guard as /chat/rooms)
     if (jobId) {
@@ -2813,7 +2815,8 @@ app.post('/api/applications/:id/view', auth, async (req, res) => {
       'SELECT j.posted_by FROM applications a JOIN jobs j ON a.job_id = j.id WHERE a.id = $1',
       [req.params.id]
     );
-    if (appRes.rows.length && appRes.rows[0].posted_by !== req.userId) {
+    if (!appRes.rows.length) return res.status(404).json({ error: 'Application not found' });
+    if (appRes.rows[0].posted_by !== req.userId) {
       return res.status(403).json({ error: 'Forbidden' });
     }
     await query('UPDATE applications SET viewed = true, viewed_at = NOW() WHERE id = $1', [req.params.id]).catch(() => {});
