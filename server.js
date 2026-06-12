@@ -244,6 +244,11 @@ async function checkBlocked(req, res, next) {
   } catch (_) { next(); }
 }
 
+function serverError(err, res) {
+  console.error('[Error]', err);
+  return res.status(500).json({ error: 'Internal server error' });
+}
+
 // ─── Root & Pi Network verification ──────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({ name: 'WorkPro API', version: '3.2.0', status: 'ok' });
@@ -260,7 +265,8 @@ app.get('/api/health', async (req, res) => {
     await query('SELECT 1');
     res.json({ status: 'ok', version: '3.2.0', database: 'connected', timestamp: now() });
   } catch (err) {
-    res.status(500).json({ status: 'error', database: 'disconnected', error: err.message });
+    console.error('[Health] DB check failed:', err.message);
+    res.status(500).json({ status: 'error', database: 'disconnected' });
   }
 });
 
@@ -280,7 +286,7 @@ app.put('/api/me', auth, async (req, res) => {
     const result = await query('SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, is_blocked, status, created_at, updated_at FROM users WHERE id = $1', [req.userId]);
     const u = result.rows[0];
     res.json({ ...u, uid: u.id, is_admin: u.role === 'admin' });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 // GET /api/me — get current user profile (used by Profile.js) — auth required
@@ -291,7 +297,7 @@ app.get('/api/me', auth, async (req, res) => {
     const u = result.rows[0];
     const levelInfo = computeLevel(u.total_jobs_completed, u.rating);
     res.json({ ...u, uid: u.id, is_admin: u.role === 'admin', level: levelInfo });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 // POST /api/me — alias login endpoint used by Auth.js + bundle registration
@@ -356,7 +362,7 @@ app.post('/api/me', async (req, res) => {
     // Issue a real JWT instead of predictable dummy token
     const token = jwt.sign({ id: uid, username: uname }, JWT_SECRET, { expiresIn: '7d' });
     res.json({ ...u, uid: u.id, is_admin: u.role === 'admin', token });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 // ─── Auth ──────────────────────────────────────────────
@@ -410,7 +416,7 @@ app.post('/api/auth/login', async (req, res) => {
     await audit('user_login', { user_id: uid });
     res.json({ token, user: { ...user.rows[0], payments_enabled: paymentsEnabled } });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(err, res);
   }
 });
 
@@ -424,7 +430,7 @@ app.get('/api/auth/me', auth, async (req, res) => {
     const u = result.rows[0];
     res.json({ ...u, uid: u.id, is_admin: u.role === 'admin' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(err, res);
   }
 });
 
@@ -441,7 +447,7 @@ app.get('/api/users', softAuth, async (req, res) => {
     const total = await query('SELECT COUNT(*) FROM users');
     res.json({ users: result.rows, count: result.rowCount, total: parseInt(total.rows[0].count), limit, offset });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(err, res);
   }
 });
 
@@ -466,7 +472,7 @@ app.get('/api/users/:id', softAuth, async (req, res) => {
     delete u.role;
     res.json({ ...u, uid: u.id, is_admin });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(err, res);
   }
 });
 
@@ -488,7 +494,7 @@ app.post('/api/users/:id', auth, async (req, res) => {
     if (!result.rows.length) return res.status(404).json({ error: 'User not found' });
     res.json(result.rows[0]);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(err, res);
   }
 });
 
@@ -501,7 +507,7 @@ app.get('/api/users/:id/ratings', async (req, res) => {
     const avg = parseFloat(totalRes.rows[0].avg) || 0;
     res.json({ ratings: result.rows, average: Math.round(avg * 10) / 10, count: parseInt(totalRes.rows[0].count), limit, offset });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(err, res);
   }
 });
 
@@ -585,7 +591,7 @@ app.get('/api/jobs', async (req, res) => {
     });
     res.json({ jobs, total, page: parseInt(page), total_pages: Math.ceil(total / parseInt(limit)) });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(err, res);
   }
 });
 
@@ -613,7 +619,7 @@ app.post('/api/jobs', auth, checkBlocked, jobPostLimiter, async (req, res) => {
     await audit('job_created', { job_id: result.rows[0].id, user_id: req.userId });
     res.json({ job: parseJobRow(result.rows[0]), success: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(err, res);
   }
 });
 
@@ -631,7 +637,7 @@ app.get('/api/jobs/user/:userId', async (req, res) => {
       [userId, limit, offset]
     );
     res.json({ jobs: result.rows.map(parseJobRow), limit, offset });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 // GET /api/jobs/as-freelancer — jobs where current user is the hired freelancer
@@ -648,7 +654,7 @@ app.get('/api/jobs/as-freelancer', auth, async (req, res) => {
       [req.userId, limit, offset]
     );
     res.json({ jobs: result.rows.map(parseJobRow), limit, offset });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 // GET /api/jobs/my — client's own posted jobs (must be before /:id to avoid conflict)
@@ -661,7 +667,7 @@ app.get('/api/jobs/my', auth, async (req, res) => {
       [req.userId, limit, offset]
     );
     res.json({ jobs: result.rows.map(parseJobRow), limit, offset });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 app.get('/api/jobs/:id', softAuth, async (req, res) => {
@@ -681,7 +687,7 @@ app.get('/api/jobs/:id', softAuth, async (req, res) => {
     const job = parseJobRow({ ...job_row, room_id: roomResult.rows[0]?.id || null });
     res.json({ job, applications });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(err, res);
   }
 });
 
@@ -705,7 +711,7 @@ app.patch('/api/jobs/:id', auth, checkBlocked, async (req, res) => {
     }
     res.json({ job: result.rows[0], success: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(err, res);
   }
 });
 
@@ -758,7 +764,7 @@ app.post('/api/jobs/:id/apply', auth, checkBlocked, async (req, res) => {
     const newBalance = (user.balance_connects || 0) - cost;
     res.json({ application: appResult.rows[0], success: true, remaining_connects: newBalance, new_balance: newBalance });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(err, res);
   }
 });
 
@@ -807,7 +813,7 @@ app.post('/api/jobs/:id/hire', auth, checkBlocked, async (req, res) => {
       'Заказчик выбрал вас. Обсудите детали в чате.', parseInt(req.params.id), roomId);
     res.json({ success: true, room_id: roomId, freelancer_name: freelancerName });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(err, res);
   }
 });
 
@@ -855,7 +861,7 @@ app.post('/api/jobs/:id/complete', auth, checkBlocked, async (req, res) => {
     }
     res.json({ success: true, paid: paidAmount });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(err, res);
   }
 });
 
@@ -870,7 +876,7 @@ app.delete('/api/jobs/:id', auth, checkBlocked, async (req, res) => {
     await query('DELETE FROM jobs WHERE id = $1', [req.params.id]);
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(err, res);
   }
 });
 
@@ -883,7 +889,7 @@ app.get('/api/applications', auth, async (req, res) => {
     const total = await query('SELECT COUNT(*) FROM applications WHERE freelancer_id = $1', [req.userId]);
     res.json({ applications: result.rows, total: parseInt(total.rows[0].count), limit, offset });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(err, res);
   }
 });
 
@@ -899,7 +905,7 @@ app.patch('/api/applications/:id', auth, async (req, res) => {
     await audit('application_status_changed', { app_id: req.params.id, status });
     res.json({ application: result.rows[0], success: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(err, res);
   }
 });
 
@@ -926,7 +932,7 @@ app.get('/api/chat/rooms', auth, async (req, res) => {
     );
     res.json({ rooms: result.rows, limit, offset });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(err, res);
   }
 });
 
@@ -957,7 +963,7 @@ app.post('/api/chat/rooms', auth, checkBlocked, async (req, res) => {
     );
     res.json({ room: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(err, res);
   }
 });
 
@@ -971,7 +977,7 @@ app.get('/api/chat/rooms/:id/messages', auth, async (req, res) => {
     const messages = result.rows.map(m => ({ ...m, content: m.message, text: m.message }));
     res.json({ messages, limit, offset });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(err, res);
   }
 });
 
@@ -1000,7 +1006,7 @@ app.post('/api/chat/rooms/:id/messages', auth, checkBlocked, async (req, res) =>
 
     res.json({ message: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(err, res);
   }
 });
 
@@ -1012,7 +1018,7 @@ app.get('/api/escrow', auth, async (req, res) => {
     const result = await query('SELECT * FROM escrows WHERE client_id = $1 OR freelancer_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3', [req.userId, limit, offset]);
     res.json({ escrows: result.rows, limit, offset });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(err, res);
   }
 });
 
@@ -1036,7 +1042,7 @@ app.post('/api/escrow', auth, checkBlocked, async (req, res) => {
     await audit('escrow_created', { escrow_id: result.rows[0].id, job_id });
     res.json({ escrow: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(err, res);
   }
 });
 
@@ -1066,7 +1072,7 @@ app.post('/api/escrow/:id/release', auth, async (req, res) => {
     await audit('escrow_released', { escrow_id: req.params.id, freelancer_id: escrow.freelancer_id, amount: escrow.amount, net_paid: net });
     res.json({ escrow: { ...escrow, status: 'released' }, success: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(err, res);
   }
 });
 
@@ -1103,7 +1109,7 @@ app.post('/api/payments/:paymentId/approve', auth, async (req, res) => {
     res.json({ success: true, payment: piPayment });
   } catch (err) {
     console.error('[Payment] Approve error:', err.message);
-    res.status(500).json({ error: err.message });
+    serverError(err, res);
   }
 });
 
@@ -1158,7 +1164,7 @@ app.post('/api/payments/:paymentId/complete', auth, async (req, res) => {
     res.json({ success: true, payment: piPayment });
   } catch (err) {
     console.error('[Payment] Complete error:', err.message);
-    res.status(500).json({ error: err.message });
+    serverError(err, res);
   }
 });
 
@@ -1170,7 +1176,7 @@ app.get('/api/payments', auth, async (req, res) => {
     const total = await query('SELECT COUNT(*) FROM payments WHERE user_id = $1', [req.userId]);
     res.json({ payments: result.rows, total: parseInt(total.rows[0].count), limit, offset });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(err, res);
   }
 });
 
@@ -1192,7 +1198,7 @@ app.post('/api/payments/incomplete', auth, async (req, res) => {
     }
     res.json({ success: true, payment: piPayment });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(err, res);
   }
 });
 
@@ -1202,7 +1208,7 @@ app.get('/api/connects/balance', auth, async (req, res) => {
     const result = await query('SELECT balance_connects FROM users WHERE id = $1', [req.userId]);
     res.json({ balance: result.rows[0]?.balance_connects || 0 });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(err, res);
   }
 });
 
@@ -1256,7 +1262,7 @@ app.post('/api/connects/purchase', auth, checkBlocked, async (req, res) => {
     await audit('connects_purchased', { user_id: req.userId, amount: connectsAmount, payment_id });
     res.json({ balance: newBalance, success: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(err, res);
   }
 });
 
@@ -1296,7 +1302,7 @@ app.post('/api/ratings', auth, checkBlocked, async (req, res) => {
     await notify(to_user_id, 'rating', 'Новый отзыв', `Вы получили оценку ${rating}/5. Средний рейтинг: ${newAvg}`, job_id || null, null);
     res.json({ rating: result.rows[0], success: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(err, res);
   }
 });
 
@@ -1319,7 +1325,7 @@ app.get('/api/users/:id/level', async (req, res) => {
     const u = result.rows[0];
     const levelInfo = computeLevel(u.total_jobs_completed, u.rating);
     res.json({ ...levelInfo, completed_jobs: u.total_jobs_completed, rating: u.rating });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 // ─── Admin ──────────────────────────────────────────────
@@ -1354,7 +1360,7 @@ app.get('/api/admin/stats', adminAuth, async (req, res) => {
       chats: parseInt(chats.rows[0].count),
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(err, res);
   }
 });
 
@@ -1376,7 +1382,7 @@ app.get('/api/admin/users', adminAuth, async (req, res) => {
     const total = await query('SELECT COUNT(DISTINCT LOWER(username)) FROM users');
     res.json({ users: result.rows, count: result.rows.length, total: parseInt(total.rows[0].count), limit, offset });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(err, res);
   }
 });
 
@@ -1390,7 +1396,7 @@ app.post('/api/admin/users/:id/block', adminAuth, async (req, res) => {
     await audit('user_blocked', { user_id: req.params.id });
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(err, res);
   }
 });
 
@@ -1400,7 +1406,7 @@ app.post('/api/admin/users/:id/unblock', adminAuth, async (req, res) => {
     await audit('user_unblocked', { user_id: req.params.id });
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(err, res);
   }
 });
 
@@ -1409,7 +1415,7 @@ app.post('/api/admin/users/:id/make-admin', adminAuth, async (req, res) => {
     await query("UPDATE users SET role = 'admin', updated_at = NOW() WHERE id = $1", [req.params.id]);
     await audit('user_made_admin', { user_id: req.params.id, by: req.userId });
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 app.post('/api/admin/users/:id/remove-admin', adminAuth, async (req, res) => {
@@ -1421,7 +1427,7 @@ app.post('/api/admin/users/:id/remove-admin', adminAuth, async (req, res) => {
     await query("UPDATE users SET role = 'freelancer', updated_at = NOW() WHERE id = $1", [req.params.id]);
     await audit('user_removed_admin', { user_id: req.params.id, by: req.userId });
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 app.get('/api/admin/jobs', adminAuth, async (req, res) => {
@@ -1432,7 +1438,7 @@ app.get('/api/admin/jobs', adminAuth, async (req, res) => {
     const total = await query('SELECT COUNT(*) FROM jobs');
     res.json({ jobs: result.rows, total: parseInt(total.rows[0].count), limit, offset });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(err, res);
   }
 });
 
@@ -1442,7 +1448,7 @@ app.delete('/api/admin/jobs/:id', adminAuth, async (req, res) => {
     await query('DELETE FROM jobs WHERE id = $1', [req.params.id]);
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(err, res);
   }
 });
 
@@ -1455,7 +1461,7 @@ app.post('/api/admin/users/:id/grant-connects', adminAuth, async (req, res) => {
     const result = await query('SELECT balance_connects FROM users WHERE id = $1', [req.params.id]);
     await audit('admin_grant_connects', { user_id: req.params.id, amount: qty, granted_by: req.userId });
     res.json({ success: true, balance: result.rows[0]?.balance_connects || 0 });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 app.get('/api/admin/escrows', adminAuth, async (req, res) => {
@@ -1477,7 +1483,7 @@ app.get('/api/admin/escrows', adminAuth, async (req, res) => {
     const total = await query('SELECT COUNT(*) FROM escrows');
     res.json({ escrows: result.rows, total: parseInt(total.rows[0].count), limit, offset });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(err, res);
   }
 });
 
@@ -1515,7 +1521,7 @@ app.get('/api/admin/earnings', adminAuth, async (req, res) => {
       }
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(err, res);
   }
 });
 
@@ -1527,7 +1533,7 @@ app.get('/api/admin/audit-logs', adminAuth, async (req, res) => {
     const total = await query('SELECT COUNT(*) FROM audit_logs');
     res.json({ logs: result.rows, total: parseInt(total.rows[0].count), limit, offset });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    serverError(err, res);
   }
 });
 
@@ -1550,7 +1556,7 @@ app.get('/api/jobs/:id/applications', auth, async (req, res) => {
     if (jobResult.rows[0].posted_by !== req.userId) return res.status(403).json({ error: 'Forbidden' });
     const result = await query('SELECT * FROM applications WHERE job_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3', [req.params.id, limit, offset]);
     res.json({ applications: result.rows, limit, offset });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 // GET /api/jobs?client_uid=xxx — filter by owner (client_uid alias for posted_by)
@@ -1567,7 +1573,7 @@ app.get('/api/escrows', auth, async (req, res) => {
   try {
     const result = await query('SELECT * FROM escrows WHERE client_id = $1 OR freelancer_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3', [req.userId, limit, offset]);
     res.json({ escrows: result.rows, limit, offset });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 app.get('/api/escrows/me', auth, async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit) || 50, 200);
@@ -1575,7 +1581,7 @@ app.get('/api/escrows/me', auth, async (req, res) => {
   try {
     const result = await query('SELECT * FROM escrows WHERE client_id = $1 OR freelancer_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3', [req.userId, limit, offset]);
     res.json({ escrows: result.rows, limit, offset });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 app.post('/api/escrows/:id/release', auth, async (req, res) => {
   try {
@@ -1601,7 +1607,7 @@ app.post('/api/escrows/:id/release', auth, async (req, res) => {
     finally { pgClient4.release(); }
     await audit('escrow_released', { escrow_id: req.params.id, net_paid: net2 });
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 app.post('/api/escrows/:id/cancel', auth, checkBlocked, async (req, res) => {
   try {
@@ -1632,7 +1638,7 @@ app.post('/api/escrows/:id/cancel', auth, checkBlocked, async (req, res) => {
       await audit('escrow_cancelled_refunded', { escrow_id: req.params.id, amount: escrow.amount, client_id: escrow.client_id });
     }
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 // POST /api/chat/start — start or get conversation
@@ -1649,7 +1655,7 @@ app.post('/api/chat/start', auth, checkBlocked, async (req, res) => {
     const roomId = 'room_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
     const result = await query('INSERT INTO chat_rooms (id, client_id, freelancer_id, job_id) VALUES ($1, $2, $3, $4) RETURNING *', [roomId, req.userId, other_user_id, jobId]);
     res.json({ conversation: result.rows[0], id: result.rows[0].id });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 // ─── Alias endpoints for cherry19899.github.io frontend ──────────────────
@@ -1689,7 +1695,7 @@ app.post('/api/applications', auth, checkBlocked, async (req, res) => {
       `${user.username || 'Фрилансер'} откликнулся на вашу задачу`, parseInt(job_id), null);
     const newBal = (user.balance_connects || 0) - cost;
     res.json({ application: appResult.rows[0], success: true, remaining_connects: newBal, new_balance: newBal });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 // GET /api/applications/my + /api/applications/me — my applications as freelancer
@@ -1700,7 +1706,7 @@ app.get('/api/applications/my', auth, async (req, res) => {
     const result = await query('SELECT * FROM applications WHERE freelancer_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3', [req.userId, limit, offset]);
     const total = await query('SELECT COUNT(*) FROM applications WHERE freelancer_id = $1', [req.userId]);
     res.json({ applications: result.rows, total: parseInt(total.rows[0].count), limit, offset });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 app.get('/api/applications/me', auth, async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit) || 50, 200);
@@ -1709,7 +1715,7 @@ app.get('/api/applications/me', auth, async (req, res) => {
     const result = await query('SELECT * FROM applications WHERE freelancer_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3', [req.userId, limit, offset]);
     const total = await query('SELECT COUNT(*) FROM applications WHERE freelancer_id = $1', [req.userId]);
     res.json({ applications: result.rows, total: parseInt(total.rows[0].count), limit, offset });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 // GET /api/applications/job/:jobId — applications for a specific job (owner only)
@@ -1722,7 +1728,7 @@ app.get('/api/applications/job/:jobId', auth, async (req, res) => {
     if (jobResult.rows[0].posted_by !== req.userId) return res.status(403).json({ error: 'Forbidden' });
     const result = await query('SELECT * FROM applications WHERE job_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3', [req.params.jobId, limit, offset]);
     res.json({ applications: result.rows, limit, offset });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 // POST /api/applications/:id/accept — accept application + create escrow record
@@ -1761,7 +1767,7 @@ app.post('/api/applications/:id/accept', auth, async (req, res) => {
 
     await audit('application_accepted', { app_id: req.params.id, job_id: app_.job_id, freelancer_id: freelancerId });
     res.json({ application: result.rows[0], escrow, success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 // POST /api/applications/:id/reject — alias used by JobDetail.js
@@ -1772,7 +1778,7 @@ app.post('/api/applications/:id/reject', auth, async (req, res) => {
     if (appResult.rows[0].posted_by !== req.userId) return res.status(403).json({ error: 'Forbidden' });
     const result = await query('UPDATE applications SET status = $1 WHERE id = $2 RETURNING *', ['rejected', req.params.id]);
     res.json({ application: result.rows[0], success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 // POST /api/applications/:id/withdraw — freelancer withdraws their own pending application
@@ -1785,7 +1791,7 @@ app.post('/api/applications/:id/withdraw', auth, async (req, res) => {
     if (app_.status !== 'pending') return res.status(400).json({ error: 'Can only withdraw pending applications' });
     const result = await query('UPDATE applications SET status = $1, updated_at = NOW() WHERE id = $2 RETURNING *', ['withdrawn', req.params.id]);
     res.json({ application: result.rows[0], success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 // PUT /api/applications/:id/status — update application status (job owner only: accepted/rejected)
@@ -1799,7 +1805,7 @@ app.put('/api/applications/:id/status', auth, async (req, res) => {
     if (appResult.rows[0].posted_by !== req.userId) return res.status(403).json({ error: 'Forbidden' });
     const result = await query('UPDATE applications SET status = $1 WHERE id = $2 RETURNING *', [status, req.params.id]);
     res.json({ application: result.rows[0], success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 // PUT /api/jobs/:id — update job
@@ -1847,7 +1853,7 @@ app.put('/api/jobs/:id', auth, async (req, res) => {
     vals.push(req.params.id);
     const result = await query(`UPDATE jobs SET ${fields.join(',')} WHERE id=$${i} RETURNING *`, vals);
     res.json({ job: parseJobRow(result.rows[0]), success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 // GET /api/users/me — get current user profile
@@ -1860,7 +1866,7 @@ app.get('/api/users/me', auth, async (req, res) => {
     if (!result.rows.length) return res.status(404).json({ error: 'User not found' });
     const u = result.rows[0];
     res.json({ ...u, uid: u.id, is_admin: u.role === 'admin' });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 // PUT /api/users/me — update current user profile
@@ -1891,7 +1897,7 @@ app.put('/api/users/me', auth, async (req, res) => {
     const result = await query('SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, is_blocked, status, created_at, updated_at FROM users WHERE id = $1', [req.userId]);
     const u = result.rows[0];
     res.json({ ...u, uid: u.id, is_admin: u.role === 'admin' });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 // ─── Chat alias endpoints (conversations = rooms) ──────────────────
@@ -1916,7 +1922,7 @@ app.get('/api/chat/conversations', auth, async (req, res) => {
       [req.userId, limit, offset]
     );
     res.json({ conversations: result.rows, rooms: result.rows, limit, offset });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 app.post('/api/chat/conversations', auth, checkBlocked, async (req, res) => {
@@ -1941,7 +1947,7 @@ app.post('/api/chat/conversations', auth, checkBlocked, async (req, res) => {
     const roomId = 'room_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
     const result = await query('INSERT INTO chat_rooms (id, client_id, freelancer_id, job_id) VALUES ($1, $2, $3, $4) RETURNING *', [roomId, cId, fId, job_id]);
     res.json({ conversation: result.rows[0], room: result.rows[0] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 app.get('/api/chat/conversations/:id/messages', auth, async (req, res) => {
@@ -1953,7 +1959,7 @@ app.get('/api/chat/conversations/:id/messages', auth, async (req, res) => {
     const result = await query('SELECT * FROM chat_messages WHERE room_id = $1 ORDER BY created_at ASC LIMIT $2 OFFSET $3', [req.params.id, limit, offset]);
     const messages = result.rows.map(m => ({ ...m, content: m.message, text: m.message }));
     res.json({ messages, limit, offset });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 app.post('/api/chat/conversations/:id/messages', auth, checkBlocked, async (req, res) => {
@@ -1968,7 +1974,7 @@ app.post('/api/chat/conversations/:id/messages', auth, checkBlocked, async (req,
     const result = await query('INSERT INTO chat_messages (room_id, sender_id, sender_name, message) VALUES ($1, $2, $3, $4) RETURNING *', [req.params.id, req.userId, senderName, msg.trim()]);
     await query('UPDATE chat_rooms SET updated_at = NOW() WHERE id = $1', [req.params.id]);
     res.json({ message: result.rows[0] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 app.get('/api/chat/unread', auth, async (req, res) => {
@@ -2027,7 +2033,7 @@ app.post('/api/reviews', auth, checkBlocked, async (req, res) => {
     const newAvg = Math.round(parseFloat(avgResult.rows[0].avg) * 10) / 10;
     await query('UPDATE users SET rating = $1, updated_at = NOW() WHERE id = $2', [newAvg, toId]);
     res.json({ review: result.rows[0], rating: result.rows[0], success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 app.get('/api/reviews/user/:userId', async (req, res) => {
@@ -2037,7 +2043,7 @@ app.get('/api/reviews/user/:userId', async (req, res) => {
     const result = await query('SELECT r.*, u.username as from_username FROM ratings r LEFT JOIN users u ON u.id = r.from_user_id WHERE r.to_user_id = $1 ORDER BY r.created_at DESC LIMIT $2 OFFSET $3', [req.params.userId, limit, offset]);
     const total = await query('SELECT COUNT(*) FROM ratings WHERE to_user_id = $1', [req.params.userId]);
     res.json({ reviews: result.rows, ratings: result.rows, total: parseInt(total.rows[0].count), limit, offset });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 // GET /api/reviews?user_id=xxx — alias used by some frontend pages
@@ -2050,7 +2056,7 @@ app.get('/api/reviews', async (req, res) => {
     const result = await query('SELECT r.*, u.username as from_username FROM ratings r LEFT JOIN users u ON u.id = r.from_user_id WHERE r.to_user_id = $1 ORDER BY r.created_at DESC LIMIT $2 OFFSET $3', [userId, limit, offset]);
     const total = await query('SELECT COUNT(*) FROM ratings WHERE to_user_id = $1', [userId]);
     res.json({ reviews: result.rows, ratings: result.rows, total: parseInt(total.rows[0].count), limit, offset });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 // GET /api/admin/jobs/all — alias for /api/admin/jobs
@@ -2061,7 +2067,7 @@ app.get('/api/admin/jobs/all', adminAuth, async (req, res) => {
     const result = await query('SELECT j.*, u.username as posted_by_name FROM jobs j LEFT JOIN users u ON u.id = j.posted_by ORDER BY j.created_at DESC LIMIT $1 OFFSET $2', [limit, offset]);
     const total = await query('SELECT COUNT(*) FROM jobs');
     res.json({ jobs: result.rows, total: parseInt(total.rows[0].count), limit, offset });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 // POST /api/connects/buy defined later (full version with package_amount + Pi payment support)
@@ -2096,7 +2102,7 @@ app.post('/api/escrow/:id/refund', auth, checkBlocked, async (req, res) => {
     }
     await audit('escrow_refunded', { escrow_id: req.params.id, status_was: escrow.status, amount: escrow.amount });
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 // ─── Portfolio ──────────────────
@@ -2113,7 +2119,7 @@ app.get('/api/users/:id/portfolio', async (req, res) => {
       items: itemsResult.rows,
       stats: { jobs_posted: owner.total_jobs_posted, jobs_completed: owner.total_jobs_completed, rating: owner.rating }
     });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 app.put('/api/users/me/portfolio', auth, async (req, res) => {
@@ -2140,7 +2146,7 @@ app.put('/api/users/me/portfolio', auth, async (req, res) => {
     );
     const result = await query('SELECT * FROM portfolios WHERE user_id = $1', [req.userId]);
     res.json({ portfolio: result.rows[0], success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 app.post('/api/users/me/portfolio/items', auth, async (req, res) => {
@@ -2164,7 +2170,7 @@ app.post('/api/users/me/portfolio/items', auth, async (req, res) => {
       [req.userId, title, description || '', finalUrl, category || 'Other', tagsRaw]
     );
     res.json({ item: result.rows[0], success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 // DELETE /api/users/me — account deletion
@@ -2181,14 +2187,14 @@ app.delete('/api/users/me', auth, async (req, res) => {
     }
     await query('UPDATE users SET is_blocked = true, status = $1, updated_at = NOW() WHERE id = $2', ['deleted', req.userId]);
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 app.delete('/api/users/me/portfolio/items/:id', auth, async (req, res) => {
   try {
     await query('DELETE FROM portfolio_items WHERE id = $1 AND user_id = $2', [req.params.id, req.userId]);
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 // ─── Notifications ──────────────────────────────────────────────
@@ -2273,7 +2279,7 @@ app.post('/api/applications/:id/hire', auth, checkBlocked, async (req, res) => {
       'Заказчик выбрал вас и создал эскроу. Можете приступать к работе.', parseInt(app_.job_id), null);
     await audit('hire_with_escrow', { app_id: req.params.id, job_id: app_.job_id, freelancer_id: freelancerId, amount: escrowAmount });
     res.json({ success: true, escrow: escrow.rows[0] || { job_id: app_.job_id, status: 'funded' } });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 // POST /api/payments/approve — Pi payment server-side approval
@@ -2306,7 +2312,7 @@ app.post('/api/payments/approve', auth, async (req, res) => {
       [payment_id, req.userId, approveData.amount || 0, JSON.stringify(metadata || {}), payment_id]
     ).catch(() => {});
     res.json({ success: true, payment: approveData });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 // POST /api/payments/complete — Pi payment server-side completion
@@ -2337,7 +2343,7 @@ app.post('/api/payments/complete', auth, async (req, res) => {
       [txid, payment_id]
     ).catch(() => {});
     res.json({ success: true, payment: completeData });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 // POST /api/connects/buy — credit connects ONLY after a Pi-verified payment.
@@ -2417,7 +2423,7 @@ app.post('/api/connects/buy', auth, checkBlocked, async (req, res) => {
     const balance = result.rows[0]?.balance_connects || 0;
     await audit('connects_purchased', { user_id: req.userId, credited, payment_id, txid });
     res.json({ success: true, credited, balance, balance_connects: balance, new_balance: balance, remaining_connects: balance });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 // (jobs/my is defined above, before /jobs/:id)
@@ -2444,7 +2450,7 @@ app.get('/api/applications/user/:userId', auth, async (req, res) => {
       [userId, limit, offset]
     );
     res.json({ applications: result.rows, limit, offset });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 // GET /api/escrows/user/:userId — list escrows for a user
@@ -2467,7 +2473,7 @@ app.get('/api/escrows/user/:userId', auth, async (req, res) => {
       [userId, limit, offset]
     );
     res.json({ escrows: result.rows, limit, offset });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 // POST /api/offers — client sends a direct offer to a freelancer
@@ -2495,7 +2501,7 @@ app.post('/api/offers', auth, checkBlocked, async (req, res) => {
     await notify(to_user_id, 'offer', `Вам отправлено предложение по задаче "${job.title}"`,
       `${callerName} предлагает вам работу. Сумма: ${amount || job.budget} π`, job_id, null);
     res.json({ offer: result.rows[0], success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 // GET /api/offers — direct offers (job invitations) for freelancer
@@ -2515,7 +2521,7 @@ app.get('/api/offers', auth, async (req, res) => {
       [req.userId, limit, offset]
     );
     res.json({ offers: result.rows, limit, offset });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 // GET /api/reviews/stats — review statistics for logged-in user
@@ -2535,7 +2541,7 @@ app.get('/api/reviews/stats', auth, async (req, res) => {
     const distribution = {};
     distResult.rows.forEach(r => { distribution[r.rating] = parseInt(r.count); });
     res.json({ total, avg: parseFloat(avg), distribution, rating: parseFloat(avg) });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 // ─── Additional endpoints from bundle analysis ──────────────────────────────────────────────
@@ -2557,7 +2563,7 @@ app.post('/api/chat/:roomId/messages', auth, checkBlocked, async (req, res) => {
     );
     await query('UPDATE chat_rooms SET updated_at = NOW() WHERE id = $1', [req.params.roomId]);
     res.json({ message: result.rows[0], success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 // GET /api/offers/:id — get a specific offer
@@ -2573,7 +2579,7 @@ app.get('/api/offers/:id', auth, async (req, res) => {
     );
     if (!result.rows.length) return res.status(404).json({ error: 'Offer not found' });
     res.json({ offer: result.rows[0] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 // POST /api/applications/:id/view — mark application as viewed
@@ -2607,7 +2613,7 @@ app.get('/api/chat/:roomId/messages', auth, async (req, res) => {
       [req.params.roomId, limit, offset]
     );
     res.json({ messages: result.rows, limit, offset });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 // GET /api/chat/rooms/:id — specific chat room details
@@ -2624,7 +2630,7 @@ app.get('/api/chat/rooms/:id', auth, async (req, res) => {
     );
     if (!result.rows.length) return res.status(404).json({ error: 'Room not found' });
     res.json({ room: result.rows[0] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 // POST /api/escrows/:id/fund — fund an escrow after Pi payment
@@ -2643,7 +2649,7 @@ app.post('/api/escrows/:id/fund', auth, async (req, res) => {
     await query('UPDATE escrows SET status = $1, payment_id = $2, updated_at = NOW() WHERE id = $3', ['funded', payment_id, req.params.id]);
     await audit('escrow_funded', { escrow_id: req.params.id, payment_id, txid });
     res.json({ escrow: { ...escrow, status: 'funded' }, success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 // POST /api/escrows/:id/dispute — open a dispute
@@ -2664,7 +2670,7 @@ app.post('/api/escrows/:id/dispute', auth, async (req, res) => {
     await notify(otherParty, 'dispute', 'Открыт спор по задаче',
       reason || 'Одна из сторон открыла спор. Пожалуйста, свяжитесь с поддержкой.', escrow.job_id, null);
     res.json({ escrow: { ...escrow, status: 'disputed' }, success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 // GET /api/escrows/:id/room — chat room for an escrow
@@ -2688,7 +2694,7 @@ app.get('/api/escrows/:id/room', auth, async (req, res) => {
       [roomId, escrow.client_id, escrow.freelancer_id]
     );
     res.json({ room: newRoom.rows[0], room_id: newRoom.rows[0].id });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 
@@ -2698,7 +2704,7 @@ app.post('/api/offers/:id/accept', auth, async (req, res) => {
     const result = await query('UPDATE applications SET status = $1 WHERE id = $2 AND freelancer_id = $3 RETURNING *', ['accepted', req.params.id, req.userId]);
     if (!result.rows.length) return res.status(404).json({ error: 'Offer not found' });
     res.json({ application: result.rows[0], success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 // POST /api/offers/:id/decline — decline a job offer
@@ -2707,7 +2713,7 @@ app.post('/api/offers/:id/decline', auth, async (req, res) => {
     const result = await query('UPDATE applications SET status = $1 WHERE id = $2 AND freelancer_id = $3 RETURNING *', ['declined', req.params.id, req.userId]);
     if (!result.rows.length) return res.status(404).json({ error: 'Offer not found' });
     res.json({ application: result.rows[0], success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 // GET /api/reviews/stats/:userId — review stats for a specific user (path param, MUST be before /:id)
@@ -2724,7 +2730,7 @@ app.get('/api/reviews/stats/:userId', async (req, res) => {
     const distribution = {};
     distResult.rows.forEach(r => { distribution[r.rating] = parseInt(r.count); });
     res.json({ total, avg: parseFloat(avg), distribution, rating: parseFloat(avg) });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 // GET /api/reviews/:id — get review by ID, OR if id is non-integer, treat as user ID
@@ -2750,7 +2756,7 @@ app.get('/api/reviews/:id', async (req, res) => {
       );
       res.json({ reviews: result.rows, ratings: result.rows, limit: limit2, offset: offset2 });
     }
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 });
 
 // POST + PUT /api/users/:id/availability — update user availability status
@@ -2774,7 +2780,7 @@ async function handleAvailability(req, res) {
     );
     const u = result.rows[0] || {};
     res.json({ ...u, uid: u.id, is_admin: u?.role === 'admin', success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(err, res); }
 }
 app.put('/api/users/:id/availability', auth, handleAvailability);
 app.post('/api/users/:id/availability', auth, handleAvailability);
