@@ -1021,12 +1021,11 @@ app.post('/api/chat/rooms', auth, checkBlocked, async (req, res) => {
   const { freelancer_id, job_id } = req.body;
   const cId = req.userId; // always use authenticated user as client
   if (!freelancer_id || !job_id) return res.status(400).json({ error: 'freelancer_id and job_id required' });
+  if (freelancer_id === cId) return res.status(400).json({ error: 'Cannot create a chat room with yourself' });
   try {
     // Validate target user exists
-    if (freelancer_id !== cId) {
-      const targetExists = await query('SELECT id FROM users WHERE id = $1 LIMIT 1', [freelancer_id]);
-      if (!targetExists.rows.length) return res.status(404).json({ error: 'User not found' });
-    }
+    const targetExists = await query('SELECT id FROM users WHERE id = $1 LIMIT 1', [freelancer_id]);
+    if (!targetExists.rows.length) return res.status(404).json({ error: 'User not found' });
     // Verify caller is actually involved in this job (poster or applicant/hired freelancer)
     const jobCheck = await query('SELECT posted_by, hired_freelancer_id FROM jobs WHERE id = $1', [job_id]);
     if (!jobCheck.rows.length) return res.status(404).json({ error: 'Job not found' });
@@ -1592,9 +1591,16 @@ app.delete('/api/admin/jobs/:id', adminAuth, async (req, res) => {
       await query("UPDATE escrows SET status='refunded', updated_at=NOW() WHERE id=$1", [esc.id]);
       await query('UPDATE users SET balance_pi = COALESCE(balance_pi,0) + $1, updated_at=NOW() WHERE id=$2', [esc.amount, esc.client_id]);
     }
+    // Refund connects to applicants (mirrors client-side delete behavior)
+    const jobMeta = await query('SELECT apply_cost FROM jobs WHERE id = $1', [req.params.id]);
+    const applyRefundCost = jobMeta.rows[0]?.apply_cost || 1;
+    const applicants = await query('SELECT DISTINCT freelancer_id FROM applications WHERE job_id = $1', [req.params.id]);
+    for (const row of applicants.rows) {
+      await query('UPDATE users SET balance_connects = balance_connects + $1, updated_at=NOW() WHERE id=$2', [applyRefundCost, row.freelancer_id]).catch(() => {});
+    }
     await query('DELETE FROM applications WHERE job_id = $1', [req.params.id]);
     await query('DELETE FROM jobs WHERE id = $1', [req.params.id]);
-    await audit('admin_job_deleted', { job_id: req.params.id, by: req.userId, escrow_refunded: fundedEscrow.rows.length > 0 });
+    await audit('admin_job_deleted', { job_id: req.params.id, by: req.userId, escrow_refunded: fundedEscrow.rows.length > 0, connects_refunded: applicants.rows.length });
     res.json({ success: true });
   } catch (err) {
     serverError(err, res);
@@ -1794,6 +1800,7 @@ app.post('/api/escrows/:id/cancel', auth, checkBlocked, async (req, res) => {
 app.post('/api/chat/start', auth, checkBlocked, async (req, res) => {
   const { other_user_id, job_id } = req.body;
   if (!other_user_id) return res.status(400).json({ error: 'other_user_id required' });
+  if (other_user_id === req.userId) return res.status(400).json({ error: 'Cannot start a chat with yourself' });
   try {
     const otherExists = await query('SELECT id FROM users WHERE id = $1 LIMIT 1', [other_user_id]);
     if (!otherExists.rows.length) return res.status(404).json({ error: 'User not found' });
@@ -2109,12 +2116,11 @@ app.post('/api/chat/conversations', auth, checkBlocked, async (req, res) => {
   const cId = req.userId; // always use authenticated user as client
   const fId = freelancer_id || other_user_id;
   if (!fId || !job_id) return res.status(400).json({ error: 'freelancer_id and job_id required' });
+  if (fId === cId) return res.status(400).json({ error: 'Cannot create a conversation with yourself' });
   try {
     // Validate target user exists
-    if (fId !== cId) {
-      const targetExists = await query('SELECT id FROM users WHERE id = $1 LIMIT 1', [fId]);
-      if (!targetExists.rows.length) return res.status(404).json({ error: 'User not found' });
-    }
+    const targetExists = await query('SELECT id FROM users WHERE id = $1 LIMIT 1', [fId]);
+    if (!targetExists.rows.length) return res.status(404).json({ error: 'User not found' });
     // Verify caller is actually involved in this job (poster or applicant/hired freelancer)
     const jobCheck = await query('SELECT posted_by, hired_freelancer_id FROM jobs WHERE id = $1', [job_id]);
     if (!jobCheck.rows.length) return res.status(404).json({ error: 'Job not found' });
