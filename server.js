@@ -800,9 +800,12 @@ app.delete('/api/jobs/:id', auth, checkBlocked, async (req, res) => {
 
 // ─── Applications ──────────────────────────────────────────────
 app.get('/api/applications', auth, async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+  const offset = parseInt(req.query.offset) || 0;
   try {
-    const result = await query('SELECT * FROM applications WHERE freelancer_id = $1 ORDER BY created_at DESC', [req.userId]);
-    res.json({ applications: result.rows });
+    const result = await query('SELECT * FROM applications WHERE freelancer_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3', [req.userId, limit, offset]);
+    const total = await query('SELECT COUNT(*) FROM applications WHERE freelancer_id = $1', [req.userId]);
+    res.json({ applications: result.rows, total: parseInt(total.rows[0].count), limit, offset });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -810,6 +813,8 @@ app.get('/api/applications', auth, async (req, res) => {
 
 app.patch('/api/applications/:id', auth, async (req, res) => {
   const { status } = req.body;
+  const OWNER_ALLOWED = ['accepted', 'rejected'];
+  if (!OWNER_ALLOWED.includes(status)) return res.status(400).json({ error: `Invalid status. Allowed: ${OWNER_ALLOWED.join(', ')}` });
   try {
     const appResult = await query('SELECT a.*, j.posted_by FROM applications a JOIN jobs j ON a.job_id = j.id WHERE a.id = $1', [req.params.id]);
     if (!appResult.rows.length) return res.status(404).json({ error: 'Application not found' });
@@ -824,6 +829,8 @@ app.patch('/api/applications/:id', auth, async (req, res) => {
 
 // ─── Chat ──────────────────────────────────────────────
 app.get('/api/chat/rooms', auth, async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+  const offset = parseInt(req.query.offset) || 0;
   try {
     const result = await query(
       `SELECT r.*,
@@ -837,10 +844,11 @@ app.get('/api/chat/rooms', auth, async (req, res) => {
        LEFT JOIN users uc ON uc.id = r.client_id
        LEFT JOIN users uf ON uf.id = r.freelancer_id
        WHERE r.client_id = $1 OR r.freelancer_id = $1
-       ORDER BY last_message_at DESC NULLS LAST`,
-      [req.userId]
+       ORDER BY last_message_at DESC NULLS LAST
+       LIMIT $2 OFFSET $3`,
+      [req.userId, limit, offset]
     );
-    res.json({ rooms: result.rows });
+    res.json({ rooms: result.rows, limit, offset });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -911,9 +919,11 @@ app.post('/api/chat/rooms/:id/messages', auth, checkBlocked, async (req, res) =>
 
 // ─── Escrow ──────────────────────────────────────────────
 app.get('/api/escrow', auth, async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+  const offset = parseInt(req.query.offset) || 0;
   try {
-    const result = await query('SELECT * FROM escrows WHERE client_id = $1 OR freelancer_id = $1 ORDER BY created_at DESC', [req.userId]);
-    res.json({ escrows: result.rows });
+    const result = await query('SELECT * FROM escrows WHERE client_id = $1 OR freelancer_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3', [req.userId, limit, offset]);
+    res.json({ escrows: result.rows, limit, offset });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1219,19 +1229,22 @@ app.get('/api/admin/stats', adminAuth, async (req, res) => {
 });
 
 app.get('/api/admin/users', adminAuth, async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 500, 2000);
+  const offset = parseInt(req.query.offset) || 0;
   try {
     const search = req.query.search || '';
-    // DISTINCT ON LOWER(username): deduplicate by username (case-insensitive), prefer admin role then newest
     const safeFields = 'id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, is_blocked, status, created_at, updated_at';
     let sql, params = [];
     if (search) {
-      sql = `SELECT ${safeFields} FROM (SELECT DISTINCT ON (LOWER(username)) ${safeFields} FROM users WHERE username ILIKE $1 OR id ILIKE $1 ORDER BY LOWER(username), CASE role WHEN 'admin' THEN 0 ELSE 1 END, updated_at DESC) sub ORDER BY created_at DESC LIMIT 500`;
-      params.push(`%${search}%`);
+      sql = `SELECT ${safeFields} FROM (SELECT DISTINCT ON (LOWER(username)) ${safeFields} FROM users WHERE username ILIKE $1 OR id ILIKE $1 ORDER BY LOWER(username), CASE role WHEN 'admin' THEN 0 ELSE 1 END, updated_at DESC) sub ORDER BY created_at DESC LIMIT $2 OFFSET $3`;
+      params = [`%${search}%`, limit, offset];
     } else {
-      sql = `SELECT ${safeFields} FROM (SELECT DISTINCT ON (LOWER(username)) ${safeFields} FROM users ORDER BY LOWER(username), CASE role WHEN 'admin' THEN 0 ELSE 1 END, updated_at DESC) sub ORDER BY created_at DESC LIMIT 500`;
+      sql = `SELECT ${safeFields} FROM (SELECT DISTINCT ON (LOWER(username)) ${safeFields} FROM users ORDER BY LOWER(username), CASE role WHEN 'admin' THEN 0 ELSE 1 END, updated_at DESC) sub ORDER BY created_at DESC LIMIT $1 OFFSET $2`;
+      params = [limit, offset];
     }
     const result = await query(sql, params);
-    res.json({ users: result.rows, count: result.rows.length });
+    const total = await query('SELECT COUNT(DISTINCT LOWER(username)) FROM users');
+    res.json({ users: result.rows, count: result.rows.length, total: parseInt(total.rows[0].count), limit, offset });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1415,15 +1428,19 @@ app.get('/api/jobs/:id/applications', auth, async (req, res) => {
 
 // GET /api/escrows + /api/escrows/me — alias for /api/escrow
 app.get('/api/escrows', auth, async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+  const offset = parseInt(req.query.offset) || 0;
   try {
-    const result = await query('SELECT * FROM escrows WHERE client_id = $1 OR freelancer_id = $1 ORDER BY created_at DESC', [req.userId]);
-    res.json({ escrows: result.rows });
+    const result = await query('SELECT * FROM escrows WHERE client_id = $1 OR freelancer_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3', [req.userId, limit, offset]);
+    res.json({ escrows: result.rows, limit, offset });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 app.get('/api/escrows/me', auth, async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+  const offset = parseInt(req.query.offset) || 0;
   try {
-    const result = await query('SELECT * FROM escrows WHERE client_id = $1 OR freelancer_id = $1 ORDER BY created_at DESC', [req.userId]);
-    res.json({ escrows: result.rows });
+    const result = await query('SELECT * FROM escrows WHERE client_id = $1 OR freelancer_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3', [req.userId, limit, offset]);
+    res.json({ escrows: result.rows, limit, offset });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 app.post('/api/escrows/:id/release', auth, async (req, res) => {
@@ -1519,15 +1536,21 @@ app.post('/api/applications', auth, checkBlocked, async (req, res) => {
 
 // GET /api/applications/my + /api/applications/me — my applications as freelancer
 app.get('/api/applications/my', auth, async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+  const offset = parseInt(req.query.offset) || 0;
   try {
-    const result = await query('SELECT * FROM applications WHERE freelancer_id = $1 ORDER BY created_at DESC', [req.userId]);
-    res.json({ applications: result.rows });
+    const result = await query('SELECT * FROM applications WHERE freelancer_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3', [req.userId, limit, offset]);
+    const total = await query('SELECT COUNT(*) FROM applications WHERE freelancer_id = $1', [req.userId]);
+    res.json({ applications: result.rows, total: parseInt(total.rows[0].count), limit, offset });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 app.get('/api/applications/me', auth, async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+  const offset = parseInt(req.query.offset) || 0;
   try {
-    const result = await query('SELECT * FROM applications WHERE freelancer_id = $1 ORDER BY created_at DESC', [req.userId]);
-    res.json({ applications: result.rows });
+    const result = await query('SELECT * FROM applications WHERE freelancer_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3', [req.userId, limit, offset]);
+    const total = await query('SELECT COUNT(*) FROM applications WHERE freelancer_id = $1', [req.userId]);
+    res.json({ applications: result.rows, total: parseInt(total.rows[0].count), limit, offset });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -1823,9 +1846,12 @@ app.post('/api/reviews', auth, checkBlocked, async (req, res) => {
 });
 
 app.get('/api/reviews/user/:userId', async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+  const offset = parseInt(req.query.offset) || 0;
   try {
-    const result = await query('SELECT r.*, u.username as from_username FROM ratings r LEFT JOIN users u ON u.id = r.from_user_id WHERE r.to_user_id = $1 ORDER BY r.created_at DESC', [req.params.userId]);
-    res.json({ reviews: result.rows, ratings: result.rows });
+    const result = await query('SELECT r.*, u.username as from_username FROM ratings r LEFT JOIN users u ON u.id = r.from_user_id WHERE r.to_user_id = $1 ORDER BY r.created_at DESC LIMIT $2 OFFSET $3', [req.params.userId, limit, offset]);
+    const total = await query('SELECT COUNT(*) FROM ratings WHERE to_user_id = $1', [req.params.userId]);
+    res.json({ reviews: result.rows, ratings: result.rows, total: parseInt(total.rows[0].count), limit, offset });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -1833,9 +1859,12 @@ app.get('/api/reviews/user/:userId', async (req, res) => {
 app.get('/api/reviews', async (req, res) => {
   const userId = req.query.user_id || req.headers['x-user-id'];
   if (!userId) return res.json({ reviews: [], ratings: [] });
+  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+  const offset = parseInt(req.query.offset) || 0;
   try {
-    const result = await query('SELECT r.*, u.username as from_username FROM ratings r LEFT JOIN users u ON u.id = r.from_user_id WHERE r.to_user_id = $1 ORDER BY r.created_at DESC', [userId]);
-    res.json({ reviews: result.rows, ratings: result.rows });
+    const result = await query('SELECT r.*, u.username as from_username FROM ratings r LEFT JOIN users u ON u.id = r.from_user_id WHERE r.to_user_id = $1 ORDER BY r.created_at DESC LIMIT $2 OFFSET $3', [userId, limit, offset]);
+    const total = await query('SELECT COUNT(*) FROM ratings WHERE to_user_id = $1', [userId]);
+    res.json({ reviews: result.rows, ratings: result.rows, total: parseInt(total.rows[0].count), limit, offset });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -2555,6 +2584,13 @@ app.post('/api/payments/clear-pending', auth, async (req, res) => {
 // Pi SDK's onIncompletePaymentFound triggers this for payments that need server-side completion
 app.post('/api/payments/:paymentId/resolve-complete', softAuth, async (req, res) => {
   const paymentId = req.params.paymentId;
+  // Only allow the payment owner (or unauthenticated for payments not yet in DB)
+  if (req.userId) {
+    const ownerCheck = await query('SELECT user_id FROM payments WHERE id = $1', [paymentId]).catch(() => ({ rows: [] }));
+    if (ownerCheck.rows.length && ownerCheck.rows[0].user_id && ownerCheck.rows[0].user_id !== req.userId) {
+      return res.status(403).json({ error: 'Payment does not belong to you' });
+    }
+  }
   try {
     // Fetch payment details from Pi API to get txid
     const piRes = await fetch(`https://api.minepi.com/v2/payments/${paymentId}`, {
