@@ -916,12 +916,14 @@ app.post('/api/chat/rooms', auth, checkBlocked, async (req, res) => {
 });
 
 app.get('/api/chat/rooms/:id/messages', auth, async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 100, 200);
+  const offset = parseInt(req.query.offset) || 0;
   try {
     const room = await query('SELECT * FROM chat_rooms WHERE id = $1 AND (client_id = $2 OR freelancer_id = $2)', [req.params.id, req.userId]);
     if (!room.rows.length) return res.status(403).json({ error: 'Forbidden' });
-    const result = await query('SELECT * FROM chat_messages WHERE room_id = $1 ORDER BY created_at ASC LIMIT 200', [req.params.id]);
+    const result = await query('SELECT * FROM chat_messages WHERE room_id = $1 ORDER BY created_at ASC LIMIT $2 OFFSET $3', [req.params.id, limit, offset]);
     const messages = result.rows.map(m => ({ ...m, content: m.message, text: m.message }));
-    res.json({ messages });
+    res.json({ messages, limit, offset });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
