@@ -1032,9 +1032,20 @@ app.post('/api/escrow/:id/release', auth, async (req, res) => {
     if (escrow.client_id !== req.userId) return res.status(403).json({ error: 'Not your escrow' });
     if (escrow.status !== 'funded') return res.status(400).json({ error: 'Escrow is not funded' });
     const net = parseFloat((escrow.amount * 0.98).toFixed(8)); // 2% platform commission
-    await query('UPDATE escrows SET status = $1, updated_at = NOW() WHERE id = $2', ['released', req.params.id]);
-    await query('UPDATE users SET balance_pi = COALESCE(balance_pi, 0) + $1, total_jobs_completed = total_jobs_completed + 1, updated_at = NOW() WHERE id = $2', [net, escrow.freelancer_id]);
-    await query('UPDATE jobs SET status = $1, updated_at = NOW() WHERE id = $2', ['completed', escrow.job_id]);
+    // Atomic: update escrow status WHERE funded; concurrent calls fail here
+    const pgClient3 = await getPool().connect();
+    try {
+      await pgClient3.query('BEGIN');
+      const updated = await pgClient3.query(
+        "UPDATE escrows SET status='released', updated_at=NOW() WHERE id=$1 AND status='funded' RETURNING id",
+        [req.params.id]
+      );
+      if (!updated.rows.length) { await pgClient3.query('ROLLBACK'); return res.status(400).json({ error: 'Escrow already processed' }); }
+      await pgClient3.query('UPDATE users SET balance_pi = COALESCE(balance_pi, 0) + $1, total_jobs_completed = total_jobs_completed + 1, updated_at = NOW() WHERE id = $2', [net, escrow.freelancer_id]);
+      await pgClient3.query('UPDATE jobs SET status = $1, updated_at = NOW() WHERE id = $2', ['completed', escrow.job_id]);
+      await pgClient3.query('COMMIT');
+    } catch (txErr) { await pgClient3.query('ROLLBACK').catch(() => {}); throw txErr; }
+    finally { pgClient3.release(); }
     await notify(escrow.freelancer_id, 'payment', 'Оплата получена', `${net}π зачислено на ваш счёт после завершения задачи.`, escrow.job_id, null);
     await audit('escrow_released', { escrow_id: req.params.id, freelancer_id: escrow.freelancer_id, amount: escrow.amount, net_paid: net });
     res.json({ escrow: { ...escrow, status: 'released' }, success: true });
@@ -1558,9 +1569,20 @@ app.post('/api/escrows/:id/release', auth, async (req, res) => {
     if (escrow.client_id !== req.userId) return res.status(403).json({ error: 'Not your escrow' });
     if (escrow.status !== 'funded') return res.status(400).json({ error: 'Escrow is not funded' });
     const net2 = parseFloat((escrow.amount * 0.98).toFixed(8)); // 2% platform commission
-    await query('UPDATE escrows SET status = $1, updated_at = NOW() WHERE id = $2', ['released', req.params.id]);
-    await query('UPDATE users SET balance_pi = COALESCE(balance_pi, 0) + $1, total_jobs_completed = total_jobs_completed + 1, updated_at = NOW() WHERE id = $2', [net2, escrow.freelancer_id]);
-    await query('UPDATE jobs SET status = $1, updated_at = NOW() WHERE id = $2', ['completed', escrow.job_id]);
+    // Atomic: update escrow status WHERE funded; concurrent calls fail here
+    const pgClient4 = await getPool().connect();
+    try {
+      await pgClient4.query('BEGIN');
+      const updated = await pgClient4.query(
+        "UPDATE escrows SET status='released', updated_at=NOW() WHERE id=$1 AND status='funded' RETURNING id",
+        [req.params.id]
+      );
+      if (!updated.rows.length) { await pgClient4.query('ROLLBACK'); return res.status(400).json({ error: 'Escrow already processed' }); }
+      await pgClient4.query('UPDATE users SET balance_pi = COALESCE(balance_pi, 0) + $1, total_jobs_completed = total_jobs_completed + 1, updated_at = NOW() WHERE id = $2', [net2, escrow.freelancer_id]);
+      await pgClient4.query('UPDATE jobs SET status = $1, updated_at = NOW() WHERE id = $2', ['completed', escrow.job_id]);
+      await pgClient4.query('COMMIT');
+    } catch (txErr) { await pgClient4.query('ROLLBACK').catch(() => {}); throw txErr; }
+    finally { pgClient4.release(); }
     await audit('escrow_released', { escrow_id: req.params.id, net_paid: net2 });
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
