@@ -109,11 +109,12 @@ async function ensureNotificationsTable() {
 }
 
 // ─── Pi Platform API ──────────────────────────────────────────────
-async function piApiRequest(path, method = 'GET', body = null) {
+// userAccessToken: when provided (e.g. for /v2/me identity check), use user Bearer token instead of server Key
+async function piApiRequest(path, method = 'GET', body = null, userAccessToken = null) {
   const opts = {
     method,
     headers: {
-      'Authorization': `Key ${PI_API_KEY}`,
+      'Authorization': userAccessToken ? `Bearer ${userAccessToken}` : `Key ${PI_API_KEY}`,
       'Content-Type': 'application/json',
     },
   };
@@ -184,6 +185,15 @@ async function auth(req, res, next) {
 
 // softAuth — extracts userId but NEVER rejects (for endpoints where bundle sends no auth)
 function softAuth(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    try {
+      const decoded = jwt.verify(authHeader.slice(7), JWT_SECRET);
+      req.userId = decoded.id;
+      req.jwtVerified = true;
+      return next();
+    } catch (_) { /* invalid/expired — fall through to x-user-id */ }
+  }
   let uid = req.headers['x-user-id'] || req.headers['x-pi-token'] || null;
   if (uid === 'cherry19899') uid = 'pi_cherry19899';
   req.userId = uid;
