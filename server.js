@@ -350,13 +350,24 @@ app.post('/api/me', async (req, res) => {
       }
     }
     const uname = username || uid.replace(/^pi_/, '') || uid;
-    // UPSERT: create or update user — role is never changed here (only via adminAuth-protected endpoints)
-    await query(
-      `INSERT INTO users (id, username, role, balance_connects, created_at, updated_at)
-       VALUES ($1, $2, 'freelancer', 10, NOW(), NOW())
-       ON CONFLICT (id) DO UPDATE SET username = EXCLUDED.username, updated_at = NOW()`,
-      [uid, uname]
-    );
+    // UPSERT: create or update user.
+    // Username is only synced on Pi-verified logins (accessToken present) —
+    // unauthenticated legacy logins must not overwrite existing username.
+    if (accessToken) {
+      await query(
+        `INSERT INTO users (id, username, role, balance_connects, created_at, updated_at)
+         VALUES ($1, $2, 'freelancer', 10, NOW(), NOW())
+         ON CONFLICT (id) DO UPDATE SET username = EXCLUDED.username, updated_at = NOW()`,
+        [uid, uname]
+      );
+    } else {
+      await query(
+        `INSERT INTO users (id, username, role, balance_connects, created_at, updated_at)
+         VALUES ($1, $2, 'freelancer', 10, NOW(), NOW())
+         ON CONFLICT (id) DO UPDATE SET updated_at = NOW()`,
+        [uid, uname]
+      );
+    }
     // Migrate legacy 'cherry19899' records to 'pi_cherry19899' (idempotent, runs every login)
     if (uid === 'pi_cherry19899') {
       try {
