@@ -1608,11 +1608,24 @@ app.post('/api/escrows/:id/cancel', auth, checkBlocked, async (req, res) => {
     const escrow = result.rows[0];
     if (escrow.client_id !== req.userId) return res.status(403).json({ error: 'Not your escrow' });
     if (!['pending', 'funded'].includes(escrow.status)) return res.status(400).json({ error: 'Escrow already settled' });
-    await query('UPDATE escrows SET status = $1, updated_at = NOW() WHERE id = $2', ['refunded', req.params.id]);
-    await query('UPDATE jobs SET status = $1, hired_freelancer_id = NULL, updated_at = NOW() WHERE id = $2', ['open', escrow.job_id]);
-    // If escrow was funded, return Pi to client's internal balance
-    if (escrow.status === 'funded') {
-      await query('UPDATE users SET balance_pi = COALESCE(balance_pi, 0) + $1, updated_at = NOW() WHERE id = $2', [escrow.amount, escrow.client_id]);
+    const wasFunded = escrow.status === 'funded';
+    // Atomic: update escrow WHERE pending|funded; concurrent calls fail here
+    const pgClient6 = await getPool().connect();
+    try {
+      await pgClient6.query('BEGIN');
+      const updated = await pgClient6.query(
+        "UPDATE escrows SET status='refunded', updated_at=NOW() WHERE id=$1 AND status = ANY($2) RETURNING id",
+        [req.params.id, ['pending', 'funded']]
+      );
+      if (!updated.rows.length) { await pgClient6.query('ROLLBACK'); return res.status(400).json({ error: 'Escrow already settled' }); }
+      await pgClient6.query('UPDATE jobs SET status = $1, hired_freelancer_id = NULL, updated_at = NOW() WHERE id = $2', ['open', escrow.job_id]);
+      if (wasFunded) {
+        await pgClient6.query('UPDATE users SET balance_pi = COALESCE(balance_pi, 0) + $1, updated_at = NOW() WHERE id = $2', [escrow.amount, escrow.client_id]);
+      }
+      await pgClient6.query('COMMIT');
+    } catch (txErr) { await pgClient6.query('ROLLBACK').catch(() => {}); throw txErr; }
+    finally { pgClient6.release(); }
+    if (wasFunded) {
       await notify(escrow.client_id, 'payment', 'Эскроу отменён', `${escrow.amount}π возвращено на ваш счёт.`, escrow.job_id, null);
       await audit('escrow_cancelled_refunded', { escrow_id: req.params.id, amount: escrow.amount, client_id: escrow.client_id });
     }
@@ -2053,12 +2066,24 @@ app.post('/api/escrow/:id/refund', auth, checkBlocked, async (req, res) => {
     const escrow = result.rows[0];
     if (escrow.client_id !== req.userId) return res.status(403).json({ error: 'Not your escrow' });
     if (escrow.status === 'released' || escrow.status === 'refunded') return res.status(400).json({ error: 'Already processed' });
-    await query('UPDATE escrows SET status = $1, updated_at = NOW() WHERE id = $2', ['refunded', req.params.id]);
-    // Clear hired_freelancer_id so job returns to truly-open state
-    await query('UPDATE jobs SET status = $1, hired_freelancer_id = NULL, hired_freelancer_name = NULL, updated_at = NOW() WHERE id = $2', ['open', escrow.job_id]);
-    // Return Pi to client if escrow was funded
-    if (escrow.status === 'funded') {
-      await query('UPDATE users SET balance_pi = COALESCE(balance_pi, 0) + $1, updated_at = NOW() WHERE id = $2', [escrow.amount, escrow.client_id]);
+    const wasFunded = escrow.status === 'funded';
+    // Atomic: update escrow WHERE not already released/refunded
+    const pgClient7 = await getPool().connect();
+    try {
+      await pgClient7.query('BEGIN');
+      const updated = await pgClient7.query(
+        "UPDATE escrows SET status='refunded', updated_at=NOW() WHERE id=$1 AND status NOT IN ('released','refunded') RETURNING id",
+        [req.params.id]
+      );
+      if (!updated.rows.length) { await pgClient7.query('ROLLBACK'); return res.status(400).json({ error: 'Already processed' }); }
+      await pgClient7.query('UPDATE jobs SET status = $1, hired_freelancer_id = NULL, hired_freelancer_name = NULL, updated_at = NOW() WHERE id = $2', ['open', escrow.job_id]);
+      if (wasFunded) {
+        await pgClient7.query('UPDATE users SET balance_pi = COALESCE(balance_pi, 0) + $1, updated_at = NOW() WHERE id = $2', [escrow.amount, escrow.client_id]);
+      }
+      await pgClient7.query('COMMIT');
+    } catch (txErr) { await pgClient7.query('ROLLBACK').catch(() => {}); throw txErr; }
+    finally { pgClient7.release(); }
+    if (wasFunded) {
       await notify(escrow.client_id, 'payment', 'Возврат средств', `${escrow.amount}π возвращено на ваш счёт.`, escrow.job_id, null);
     }
     await audit('escrow_refunded', { escrow_id: req.params.id, status_was: escrow.status, amount: escrow.amount });
