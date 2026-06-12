@@ -1263,10 +1263,16 @@ app.post('/api/payments/:paymentId/complete', auth, async (req, res) => {
       // Only create escrow if this payment hasn't already funded one
       const existingEscrow = await query('SELECT id FROM escrows WHERE payment_id = $1 LIMIT 1', [paymentId]).catch(() => ({ rows: [] }));
       if (!existingEscrow.rows.length) {
-        await query(
-          'INSERT INTO escrows (job_id, client_id, freelancer_id, amount, payment_id, status) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING',
-          [meta.job_id, req.userId, meta.freelancer_id, parseFloat(piPayment.amount || markDone.rows[0].amount || 0), paymentId, 'funded']
-        );
+        const [jobCheck, freelancerCheck] = await Promise.all([
+          query('SELECT id FROM jobs WHERE id = $1 LIMIT 1', [meta.job_id]).catch(() => ({ rows: [] })),
+          query('SELECT id FROM users WHERE id = $1 LIMIT 1', [meta.freelancer_id]).catch(() => ({ rows: [] })),
+        ]);
+        if (jobCheck.rows.length && freelancerCheck.rows.length) {
+          await query(
+            'INSERT INTO escrows (job_id, client_id, freelancer_id, amount, payment_id, status) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING',
+            [meta.job_id, req.userId, meta.freelancer_id, parseFloat(piPayment.amount || markDone.rows[0].amount || 0), paymentId, 'funded']
+          );
+        }
       }
     }
 
@@ -1320,10 +1326,16 @@ app.post('/api/payments/incomplete', auth, async (req, res) => {
         } else if (meta.type === 'escrow' && meta.job_id && meta.freelancer_id) {
           const existingEscrow = await query('SELECT id FROM escrows WHERE payment_id = $1 LIMIT 1', [paymentId]).catch(() => ({ rows: [] }));
           if (!existingEscrow.rows.length) {
-            await query(
-              'INSERT INTO escrows (job_id, client_id, freelancer_id, amount, payment_id, status) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING',
-              [meta.job_id, paymentOwner, meta.freelancer_id, parseFloat(piPayment.amount || markDone.rows[0].amount || 0), paymentId, 'funded']
-            ).catch(() => {});
+            const [jobCheck, freelancerCheck] = await Promise.all([
+              query('SELECT id FROM jobs WHERE id = $1 LIMIT 1', [meta.job_id]).catch(() => ({ rows: [] })),
+              query('SELECT id FROM users WHERE id = $1 LIMIT 1', [meta.freelancer_id]).catch(() => ({ rows: [] })),
+            ]);
+            if (jobCheck.rows.length && freelancerCheck.rows.length) {
+              await query(
+                'INSERT INTO escrows (job_id, client_id, freelancer_id, amount, payment_id, status) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING',
+                [meta.job_id, paymentOwner, meta.freelancer_id, parseFloat(piPayment.amount || markDone.rows[0].amount || 0), paymentId, 'funded']
+              ).catch(() => {});
+            }
           }
         }
       }
@@ -2571,11 +2583,17 @@ app.post('/api/payments/complete', auth, async (req, res) => {
       } else if (meta.type === 'escrow' && meta.job_id && meta.freelancer_id) {
         const existingEsc = await query('SELECT id FROM escrows WHERE payment_id = $1 LIMIT 1', [payment_id]).catch(() => ({ rows: [] }));
         if (!existingEsc.rows.length) {
-          const piVerifiedAmt = parseFloat(completeData.amount || markDone.rows[0].amount || 0);
-          await query(
-            'INSERT INTO escrows (job_id, client_id, freelancer_id, amount, payment_id, status) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING',
-            [meta.job_id, paymentOwner, meta.freelancer_id, piVerifiedAmt, payment_id, 'funded']
-          ).catch(() => {});
+          const [jobCheck, freelancerCheck] = await Promise.all([
+            query('SELECT id FROM jobs WHERE id = $1 LIMIT 1', [meta.job_id]).catch(() => ({ rows: [] })),
+            query('SELECT id FROM users WHERE id = $1 LIMIT 1', [meta.freelancer_id]).catch(() => ({ rows: [] })),
+          ]);
+          if (jobCheck.rows.length && freelancerCheck.rows.length) {
+            const piVerifiedAmt = parseFloat(completeData.amount || markDone.rows[0].amount || 0);
+            await query(
+              'INSERT INTO escrows (job_id, client_id, freelancer_id, amount, payment_id, status) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING',
+              [meta.job_id, paymentOwner, meta.freelancer_id, piVerifiedAmt, payment_id, 'funded']
+            ).catch(() => {});
+          }
         }
       }
     }
@@ -3138,10 +3156,16 @@ app.post('/api/payments/:paymentId/resolve-complete', auth, async (req, res) => 
       } else if (meta.type === 'escrow' && meta.job_id && meta.freelancer_id) {
         const existingEscrowForPayment = await query('SELECT id FROM escrows WHERE payment_id = $1 LIMIT 1', [paymentId]).catch(() => ({ rows: [] }));
         if (!existingEscrowForPayment.rows.length) {
-          await query(
-            'INSERT INTO escrows (job_id, client_id, freelancer_id, amount, payment_id, status) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING',
-            [meta.job_id, paymentOwner, meta.freelancer_id, parseFloat(markDoneRC.rows[0].amount || 0), paymentId, 'funded']
-          ).catch(() => {});
+          const [jobCheck, freelancerCheck] = await Promise.all([
+            query('SELECT id FROM jobs WHERE id = $1 LIMIT 1', [meta.job_id]).catch(() => ({ rows: [] })),
+            query('SELECT id FROM users WHERE id = $1 LIMIT 1', [meta.freelancer_id]).catch(() => ({ rows: [] })),
+          ]);
+          if (jobCheck.rows.length && freelancerCheck.rows.length) {
+            await query(
+              'INSERT INTO escrows (job_id, client_id, freelancer_id, amount, payment_id, status) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING',
+              [meta.job_id, paymentOwner, meta.freelancer_id, parseFloat(markDoneRC.rows[0].amount || 0), paymentId, 'funded']
+            ).catch(() => {});
+          }
         }
       }
     }
