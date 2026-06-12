@@ -512,7 +512,8 @@ app.post('/api/users/:id', auth, checkBlocked, async (req, res) => {
   const { username, email, bio, skills, availability, avatar } = req.body;
   if (username && username.length > 50) return res.status(400).json({ error: 'Username too long (max 50)' });
   if (bio && bio.length > 1000) return res.status(400).json({ error: 'Bio too long (max 1000)' });
-  if (skills && skills.length > 300) return res.status(400).json({ error: 'Skills too long (max 300)' });
+  const skillsStr = skills !== undefined ? (Array.isArray(skills) ? skills.join(',') : (skills || null)) : undefined;
+  if (skillsStr && skillsStr.length > 300) return res.status(400).json({ error: 'Skills too long (max 300)' });
   if (email && (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))) return res.status(400).json({ error: 'Invalid email address' });
   const ALLOWED_AVAILABILITY = ['available', 'busy', 'away', 'unavailable'];
   if (availability && !ALLOWED_AVAILABILITY.includes(availability)) return res.status(400).json({ error: 'Invalid availability value' });
@@ -523,7 +524,7 @@ app.post('/api/users/:id', auth, checkBlocked, async (req, res) => {
   try {
     const result = await query(
       'UPDATE users SET username = COALESCE($1, username), email = COALESCE($2, email), bio = COALESCE($3, bio), skills = COALESCE($4, skills), availability = COALESCE($5, availability), avatar = COALESCE($6, avatar), updated_at = NOW() WHERE id = $7 RETURNING id, username, email, role, bio, skills, avatar, availability, balance_connects, rating, kyc_verified',
-      [username, email, bio, skills, availability, avatar, req.params.id]
+      [username, email, bio, skillsStr !== undefined ? skillsStr : skills, availability, avatar, req.params.id]
     );
     if (!result.rows.length) return res.status(404).json({ error: 'User not found' });
     res.json(result.rows[0]);
@@ -576,6 +577,7 @@ function parseJobRow(job) {
 
 app.get('/api/jobs', async (req, res) => {
   const { status, category, posted_by, client_uid, search, min_budget, max_budget, sort } = req.query;
+  if (search && search.length > 200) return res.status(400).json({ error: 'Search query too long (max 200 chars)' });
   const limit = Math.min(parseInt(req.query.limit) || 20, 200);
   const page = Math.max(parseInt(req.query.page) || 1, 1);
   const ownerFilter = posted_by || client_uid;
@@ -1502,6 +1504,7 @@ app.get('/api/admin/users', adminAuth, async (req, res) => {
   const offset = parseInt(req.query.offset) || 0;
   try {
     const search = req.query.search || '';
+    if (search.length > 200) return res.status(400).json({ error: 'Search query too long (max 200 chars)' });
     const safeFields = 'id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, is_blocked, status, created_at, updated_at';
     let sql, params = [];
     if (search) {
@@ -2029,7 +2032,8 @@ app.put('/api/users/me', auth, checkBlocked, async (req, res) => {
   const { username, bio, skills, availability, avatar, email } = req.body;
   if (username && username.length > 50) return res.status(400).json({ error: 'Username too long (max 50)' });
   if (bio && bio.length > 1000) return res.status(400).json({ error: 'Bio too long (max 1000)' });
-  if (skills && skills.length > 300) return res.status(400).json({ error: 'Skills too long (max 300)' });
+  const skillsStr = skills !== undefined ? (Array.isArray(skills) ? skills.join(',') : (skills || null)) : undefined;
+  if (skillsStr && skillsStr.length > 300) return res.status(400).json({ error: 'Skills too long (max 300)' });
   if (avatar && !/^https?:\/\//i.test(avatar)) return res.status(400).json({ error: 'Avatar must be a valid URL (http/https)' });
   if (email && (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))) return res.status(400).json({ error: 'Invalid email address' });
   const ALLOWED_AVAILABILITY = ['available', 'busy', 'away', 'unavailable'];
@@ -2041,7 +2045,7 @@ app.put('/api/users/me', auth, checkBlocked, async (req, res) => {
     let i = 1;
     if (username) { fields.push(`username=$${i++}`); vals.push(username); }
     if (bio !== undefined) { fields.push(`bio=$${i++}`); vals.push(bio); }
-    if (skills !== undefined) { fields.push(`skills=$${i++}`); vals.push(skills); }
+    if (skillsStr !== undefined) { fields.push(`skills=$${i++}`); vals.push(skillsStr); }
     if (availability) { fields.push(`availability=$${i++}`); vals.push(availability); }
     if (avatar) { fields.push(`avatar=$${i++}`); vals.push(avatar); }
     if (email) { fields.push(`email=$${i++}`); vals.push(email); }
