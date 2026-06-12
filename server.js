@@ -62,12 +62,22 @@ const connectsLimiter = rateLimit({
   keyGenerator: (req) => req.ip || req.headers['x-forwarded-for'] || 'unknown',
   message: { error: 'Too many connect operations, try again later' },
 });
+// Strict limiter for chat message sending — 30 messages per minute per IP
+const messageLimiter = rateLimit({
+  windowMs: 60 * 1000, max: 30,
+  keyGenerator: (req) => req.ip || req.headers['x-forwarded-for'] || 'unknown',
+  message: { error: 'Too many messages, slow down' },
+});
 app.use('/api/auth', authLimiter);
 app.use('/api/me', authLimiter); // POST /api/me is a login endpoint — same rate limit
 app.use('/api/admin', adminLimiter);
 app.use('/api/connects/purchase', connectsLimiter);
 app.use('/api/connects/buy', connectsLimiter);
 app.use('/api/payments', connectsLimiter);
+// Apply message limiter to all three chat message POST endpoints
+app.use('/api/chat/rooms', messageLimiter);
+app.use('/api/chat/conversations', messageLimiter);
+app.use('/api/chat/', messageLimiter);
 
 // ─── Helpers ──────────────────────────────────────────────
 function now() { return new Date().toISOString(); }
