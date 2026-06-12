@@ -18,7 +18,10 @@ const app = express();
 app.set('trust proxy', 1);
 const PORT = process.env.PORT || 3000;
 const NODE_ENV = process.env.NODE_ENV || 'production';
-const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(64).toString('hex');
+const JWT_SECRET = process.env.JWT_SECRET || (() => {
+  console.warn('[SECURITY] JWT_SECRET env var is not set — using a random secret. All sessions will be invalidated on each restart.');
+  return crypto.randomBytes(64).toString('hex');
+})();
 const ADMIN_API_KEY = process.env.ADMIN_API_KEY || 'admin-secret-key';
 if (ADMIN_API_KEY === 'admin-secret-key') {
   console.warn('[SECURITY] ADMIN_API_KEY is the default value — set a strong ADMIN_API_KEY env var, otherwise the admin panel is publicly accessible.');
@@ -1647,6 +1650,16 @@ app.post('/api/chat/start', auth, checkBlocked, async (req, res) => {
   if (!other_user_id) return res.status(400).json({ error: 'other_user_id required' });
   try {
     const jobId = job_id || 0;
+    // For job-linked rooms: require caller to be owner or hired freelancer (same guard as /chat/rooms)
+    if (jobId) {
+      const jobCheck = await query('SELECT posted_by, hired_freelancer_id FROM jobs WHERE id = $1', [jobId]);
+      if (jobCheck.rows.length) {
+        const j = jobCheck.rows[0];
+        if (j.posted_by !== req.userId && j.hired_freelancer_id !== req.userId && other_user_id !== req.userId) {
+          return res.status(403).json({ error: 'You must be a participant in this job to start a chat' });
+        }
+      }
+    }
     const existing = await query(
       'SELECT * FROM chat_rooms WHERE job_id = $3 AND ((client_id = $1 AND freelancer_id = $2) OR (client_id = $2 AND freelancer_id = $1))',
       [req.userId, other_user_id, jobId]
