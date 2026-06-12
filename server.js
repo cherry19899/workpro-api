@@ -491,6 +491,8 @@ app.get('/api/users/:id', softAuth, async (req, res) => {
     if (!result.rows.length) return res.status(404).json({ error: 'User not found' });
     const u = result.rows[0];
     const isOwner = callerId === u.id;
+    // Hide deleted accounts from other users
+    if (!isOwner && u.status === 'deleted') return res.status(404).json({ error: 'User not found' });
     // Sensitive fields only for the owner themselves
     if (!isOwner) {
       delete u.balance_connects;
