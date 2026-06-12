@@ -274,7 +274,7 @@ app.get('/api/health', async (req, res) => {
 });
 
 // PUT /api/me — update profile (used by Profile.js)
-app.put('/api/me', auth, async (req, res) => {
+app.put('/api/me', auth, checkBlocked, async (req, res) => {
   const { username, bio, skills, display_name } = req.body;
   if (bio && bio.length > 1000) return res.status(400).json({ error: 'Bio too long (max 1000)' });
   if (skills && skills.length > 300) return res.status(400).json({ error: 'Skills too long (max 300)' });
@@ -479,7 +479,7 @@ app.get('/api/users/:id', softAuth, async (req, res) => {
   }
 });
 
-app.post('/api/users/:id', auth, async (req, res) => {
+app.post('/api/users/:id', auth, checkBlocked, async (req, res) => {
   if (req.userId !== req.params.id) return res.status(403).json({ error: 'Forbidden' });
   const { username, email, bio, skills, availability, avatar } = req.body;
   if (username && username.length > 50) return res.status(400).json({ error: 'Username too long (max 50)' });
@@ -1900,7 +1900,7 @@ app.get('/api/users/me', auth, async (req, res) => {
 });
 
 // PUT /api/users/me — update current user profile
-app.put('/api/users/me', auth, async (req, res) => {
+app.put('/api/users/me', auth, checkBlocked, async (req, res) => {
   const { username, bio, skills, availability, avatar, email } = req.body;
   if (username && username.length > 50) return res.status(400).json({ error: 'Username too long (max 50)' });
   if (bio && bio.length > 1000) return res.status(400).json({ error: 'Bio too long (max 1000)' });
@@ -2152,7 +2152,7 @@ app.get('/api/users/:id/portfolio', async (req, res) => {
   } catch (err) { serverError(err, res); }
 });
 
-app.put('/api/users/me/portfolio', auth, async (req, res) => {
+app.put('/api/users/me/portfolio', auth, checkBlocked, async (req, res) => {
   const { headline, summary, experience_years, website, github, linkedin } = req.body;
   if (headline && headline.length > 200) return res.status(400).json({ error: 'Headline too long (max 200)' });
   if (summary && summary.length > 2000) return res.status(400).json({ error: 'Summary too long (max 2000)' });
@@ -2640,9 +2640,15 @@ app.get('/api/offers/:id', auth, async (req, res) => {
 // POST /api/applications/:id/view — mark application as viewed
 app.post('/api/applications/:id/view', auth, async (req, res) => {
   try {
-    await query('UPDATE applications SET viewed = true, viewed_at = NOW() WHERE id = $1', [req.params.id]).catch(() => {
-      // viewed column may not exist, ignore
-    });
+    // Only the job owner may mark an application as viewed
+    const appRes = await query(
+      'SELECT j.posted_by FROM applications a JOIN jobs j ON a.job_id = j.id WHERE a.id = $1',
+      [req.params.id]
+    );
+    if (appRes.rows.length && appRes.rows[0].posted_by !== req.userId) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    await query('UPDATE applications SET viewed = true, viewed_at = NOW() WHERE id = $1', [req.params.id]).catch(() => {});
     res.json({ success: true });
   } catch (err) { res.json({ success: true }); }
 });
@@ -2708,7 +2714,7 @@ app.post('/api/escrows/:id/fund', auth, async (req, res) => {
 });
 
 // POST /api/escrows/:id/dispute — open a dispute
-app.post('/api/escrows/:id/dispute', auth, async (req, res) => {
+app.post('/api/escrows/:id/dispute', auth, checkBlocked, async (req, res) => {
   const { reason } = req.body;
   if (reason && reason.length > 1000) return res.status(400).json({ error: 'Reason too long (max 1000 chars)' });
   try {
@@ -2754,7 +2760,7 @@ app.get('/api/escrows/:id/room', auth, async (req, res) => {
 
 
 // POST /api/offers/:id/accept — accept a job offer
-app.post('/api/offers/:id/accept', auth, async (req, res) => {
+app.post('/api/offers/:id/accept', auth, checkBlocked, async (req, res) => {
   try {
     const result = await query('UPDATE applications SET status = $1 WHERE id = $2 AND freelancer_id = $3 RETURNING *', ['accepted', req.params.id, req.userId]);
     if (!result.rows.length) return res.status(404).json({ error: 'Offer not found' });
@@ -2763,7 +2769,7 @@ app.post('/api/offers/:id/accept', auth, async (req, res) => {
 });
 
 // POST /api/offers/:id/decline — decline a job offer
-app.post('/api/offers/:id/decline', auth, async (req, res) => {
+app.post('/api/offers/:id/decline', auth, checkBlocked, async (req, res) => {
   try {
     const result = await query('UPDATE applications SET status = $1 WHERE id = $2 AND freelancer_id = $3 RETURNING *', ['declined', req.params.id, req.userId]);
     if (!result.rows.length) return res.status(404).json({ error: 'Offer not found' });
