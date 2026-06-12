@@ -2689,6 +2689,10 @@ app.post('/api/offers', auth, checkBlocked, async (req, res) => {
   const { to_user_id, job_id, amount, message } = req.body;
   if (!to_user_id || !job_id) return res.status(400).json({ error: 'to_user_id and job_id required' });
   if (message && message.length > 2000) return res.status(400).json({ error: 'Message too long (max 2000)' });
+  if (amount !== undefined) {
+    const amountNum = parseFloat(amount);
+    if (isNaN(amountNum) || amountNum <= 0 || amountNum > 100000) return res.status(400).json({ error: 'amount must be a positive number (max 100000)' });
+  }
   try {
     // Verify the job belongs to the requester
     const jobRes = await query('SELECT * FROM jobs WHERE id = $1', [job_id]);
@@ -2699,6 +2703,12 @@ app.post('/api/offers', auth, checkBlocked, async (req, res) => {
     const freelancerRes = await query('SELECT id, username FROM users WHERE id = $1', [to_user_id]);
     if (!freelancerRes.rows.length) return res.status(404).json({ error: 'Freelancer not found' });
     const freelancer = freelancerRes.rows[0];
+    // Prevent duplicate offers for the same job/freelancer pair
+    const existingOffer = await query(
+      "SELECT id FROM applications WHERE job_id = $1 AND freelancer_id = $2 AND status = 'offer' LIMIT 1",
+      [job_id, to_user_id]
+    );
+    if (existingOffer.rows.length) return res.status(400).json({ error: 'Offer already sent to this freelancer for this job' });
     const callerRes = await query('SELECT username FROM users WHERE id = $1', [req.userId]);
     const callerName = callerRes.rows[0]?.username || req.userId;
     // Create application record with status='offer'
