@@ -2180,6 +2180,11 @@ app.post('/api/payments/approve', auth, async (req, res) => {
   const { payment_id, metadata } = req.body;
   if (!payment_id) return res.status(400).json({ error: 'payment_id required' });
   try {
+    // Verify ownership if payment already exists in DB
+    const ownerCheck = await query('SELECT user_id FROM payments WHERE id = $1', [payment_id]).catch(() => ({ rows: [] }));
+    if (ownerCheck.rows.length && ownerCheck.rows[0].user_id && ownerCheck.rows[0].user_id !== req.userId) {
+      return res.status(403).json({ error: 'Payment does not belong to you' });
+    }
     // Pi verification is mandatory when configured. piApprovePayment throws on a
     // non-OK Pi response (e.g. payment_not_found), so a forged payment id can never
     // be recorded as 'approved' — which would otherwise let it be redeemed for connects.
@@ -2208,6 +2213,11 @@ app.post('/api/payments/complete', auth, async (req, res) => {
   const { payment_id, txid, metadata } = req.body;
   if (!payment_id || !txid) return res.status(400).json({ error: 'payment_id and txid required' });
   try {
+    // Verify payment ownership (allow if payment not in DB yet — first completion)
+    const ownerCheck = await query('SELECT user_id FROM payments WHERE id = $1', [payment_id]).catch(() => ({ rows: [] }));
+    if (ownerCheck.rows.length && ownerCheck.rows[0].user_id && ownerCheck.rows[0].user_id !== req.userId) {
+      return res.status(403).json({ error: 'Payment does not belong to you' });
+    }
     const completeRes = await fetch(`https://api.minepi.com/v2/payments/${payment_id}/complete`, {
       method: 'POST',
       headers: {
