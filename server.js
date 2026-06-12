@@ -1580,8 +1580,16 @@ app.get('/api/admin/jobs', adminAuth, async (req, res) => {
 
 app.delete('/api/admin/jobs/:id', adminAuth, async (req, res) => {
   try {
+    // Refund funded escrow to client before hard-deleting the job
+    const fundedEscrow = await query("SELECT * FROM escrows WHERE job_id = $1 AND status = 'funded' LIMIT 1", [req.params.id]);
+    if (fundedEscrow.rows.length) {
+      const esc = fundedEscrow.rows[0];
+      await query("UPDATE escrows SET status='refunded', updated_at=NOW() WHERE id=$1", [esc.id]);
+      await query('UPDATE users SET balance_pi = COALESCE(balance_pi,0) + $1, updated_at=NOW() WHERE id=$2', [esc.amount, esc.client_id]);
+    }
     await query('DELETE FROM applications WHERE job_id = $1', [req.params.id]);
     await query('DELETE FROM jobs WHERE id = $1', [req.params.id]);
+    await audit('admin_job_deleted', { job_id: req.params.id, by: req.userId, escrow_refunded: fundedEscrow.rows.length > 0 });
     res.json({ success: true });
   } catch (err) {
     serverError(err, res);
