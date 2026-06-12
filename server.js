@@ -475,6 +475,7 @@ app.post('/api/users/:id', auth, async (req, res) => {
   const { username, email, bio, skills, availability, avatar } = req.body;
   if (username && username.length > 50) return res.status(400).json({ error: 'Username too long (max 50)' });
   if (bio && bio.length > 1000) return res.status(400).json({ error: 'Bio too long (max 1000)' });
+  if (email && (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))) return res.status(400).json({ error: 'Invalid email address' });
   // Limit base64 avatar to 2MB to prevent DoS
   if (avatar && avatar.length > 2 * 1024 * 1024 * 1.37) {
     return res.status(400).json({ error: 'Фото слишком большое (макс. 2MB)' });
@@ -1047,6 +1048,11 @@ app.post('/api/payments/:paymentId/approve', auth, async (req, res) => {
   const { paymentId } = req.params;
   const { metadata } = req.body;
   try {
+    // Verify ownership if payment already in DB
+    const ownerCheck = await query('SELECT user_id FROM payments WHERE id = $1', [paymentId]).catch(() => ({ rows: [] }));
+    if (ownerCheck.rows.length && ownerCheck.rows[0].user_id && ownerCheck.rows[0].user_id !== req.userId) {
+      return res.status(403).json({ error: 'Payment does not belong to you' });
+    }
     let piPayment = { amount: 0 };
     // When PI_API_KEY is configured, verification with Pi Platform is mandatory
     if (PI_API_KEY) {
@@ -1079,6 +1085,11 @@ app.post('/api/payments/:paymentId/complete', auth, async (req, res) => {
   const { txid, metadata } = req.body;
   if (!txid) return res.status(400).json({ error: 'txid required' });
   try {
+    // Verify ownership if payment already in DB
+    const ownerCheck2 = await query('SELECT user_id FROM payments WHERE id = $1', [paymentId]).catch(() => ({ rows: [] }));
+    if (ownerCheck2.rows.length && ownerCheck2.rows[0].user_id && ownerCheck2.rows[0].user_id !== req.userId) {
+      return res.status(403).json({ error: 'Payment does not belong to you' });
+    }
     let piPayment = { amount: 0 };
     // When PI_API_KEY is configured, completion with Pi Platform is mandatory
     if (PI_API_KEY) {
@@ -1102,9 +1113,10 @@ app.post('/api/payments/:paymentId/complete', auth, async (req, res) => {
       const meta = paymentRecord.rows[0].metadata || {};
       const paymentOwner = paymentRecord.rows[0].user_id || req.userId;
       if (meta.type === 'connects') {
-        // SECURITY: derives connects from Pi amount paid, not client-supplied metadata
+        // SECURITY: derives connects strictly from Pi-verified amount; never from metadata
         const piAmountPaid = parseFloat(piPayment.amount || paymentRecord.rows[0].amount || 0);
-        const amount = piAmountPaid > 0 ? Math.floor(piAmountPaid * 10) : parseInt(meta.connects_amount || 10);
+        const amount = Math.floor(piAmountPaid * 10);
+        if (amount <= 0) return res.status(400).json({ error: 'Payment amount too small to credit connects' });
         await query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [amount, paymentOwner]);
       } else if (meta.type === 'escrow' && meta.job_id && meta.freelancer_id) {
         // Create escrow record — hireFreelancer endpoint updates job status after this
