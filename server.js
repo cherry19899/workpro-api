@@ -264,6 +264,7 @@ app.put('/api/me', auth, async (req, res) => {
   if (skills && skills.length > 300) return res.status(400).json({ error: 'Skills too long (max 300)' });
   try {
     const uname = display_name || username;
+    if (uname && uname.length > 50) return res.status(400).json({ error: 'Username too long (max 50)' });
     const skillsStr = Array.isArray(skills) ? skills.join(',') : (skills || null);
     await query(
       'UPDATE users SET username = COALESCE($1, username), bio = COALESCE($2, bio), skills = COALESCE($3, skills), updated_at = NOW() WHERE id = $4',
@@ -463,6 +464,8 @@ app.get('/api/users/:id', softAuth, async (req, res) => {
 app.post('/api/users/:id', auth, async (req, res) => {
   if (req.userId !== req.params.id) return res.status(403).json({ error: 'Forbidden' });
   const { username, email, bio, skills, availability, avatar } = req.body;
+  if (username && username.length > 50) return res.status(400).json({ error: 'Username too long (max 50)' });
+  if (bio && bio.length > 1000) return res.status(400).json({ error: 'Bio too long (max 1000)' });
   // Limit base64 avatar to 2MB to prevent DoS
   if (avatar && avatar.length > 2 * 1024 * 1024 * 1.37) {
     return res.status(400).json({ error: 'Фото слишком большое (макс. 2MB)' });
