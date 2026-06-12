@@ -2179,7 +2179,7 @@ app.put('/api/users/me/portfolio', auth, checkBlocked, async (req, res) => {
   } catch (err) { serverError(err, res); }
 });
 
-app.post('/api/users/me/portfolio/items', auth, async (req, res) => {
+app.post('/api/users/me/portfolio/items', auth, checkBlocked, async (req, res) => {
   const { title, description, image_url, url, category, tags } = req.body;
   const finalUrl = image_url || url || '';
   if (!title) return res.status(400).json({ error: 'title required' });
