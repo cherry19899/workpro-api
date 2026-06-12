@@ -3065,7 +3065,7 @@ app.post('/api/payments/:paymentId/resolve-complete', auth, async (req, res) => 
 
     // Mark as completed in our DB — idempotency guard prevents double-credit
     const markDoneRC = await query(
-      `UPDATE payments SET status = 'completed', txid = COALESCE($1, txid), updated_at = NOW() WHERE id = $2 AND status != 'completed' RETURNING *`,
+      `UPDATE payments SET status = 'completed', txid = COALESCE($1, txid), updated_at = NOW() WHERE id = $2 AND status = 'approved' RETURNING *`,
       [txid, paymentId]
     ).catch(() => ({ rows: [] }));
 
