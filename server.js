@@ -513,8 +513,9 @@ function parseJobRow(job) {
 }
 
 app.get('/api/jobs', async (req, res) => {
-  const { status, category, posted_by, client_uid, search, limit = 20, page = 1,
-          min_budget, max_budget, sort } = req.query;
+  const { status, category, posted_by, client_uid, search, min_budget, max_budget, sort } = req.query;
+  const limit = Math.min(parseInt(req.query.limit) || 20, 200);
+  const page = Math.max(parseInt(req.query.page) || 1, 1);
   const ownerFilter = posted_by || client_uid;
   try {
     let conditions = [];
@@ -611,27 +612,31 @@ app.get('/api/jobs/user/:userId', async (req, res) => {
 
 // GET /api/jobs/as-freelancer — jobs where current user is the hired freelancer
 app.get('/api/jobs/as-freelancer', auth, async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+  const offset = parseInt(req.query.offset) || 0;
   try {
     const result = await query(
       `SELECT j.*, u.username as client_username
        FROM jobs j
        LEFT JOIN users u ON u.id = j.posted_by
        WHERE j.hired_freelancer_id = $1
-       ORDER BY j.updated_at DESC`,
-      [req.userId]
+       ORDER BY j.updated_at DESC LIMIT $2 OFFSET $3`,
+      [req.userId, limit, offset]
     );
-    res.json({ jobs: result.rows.map(parseJobRow) });
+    res.json({ jobs: result.rows.map(parseJobRow), limit, offset });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // GET /api/jobs/my — client's own posted jobs (must be before /:id to avoid conflict)
 app.get('/api/jobs/my', auth, async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+  const offset = parseInt(req.query.offset) || 0;
   try {
     const result = await query(
-      'SELECT j.*, u.username as client_username FROM jobs j LEFT JOIN users u ON u.id = j.posted_by WHERE j.posted_by = $1 ORDER BY j.created_at DESC',
-      [req.userId]
+      'SELECT j.*, u.username as client_username FROM jobs j LEFT JOIN users u ON u.id = j.posted_by WHERE j.posted_by = $1 ORDER BY j.created_at DESC LIMIT $2 OFFSET $3',
+      [req.userId, limit, offset]
     );
-    res.json({ jobs: result.rows.map(parseJobRow) });
+    res.json({ jobs: result.rows.map(parseJobRow), limit, offset });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -1443,12 +1448,14 @@ app.get('/api/admin/verify', async (req, res) => {
 
 // GET /api/jobs/:id/applications — used by JobDetail.js
 app.get('/api/jobs/:id/applications', auth, async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 100, 500);
+  const offset = parseInt(req.query.offset) || 0;
   try {
     const jobResult = await query('SELECT posted_by FROM jobs WHERE id = $1', [req.params.id]);
     if (!jobResult.rows.length) return res.status(404).json({ error: 'Job not found' });
     if (jobResult.rows[0].posted_by !== req.userId) return res.status(403).json({ error: 'Forbidden' });
-    const result = await query('SELECT * FROM applications WHERE job_id = $1 ORDER BY created_at DESC', [req.params.id]);
-    res.json({ applications: result.rows });
+    const result = await query('SELECT * FROM applications WHERE job_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3', [req.params.id, limit, offset]);
+    res.json({ applications: result.rows, limit, offset });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
