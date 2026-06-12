@@ -2415,16 +2415,24 @@ app.post('/api/connects/buy', auth, checkBlocked, async (req, res) => {
       return res.status(400).json({ error: 'Payment amount too small to credit any connects' });
     }
 
-    // Atomic: mark payment completed + credit connects (idempotent on payment id)
+    // Atomic: mark payment completed + credit connects. Uses conditional UPDATE (not DO UPDATE)
+    // so concurrent calls hit the WHERE status!='completed' guard and ROLLBACK rather than
+    // double-crediting (same pattern as /api/connects/purchase).
     const pgClient = await getPool().connect();
     try {
       await pgClient.query('BEGIN');
       await pgClient.query(
         `INSERT INTO payments (id, user_id, payment_id, amount, status, txid, metadata)
-         VALUES ($1,$2,$1,$3,'completed',$4,$5)
-         ON CONFLICT (id) DO UPDATE SET status='completed', txid=$4, amount=$3, updated_at=NOW()`,
+         VALUES ($1,$2,$1,$3,'pending',$4,$5)
+         ON CONFLICT (id) DO NOTHING`,
         [payment_id, req.userId, piAmount, txid, JSON.stringify({ type: 'connects', credited })]
       );
+      const updated = await pgClient.query(
+        `UPDATE payments SET status='completed', txid=$2, amount=$3, updated_at=NOW()
+         WHERE id=$1 AND status != 'completed' RETURNING id`,
+        [payment_id, txid, piAmount]
+      );
+      if (!updated.rows.length) { await pgClient.query('ROLLBACK'); return res.status(400).json({ error: 'Payment already processed' }); }
       await pgClient.query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [credited, req.userId]);
       await pgClient.query('COMMIT');
     } catch (txErr) {
