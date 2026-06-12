@@ -2327,9 +2327,9 @@ app.post('/api/offers', auth, checkBlocked, async (req, res) => {
 
 // GET /api/offers — direct offers (job invitations) for freelancer
 app.get('/api/offers', auth, async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+  const offset = parseInt(req.query.offset) || 0;
   try {
-    // Offers are applications where the job posted_by invited the freelancer
-    // For now, return applications with status 'offer' or all pending ones
     const result = await query(
       `SELECT a.*, j.title as job_title, j.budget, j.status as job_status,
               u.username as client_username
@@ -2338,10 +2338,10 @@ app.get('/api/offers', auth, async (req, res) => {
        LEFT JOIN users u ON u.id = j.posted_by
        WHERE a.freelancer_id = $1
          AND a.status = 'offer'
-       ORDER BY a.created_at DESC`,
-      [req.userId]
+       ORDER BY a.created_at DESC LIMIT $2 OFFSET $3`,
+      [req.userId, limit, offset]
     );
-    res.json({ offers: result.rows });
+    res.json({ offers: result.rows, limit, offset });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -2415,6 +2415,8 @@ app.post('/api/applications/:id/view', auth, async (req, res) => {
 
 // GET /api/chat/:roomId/messages — messages in a chat room (uses chat_messages table)
 app.get('/api/chat/:roomId/messages', auth, async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 100, 200);
+  const offset = parseInt(req.query.offset) || 0;
   try {
     const roomCheck = await query(
       'SELECT id FROM chat_rooms WHERE id = $1 AND (client_id = $2 OR freelancer_id = $2)',
@@ -2428,10 +2430,10 @@ app.get('/api/chat/:roomId/messages', auth, async (req, res) => {
        LEFT JOIN users u ON u.id = cm.sender_id
        WHERE cm.room_id = $1
        ORDER BY cm.created_at ASC
-       LIMIT 200`,
-      [req.params.roomId]
+       LIMIT $2 OFFSET $3`,
+      [req.params.roomId, limit, offset]
     );
-    res.json({ messages: result.rows });
+    res.json({ messages: result.rows, limit, offset });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -2680,21 +2682,15 @@ app.get('/api/users/:id/connects', auth, async (req, res) => {
   } catch (err) { res.json({ balance: 0, connects: 0 }); }
 });
 
-// GET /api/reviews/:userId — list reviews for a user (bundle calls /api/reviews/${userId})
-// Must come AFTER all specific /api/reviews/... routes
-app.get('/api/reviews/:userId', async (req, res) => {
-  try {
-    const result = await query(
-      'SELECT r.*, u.username as from_username FROM ratings r LEFT JOIN users u ON u.id = r.from_user_id WHERE r.to_user_id = $1 ORDER BY r.created_at DESC',
-      [req.params.userId]
-    );
-    res.json({ reviews: result.rows, ratings: result.rows });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
+// NOTE: GET /api/reviews/:id above already handles userId as non-numeric param (returns all reviews for that user).
+// This duplicate handler is intentionally removed — Express would never reach it.
 
 // POST /api/push/subscribe — Web Push notification subscription
 app.post('/api/push/subscribe', softAuth, async (req, res) => {
   const { endpoint, keys } = req.body || {};
+  if (endpoint && !endpoint.startsWith('https://')) {
+    return res.status(400).json({ error: 'Invalid push endpoint' });
+  }
   if (req.userId && endpoint) {
     await query(
       `INSERT INTO push_subscriptions (user_id, endpoint, keys, updated_at)
