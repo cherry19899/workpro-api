@@ -122,6 +122,8 @@ async function ensureNotificationsTable() {
     await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_chat_read_at TIMESTAMPTZ`);
     // Ensure unique constraint on applications(job_id, freelancer_id) to prevent duplicate apply race
     await query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_applications_unique_apply ON applications(job_id, freelancer_id)`);
+    // One-time migration: recalculate apply_cost for jobs still at old default
+    await query(`UPDATE jobs SET apply_cost = CEIL(budget::numeric / 50.0)::int, connects_spent = CEIL(budget::numeric / 50.0)::int WHERE CEIL(budget::numeric / 50.0)::int != apply_cost`).catch((e) => console.error('[Migration] apply_cost fix error:', e.message));
   } catch (_) {}
 }
 
@@ -357,8 +359,6 @@ app.post('/api/me', async (req, res) => {
     }
     // Always sync total_jobs_posted from real DB count to fix drift
     await query(`UPDATE users SET total_jobs_posted = (SELECT COUNT(*) FROM jobs WHERE posted_by = $1), updated_at = NOW() WHERE id = $1`, [uid]).catch(() => {});
-    // Recalculate apply_cost for all jobs that still have the old default (1) — one-time migration
-    await query(`UPDATE jobs SET apply_cost = CEIL(budget::numeric / 50.0)::int, connects_spent = CEIL(budget::numeric / 50.0)::int WHERE CEIL(budget::numeric / 50.0)::int != apply_cost`).catch((e) => console.error('[Migration] apply_cost fix error:', e.message));
     const user = await query('SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, status, created_at FROM users WHERE id = $1', [uid]);
     await audit('user_login', { user_id: uid });
     const u = user.rows[0];
@@ -2301,6 +2301,14 @@ app.post('/api/applications/:id/hire', auth, checkBlocked, async (req, res) => {
         "SELECT * FROM escrows WHERE job_id = $1 AND status = ANY($2) FOR UPDATE",
         [app_.job_id, ['pending', 'funded']]
       );
+      // Prevent reusing a Pi payment across multiple escrows
+      const paymentUsed = await pgClientHire.query(
+        'SELECT id FROM escrows WHERE payment_id = $1 LIMIT 1', [payment_id]
+      );
+      if (paymentUsed.rows.length && (!existingEsc.rows.length || existingEsc.rows[0].payment_id !== payment_id)) {
+        await pgClientHire.query('ROLLBACK');
+        return res.status(400).json({ error: 'Payment already used for another escrow' });
+      }
       if (existingEsc.rows.length) {
         escrowRow = existingEsc.rows[0];
       } else {
@@ -2707,6 +2715,9 @@ app.post('/api/escrows/:id/fund', auth, async (req, res) => {
     // Require that the payment record exists in our DB (created by Pi payment webhook)
     const pmtCheck = await query('SELECT id FROM payments WHERE payment_id = $1 AND status = $2 LIMIT 1', [payment_id, 'completed']);
     if (!pmtCheck.rows.length) return res.status(402).json({ error: 'Payment not verified — complete Pi payment first' });
+    // Prevent reusing a Pi payment that already funds a different escrow
+    const paymentUsedFund = await query('SELECT id FROM escrows WHERE payment_id = $1 AND id != $2 LIMIT 1', [payment_id, req.params.id]);
+    if (paymentUsedFund.rows.length) return res.status(400).json({ error: 'Payment already used for another escrow' });
     await query('UPDATE escrows SET status = $1, payment_id = $2, updated_at = NOW() WHERE id = $3', ['funded', payment_id, req.params.id]);
     await audit('escrow_funded', { escrow_id: req.params.id, payment_id, txid });
     res.json({ escrow: { ...escrow, status: 'funded' }, success: true });
