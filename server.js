@@ -2357,7 +2357,8 @@ app.post('/api/payments/complete', auth, async (req, res) => {
     });
     const completeData = await completeRes.json();
     if (!completeRes.ok) {
-      return res.status(502).json({ error: 'Pi payment completion failed', details: completeData });
+      console.error('[Payment/complete] Pi completion failed:', completeData);
+      return res.status(502).json({ error: 'Pi payment completion failed' });
     }
     // Update using id (not payment_id column)
     await query(
