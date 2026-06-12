@@ -817,19 +817,33 @@ app.post('/api/jobs/:id/complete', auth, checkBlocked, async (req, res) => {
     if (job.posted_by !== req.userId) return res.status(403).json({ error: 'Not your job' });
     if (!['in_progress', 'submitted'].includes(job.status)) return res.status(400).json({ error: 'Job is not in progress' });
 
-    const escrow = await query('SELECT * FROM escrows WHERE job_id = $1 AND status = $2 LIMIT 1', [req.params.id, 'funded']);
     let paidAmount = 0;
-    if (escrow.rows.length) {
-      const e = escrow.rows[0];
-      const net = parseFloat((e.amount * 0.98).toFixed(8)); // 2% platform commission
-      await query('UPDATE escrows SET status = $1, updated_at = NOW() WHERE id = $2', ['released', e.id]);
-      await query('UPDATE users SET balance_pi = COALESCE(balance_pi, 0) + $1, updated_at = NOW() WHERE id = $2', [net, e.freelancer_id]);
-      paidAmount = net;
-    }
-    await query('UPDATE jobs SET status = $1, updated_at = NOW() WHERE id = $2', ['completed', req.params.id]);
-    if (job.hired_freelancer_id) {
-      await query('UPDATE users SET total_jobs_completed = total_jobs_completed + 1, updated_at = NOW() WHERE id = $1', [job.hired_freelancer_id]);
-    }
+    const pgClient5 = await getPool().connect();
+    try {
+      await pgClient5.query('BEGIN');
+      // Idempotency guard: only complete if still in_progress or submitted
+      const jobUpdate = await pgClient5.query(
+        "UPDATE jobs SET status='completed', updated_at=NOW() WHERE id=$1 AND status = ANY($2) RETURNING id",
+        [req.params.id, ['in_progress', 'submitted']]
+      );
+      if (!jobUpdate.rows.length) { await pgClient5.query('ROLLBACK'); return res.status(400).json({ error: 'Job already completed or status changed' }); }
+      const escrow = await pgClient5.query(
+        "UPDATE escrows SET status='released', updated_at=NOW() WHERE job_id=$1 AND status='funded' RETURNING *",
+        [req.params.id]
+      );
+      if (escrow.rows.length) {
+        const e = escrow.rows[0];
+        const net = parseFloat((e.amount * 0.98).toFixed(8)); // 2% platform commission
+        await pgClient5.query('UPDATE users SET balance_pi = COALESCE(balance_pi, 0) + $1, updated_at = NOW() WHERE id = $2', [net, e.freelancer_id]);
+        paidAmount = net;
+      }
+      if (job.hired_freelancer_id) {
+        await pgClient5.query('UPDATE users SET total_jobs_completed = total_jobs_completed + 1, updated_at = NOW() WHERE id = $1', [job.hired_freelancer_id]);
+      }
+      await pgClient5.query('COMMIT');
+    } catch (txErr) { await pgClient5.query('ROLLBACK').catch(() => {}); throw txErr; }
+    finally { pgClient5.release(); }
+
     await audit('job_completed', { job_id: req.params.id, paid: paidAmount });
     if (job.hired_freelancer_id) {
       const payMsg = paidAmount > 0
