@@ -2970,8 +2970,12 @@ app.get('/api/escrows/:id/room', auth, async (req, res) => {
 // POST /api/offers/:id/accept — accept a job offer
 app.post('/api/offers/:id/accept', auth, checkBlocked, async (req, res) => {
   try {
-    const result = await query('UPDATE applications SET status = $1 WHERE id = $2 AND freelancer_id = $3 RETURNING *', ['accepted', req.params.id, req.userId]);
-    if (!result.rows.length) return res.status(404).json({ error: 'Offer not found' });
+    const result = await query("UPDATE applications SET status = $1 WHERE id = $2 AND freelancer_id = $3 AND status = 'pending' RETURNING *", ['accepted', req.params.id, req.userId]);
+    if (!result.rows.length) {
+      const exists = await query('SELECT status FROM applications WHERE id = $1 AND freelancer_id = $2', [req.params.id, req.userId]);
+      if (!exists.rows.length) return res.status(404).json({ error: 'Offer not found' });
+      return res.status(400).json({ error: 'Offer is no longer pending' });
+    }
     res.json({ application: result.rows[0], success: true });
   } catch (err) { serverError(err, res); }
 });
@@ -2979,8 +2983,12 @@ app.post('/api/offers/:id/accept', auth, checkBlocked, async (req, res) => {
 // POST /api/offers/:id/decline — decline a job offer
 app.post('/api/offers/:id/decline', auth, checkBlocked, async (req, res) => {
   try {
-    const result = await query('UPDATE applications SET status = $1 WHERE id = $2 AND freelancer_id = $3 RETURNING *', ['declined', req.params.id, req.userId]);
-    if (!result.rows.length) return res.status(404).json({ error: 'Offer not found' });
+    const result = await query("UPDATE applications SET status = $1 WHERE id = $2 AND freelancer_id = $3 AND status = 'pending' RETURNING *", ['declined', req.params.id, req.userId]);
+    if (!result.rows.length) {
+      const exists = await query('SELECT status FROM applications WHERE id = $1 AND freelancer_id = $2', [req.params.id, req.userId]);
+      if (!exists.rows.length) return res.status(404).json({ error: 'Offer not found' });
+      return res.status(400).json({ error: 'Offer is no longer pending' });
+    }
     res.json({ application: result.rows[0], success: true });
   } catch (err) { serverError(err, res); }
 });
