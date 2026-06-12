@@ -68,6 +68,11 @@ const messageLimiter = rateLimit({
   keyGenerator: (req) => req.ip || req.headers['x-forwarded-for'] || 'unknown',
   message: { error: 'Too many messages, slow down' },
 });
+const jobPostLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, max: 10,
+  keyGenerator: (req) => req.ip || req.headers['x-forwarded-for'] || 'unknown',
+  message: { error: 'Too many jobs posted, try again later' },
+});
 app.use('/api/auth', authLimiter);
 app.use('/api/me', authLimiter); // POST /api/me is a login endpoint — same rate limit
 app.use('/api/admin', adminLimiter);
@@ -216,7 +221,9 @@ async function adminAuth(req, res, next) {
   // The frontend admin panel attaches it from localStorage.workpro_admin_token.
   let key = req.headers['x-admin-key'] || req.headers['authorization'] || req.query.admin_key || '';
   if (typeof key === 'string' && key.startsWith('Bearer ')) key = key.slice(7);
-  if (!key || key !== ADMIN_API_KEY) {
+  const keyOk = key.length > 0 && key.length === ADMIN_API_KEY.length &&
+    crypto.timingSafeEqual(Buffer.from(key), Buffer.from(ADMIN_API_KEY));
+  if (!keyOk) {
     return res.status(403).json({ error: 'Admin access required' });
   }
   // Resolve acting user id for audit logging only — the secret is what authorizes.
@@ -581,7 +588,7 @@ app.get('/api/jobs', async (req, res) => {
   }
 });
 
-app.post('/api/jobs', auth, checkBlocked, async (req, res) => {
+app.post('/api/jobs', auth, checkBlocked, jobPostLimiter, async (req, res) => {
   const { title, description, category, budget, skills, deadline, images } = req.body;
   if (!title || !description || !budget) {
     return res.status(400).json({ error: 'Title, description, and budget are required' });
@@ -1191,6 +1198,7 @@ app.post('/api/ratings', auth, checkBlocked, async (req, res) => {
   if (!to_user_id || !rating) return res.status(400).json({ error: 'to_user_id and rating required' });
   if (rating < 1 || rating > 5) return res.status(400).json({ error: 'Rating must be 1-5' });
   if (to_user_id === req.userId) return res.status(400).json({ error: 'Cannot rate yourself' });
+  if (comment && comment.length > 1000) return res.status(400).json({ error: 'Comment too long (max 1000)' });
   try {
     // Verify rater was a participant in this job
     if (job_id) {
@@ -1459,7 +1467,9 @@ app.get('/api/admin/verify', async (req, res) => {
   const key = req.headers['x-admin-key'] || req.headers['authorization'] || req.query.admin_key;
   let token = key || '';
   if (token.startsWith('Bearer ')) token = token.substring(7);
-  res.json({ valid: token === ADMIN_API_KEY });
+  const valid = token.length > 0 && token.length === ADMIN_API_KEY.length &&
+    crypto.timingSafeEqual(Buffer.from(token), Buffer.from(ADMIN_API_KEY));
+  res.json({ valid });
 });
 
 // GET /api/jobs/:id/applications — used by JobDetail.js
@@ -1761,6 +1771,8 @@ app.put('/api/users/me', auth, async (req, res) => {
   if (username && username.length > 50) return res.status(400).json({ error: 'Username too long (max 50)' });
   if (bio && bio.length > 1000) return res.status(400).json({ error: 'Bio too long (max 1000)' });
   if (skills && skills.length > 300) return res.status(400).json({ error: 'Skills too long (max 300)' });
+  if (avatar && !/^https?:\/\//i.test(avatar)) return res.status(400).json({ error: 'Avatar must be a valid URL (http/https)' });
+  if (email && (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))) return res.status(400).json({ error: 'Invalid email address' });
   const ALLOWED_AVAILABILITY = ['available', 'busy', 'away', 'unavailable'];
   if (availability && !ALLOWED_AVAILABILITY.includes(availability)) {
     return res.status(400).json({ error: 'Invalid availability value' });
@@ -1883,6 +1895,7 @@ app.post('/api/reviews', auth, checkBlocked, async (req, res) => {
   if (!toId || !rating) return res.status(400).json({ error: 'to_user_id and rating required' });
   if (rating < 1 || rating > 5) return res.status(400).json({ error: 'Rating must be 1-5' });
   if (toId === req.userId) return res.status(400).json({ error: 'Cannot rate yourself' });
+  if (reviewComment.length > 1000) return res.status(400).json({ error: 'Comment too long (max 1000)' });
   try {
     // Verify rater was a participant in this job (same guard as /api/ratings)
     if (job_id) {
@@ -1984,6 +1997,11 @@ app.get('/api/users/:id/portfolio', async (req, res) => {
 
 app.put('/api/users/me/portfolio', auth, async (req, res) => {
   const { headline, summary, experience_years, website, github, linkedin } = req.body;
+  if (headline && headline.length > 200) return res.status(400).json({ error: 'Headline too long (max 200)' });
+  if (summary && summary.length > 2000) return res.status(400).json({ error: 'Summary too long (max 2000)' });
+  if (website && !/^https?:\/\//i.test(website)) return res.status(400).json({ error: 'Website must start with http:// or https://' });
+  if (github && github.length > 200) return res.status(400).json({ error: 'GitHub URL too long (max 200)' });
+  if (linkedin && linkedin.length > 200) return res.status(400).json({ error: 'LinkedIn URL too long (max 200)' });
   if (experience_years !== undefined && (parseInt(experience_years) < 0 || parseInt(experience_years) > 60)) {
     return res.status(400).json({ error: 'experience_years must be 0–60' });
   }
@@ -2008,6 +2026,11 @@ app.post('/api/users/me/portfolio/items', auth, async (req, res) => {
   const { title, description, image_url, url, category, tags } = req.body;
   const finalUrl = image_url || url || '';
   if (!title) return res.status(400).json({ error: 'title required' });
+  if (String(title).length > 200) return res.status(400).json({ error: 'Title too long (max 200)' });
+  if (description && description.length > 2000) return res.status(400).json({ error: 'Description too long (max 2000)' });
+  if (category && category.length > 100) return res.status(400).json({ error: 'Category too long (max 100)' });
+  const tagsRaw = Array.isArray(tags) ? tags.join(',') : (tags || '');
+  if (tagsRaw.length > 500) return res.status(400).json({ error: 'Tags too long (max 500 chars combined)' });
   if (finalUrl && !/^https?:\/\//i.test(finalUrl)) return res.status(400).json({ error: 'URL must start with http:// or https://' });
   try {
     await query(`CREATE TABLE IF NOT EXISTS portfolio_items (
@@ -2015,10 +2038,9 @@ app.post('/api/users/me/portfolio/items', auth, async (req, res) => {
       description TEXT, image_url TEXT, category VARCHAR(100), tags TEXT,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )`).catch(() => {});
-    const tagsStr = Array.isArray(tags) ? tags.join(',') : (tags || '');
     const result = await query(
       'INSERT INTO portfolio_items (user_id, title, description, image_url, category, tags) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *',
-      [req.userId, title, description || '', finalUrl, category || 'Other', tagsStr]
+      [req.userId, title, description || '', finalUrl, category || 'Other', tagsRaw]
     );
     res.json({ item: result.rows[0], success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -2321,6 +2343,7 @@ app.get('/api/escrows/user/:userId', auth, async (req, res) => {
 app.post('/api/offers', auth, checkBlocked, async (req, res) => {
   const { to_user_id, job_id, amount, message } = req.body;
   if (!to_user_id || !job_id) return res.status(400).json({ error: 'to_user_id and job_id required' });
+  if (message && message.length > 2000) return res.status(400).json({ error: 'Message too long (max 2000)' });
   try {
     // Verify the job belongs to the requester
     const jobRes = await query('SELECT * FROM jobs WHERE id = $1', [job_id]);
