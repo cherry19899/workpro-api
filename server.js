@@ -2287,8 +2287,8 @@ app.put('/api/users/me/portfolio', auth, checkBlocked, async (req, res) => {
   if (headline && headline.length > 200) return res.status(400).json({ error: 'Headline too long (max 200)' });
   if (summary && summary.length > 2000) return res.status(400).json({ error: 'Summary too long (max 2000)' });
   if (website && !/^https?:\/\//i.test(website)) return res.status(400).json({ error: 'Website must start with http:// or https://' });
-  if (github && github.length > 200) return res.status(400).json({ error: 'GitHub URL too long (max 200)' });
-  if (linkedin && linkedin.length > 200) return res.status(400).json({ error: 'LinkedIn URL too long (max 200)' });
+  if (github && (github.length > 200 || !/^https?:\/\//i.test(github))) return res.status(400).json({ error: 'GitHub must be a valid http/https URL (max 200)' });
+  if (linkedin && (linkedin.length > 200 || !/^https?:\/\//i.test(linkedin))) return res.status(400).json({ error: 'LinkedIn must be a valid http/https URL (max 200)' });
   if (experience_years !== undefined && (parseInt(experience_years) < 0 || parseInt(experience_years) > 60)) {
     return res.status(400).json({ error: 'experience_years must be 0–60' });
   }
@@ -2315,6 +2315,8 @@ app.post('/api/users/me/portfolio/items', auth, checkBlocked, async (req, res) =
   if (tagsRaw.length > 500) return res.status(400).json({ error: 'Tags too long (max 500 chars combined)' });
   if (finalUrl && !/^https?:\/\//i.test(finalUrl)) return res.status(400).json({ error: 'URL must start with http:// or https://' });
   try {
+    const itemCount = await query('SELECT COUNT(*) FROM portfolio_items WHERE user_id = $1', [req.userId]);
+    if (parseInt(itemCount.rows[0].count) >= 20) return res.status(400).json({ error: 'Portfolio limited to 20 items' });
     const result = await query(
       'INSERT INTO portfolio_items (user_id, title, description, image_url, category, tags) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *',
       [req.userId, title, description || '', finalUrl, category || 'Other', tagsRaw]
