@@ -41,7 +41,9 @@ async function query(text, params) {
   if (!usePg) throw new Error('PostgreSQL not configured');
   const start = Date.now();
   const result = await pool.query(text, params);
-  console.log('PG query', { text: text.substring(0, 50), duration: Date.now() - start, rows: result.rowCount });
+  if (process.env.NODE_ENV !== 'production') {
+    console.log('PG query', { text: text.substring(0, 50), duration: Date.now() - start, rows: result.rowCount });
+  }
   return result;
 }
 
