@@ -896,7 +896,7 @@ app.get('/api/applications', auth, async (req, res) => {
   }
 });
 
-app.patch('/api/applications/:id', auth, async (req, res) => {
+app.patch('/api/applications/:id', auth, checkBlocked, async (req, res) => {
   const { status } = req.body;
   const OWNER_ALLOWED = ['accepted', 'rejected'];
   if (!OWNER_ALLOWED.includes(status)) return res.status(400).json({ error: `Invalid status. Allowed: ${OWNER_ALLOWED.join(', ')}` });
@@ -1772,19 +1772,27 @@ app.post('/api/applications/:id/accept', auth, checkBlocked, async (req, res) =>
     const escrowAmount = app_.bid_amount || app_.budget || 0;
     let escrow = null;
     if (freelancerId) {
-      const existing = await query('SELECT * FROM escrows WHERE job_id = $1 AND status IN ($2, $3)', [app_.job_id, 'pending', 'funded']);
-      if (!existing.rows.length) {
-        const escrowResult = await query(
-          `INSERT INTO escrows (job_id, client_id, freelancer_id, amount, status)
-           VALUES ($1,$2,$3,$4,'pending') RETURNING *`,
-          [app_.job_id, req.userId, freelancerId, escrowAmount]
+      const pgClientAccept = await getPool().connect();
+      try {
+        await pgClientAccept.query('BEGIN');
+        const existing = await pgClientAccept.query(
+          "SELECT * FROM escrows WHERE job_id = $1 AND status = ANY($2) FOR UPDATE",
+          [app_.job_id, ['pending', 'funded']]
         );
-        escrow = escrowResult.rows[0];
-      } else {
-        escrow = existing.rows[0];
-      }
-      // Mark job as in-progress
-      await query("UPDATE jobs SET status='in_progress', updated_at=NOW() WHERE id=$1", [app_.job_id]);
+        if (!existing.rows.length) {
+          const escrowResult = await pgClientAccept.query(
+            `INSERT INTO escrows (job_id, client_id, freelancer_id, amount, status)
+             VALUES ($1,$2,$3,$4,'pending') RETURNING *`,
+            [app_.job_id, req.userId, freelancerId, escrowAmount]
+          );
+          escrow = escrowResult.rows[0];
+        } else {
+          escrow = existing.rows[0];
+        }
+        await pgClientAccept.query("UPDATE jobs SET status='in_progress', updated_at=NOW() WHERE id=$1", [app_.job_id]);
+        await pgClientAccept.query('COMMIT');
+      } catch (txErr) { await pgClientAccept.query('ROLLBACK').catch(() => {}); throw txErr; }
+      finally { pgClientAccept.release(); }
     }
 
     await audit('application_accepted', { app_id: req.params.id, job_id: app_.job_id, freelancer_id: freelancerId });
@@ -2284,23 +2292,38 @@ app.post('/api/applications/:id/hire', auth, checkBlocked, async (req, res) => {
 
     // Accept application
     await query('UPDATE applications SET status = $1 WHERE id = $2', ['accepted', req.params.id]);
-    // Create escrow
-    const escrow = await query(
-      `INSERT INTO escrows (job_id, client_id, freelancer_id, amount, payment_id, status)
-       VALUES ($1,$2,$3,$4,$5,'funded') ON CONFLICT DO NOTHING RETURNING *`,
-      [app_.job_id, req.userId, freelancerId, escrowAmount, payment_id]
-    );
-    // Mark job as in-progress and set hired_freelancer_id
-    const freelancerNameRes = await query('SELECT username FROM users WHERE id = $1', [freelancerId]);
-    const freelancerName = freelancerNameRes.rows[0]?.username || freelancerId;
-    await query(
-      "UPDATE jobs SET status='in_progress', hired_freelancer_id=$1, hired_freelancer_name=$2, updated_at=NOW() WHERE id=$3",
-      [freelancerId, freelancerName, app_.job_id]
-    );
+    // Atomic: check for duplicate funded escrow before creating (same pattern as /api/escrow)
+    let escrowRow;
+    const pgClientHire = await getPool().connect();
+    try {
+      await pgClientHire.query('BEGIN');
+      const existingEsc = await pgClientHire.query(
+        "SELECT * FROM escrows WHERE job_id = $1 AND status = ANY($2) FOR UPDATE",
+        [app_.job_id, ['pending', 'funded']]
+      );
+      if (existingEsc.rows.length) {
+        escrowRow = existingEsc.rows[0];
+      } else {
+        const escrowResult = await pgClientHire.query(
+          `INSERT INTO escrows (job_id, client_id, freelancer_id, amount, payment_id, status)
+           VALUES ($1,$2,$3,$4,$5,'funded') RETURNING *`,
+          [app_.job_id, req.userId, freelancerId, escrowAmount, payment_id]
+        );
+        escrowRow = escrowResult.rows[0];
+      }
+      const freelancerNameRes = await pgClientHire.query('SELECT username FROM users WHERE id = $1', [freelancerId]);
+      const freelancerName = freelancerNameRes.rows[0]?.username || freelancerId;
+      await pgClientHire.query(
+        "UPDATE jobs SET status='in_progress', hired_freelancer_id=$1, hired_freelancer_name=$2, updated_at=NOW() WHERE id=$3",
+        [freelancerId, freelancerName, app_.job_id]
+      );
+      await pgClientHire.query('COMMIT');
+    } catch (txErr) { await pgClientHire.query('ROLLBACK').catch(() => {}); throw txErr; }
+    finally { pgClientHire.release(); }
     await notify(freelancerId, 'hired', `Вас наняли на задачу "${app_.job_title || app_.job_id}"`,
       'Заказчик выбрал вас и создал эскроу. Можете приступать к работе.', parseInt(app_.job_id), null);
     await audit('hire_with_escrow', { app_id: req.params.id, job_id: app_.job_id, freelancer_id: freelancerId, amount: escrowAmount });
-    res.json({ success: true, escrow: escrow.rows[0] || { job_id: app_.job_id, status: 'funded' } });
+    res.json({ success: true, escrow: escrowRow || { job_id: app_.job_id, status: 'funded' } });
   } catch (err) { serverError(err, res); }
 });
 
