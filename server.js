@@ -789,8 +789,8 @@ app.post('/api/jobs/:id/apply', auth, checkBlocked, async (req, res) => {
 });
 
 app.post('/api/jobs/:id/hire', auth, checkBlocked, async (req, res) => {
-  const { application_id, freelancer_id } = req.body;
-  if (!application_id || !freelancer_id) return res.status(400).json({ error: 'application_id and freelancer_id required' });
+  const { application_id, freelancer_id, payment_id } = req.body;
+  if (!application_id || !freelancer_id || !payment_id) return res.status(400).json({ error: 'application_id, freelancer_id, and payment_id required' });
   try {
     const jobResult = await query('SELECT * FROM jobs WHERE id = $1', [req.params.id]);
     if (!jobResult.rows.length) return res.status(404).json({ error: 'Job not found' });
@@ -798,29 +798,53 @@ app.post('/api/jobs/:id/hire', auth, checkBlocked, async (req, res) => {
     if (job.posted_by !== req.userId) return res.status(403).json({ error: 'Not your job' });
     if (job.status !== 'open') return res.status(400).json({ error: 'Job is not open' });
 
+    // Require completed Pi payment
+    const pmtRec = await query('SELECT id, user_id, amount, status FROM payments WHERE id = $1', [payment_id]);
+    if (!pmtRec.rows.length) return res.status(402).json({ error: 'Payment not found — complete Pi payment first' });
+    if (pmtRec.rows[0].user_id !== req.userId) return res.status(403).json({ error: 'Payment does not belong to you' });
+    if (pmtRec.rows[0].status !== 'completed') return res.status(402).json({ error: 'Payment not yet completed' });
+
     const appResult = await query('SELECT * FROM applications WHERE id = $1 AND job_id = $2', [application_id, req.params.id]);
     if (!appResult.rows.length) return res.status(404).json({ error: 'Application not found' });
     const app = appResult.rows[0];
     if (app.freelancer_id !== freelancer_id) return res.status(400).json({ error: 'freelancer_id does not match application' });
 
-    // Accept chosen application, reject all others
-    await query('UPDATE applications SET status = $1 WHERE id = $2', ['accepted', application_id]);
-    await query('UPDATE applications SET status = $1 WHERE job_id = $2 AND id != $3 AND status = $4', ['rejected', req.params.id, application_id, 'pending']);
-
-    // Update job
     const freelancerRes = await query('SELECT username FROM users WHERE id = $1', [freelancer_id]);
     const freelancerName = freelancerRes.rows[0]?.username || freelancer_id;
-    await query(
-      'UPDATE jobs SET status = $1, hired_freelancer_id = $2, hired_freelancer_name = $3, updated_at = NOW() WHERE id = $4',
-      ['in_progress', freelancer_id, freelancerName, req.params.id]
-    );
+
+    // Atomic: accept application, create funded escrow, update job
+    const pgClientJ = await getPool().connect();
+    let roomId, escrowRow;
+    try {
+      await pgClientJ.query('BEGIN');
+      // Guard: prevent reusing payment or duplicate escrow
+      const existingEsc = await pgClientJ.query("SELECT * FROM escrows WHERE job_id = $1 AND status = ANY($2) FOR UPDATE", [req.params.id, ['pending', 'funded']]);
+      const payUsed = await pgClientJ.query('SELECT id FROM escrows WHERE payment_id = $1 LIMIT 1', [payment_id]);
+      if (payUsed.rows.length && (!existingEsc.rows.length || existingEsc.rows[0].payment_id !== payment_id)) {
+        await pgClientJ.query('ROLLBACK');
+        return res.status(400).json({ error: 'Payment already used for another escrow' });
+      }
+      await pgClientJ.query('UPDATE applications SET status = $1 WHERE id = $2', ['accepted', application_id]);
+      await pgClientJ.query('UPDATE applications SET status = $1 WHERE job_id = $2 AND id != $3 AND status = $4', ['rejected', req.params.id, application_id, 'pending']);
+      if (!existingEsc.rows.length) {
+        const escRes = await pgClientJ.query(
+          "INSERT INTO escrows (job_id, client_id, freelancer_id, amount, payment_id, status) VALUES ($1,$2,$3,$4,$5,'funded') RETURNING *",
+          [req.params.id, req.userId, freelancer_id, parseFloat(pmtRec.rows[0].amount || 0), payment_id]
+        );
+        escrowRow = escRes.rows[0];
+      } else {
+        escrowRow = existingEsc.rows[0];
+      }
+      await pgClientJ.query(
+        'UPDATE jobs SET status=$1, hired_freelancer_id=$2, hired_freelancer_name=$3, updated_at=NOW() WHERE id=$4',
+        ['in_progress', freelancer_id, freelancerName, req.params.id]
+      );
+      await pgClientJ.query('COMMIT');
+    } catch (txErr) { await pgClientJ.query('ROLLBACK').catch(() => {}); throw txErr; }
+    finally { pgClientJ.release(); }
 
     // Create or get chat room between client and freelancer
-    const existingRoom = await query(
-      'SELECT id FROM chat_rooms WHERE job_id = $1 AND client_id = $2 AND freelancer_id = $3',
-      [req.params.id, req.userId, freelancer_id]
-    );
-    let roomId;
+    const existingRoom = await query('SELECT id FROM chat_rooms WHERE job_id = $1 AND client_id = $2 AND freelancer_id = $3', [req.params.id, req.userId, freelancer_id]);
     if (existingRoom.rows.length) {
       roomId = existingRoom.rows[0].id;
     } else {
@@ -828,10 +852,10 @@ app.post('/api/jobs/:id/hire', auth, checkBlocked, async (req, res) => {
       await query('INSERT INTO chat_rooms (id, client_id, freelancer_id, job_id) VALUES ($1, $2, $3, $4)', [roomId, req.userId, freelancer_id, req.params.id]);
     }
 
-    await audit('job_hired', { job_id: req.params.id, freelancer_id, application_id });
+    await audit('job_hired', { job_id: req.params.id, freelancer_id, application_id, payment_id });
     await notify(freelancer_id, 'hired', `Вас наняли на задачу "${job.title}"`,
-      'Заказчик выбрал вас. Обсудите детали в чате.', parseInt(req.params.id), roomId);
-    res.json({ success: true, room_id: roomId, freelancer_name: freelancerName });
+      'Заказчик выбрал вас и создал эскроу. Можете приступать к работе.', parseInt(req.params.id), roomId);
+    res.json({ success: true, room_id: roomId, freelancer_name: freelancerName, escrow: escrowRow });
   } catch (err) {
     serverError(err, res);
   }
@@ -1043,9 +1067,16 @@ app.get('/api/escrow', auth, async (req, res) => {
 });
 
 app.post('/api/escrow', auth, checkBlocked, async (req, res) => {
-  const { job_id, freelancer_id, amount, payment_id } = req.body;
-  if (!job_id || !freelancer_id || !amount) return res.status(400).json({ error: 'job_id, freelancer_id, amount required' });
+  const { job_id, freelancer_id, payment_id } = req.body;
+  if (!job_id || !freelancer_id || !payment_id) return res.status(400).json({ error: 'job_id, freelancer_id, payment_id required' });
   try {
+    // Require payment to be completed and owned by caller — prevents fake escrow amounts
+    const pmtRec = await query('SELECT id, user_id, amount, status FROM payments WHERE id = $1', [payment_id]);
+    if (!pmtRec.rows.length) return res.status(402).json({ error: 'Payment not found — complete Pi payment first' });
+    if (pmtRec.rows[0].user_id !== req.userId) return res.status(403).json({ error: 'Payment does not belong to you' });
+    if (pmtRec.rows[0].status !== 'completed') return res.status(402).json({ error: 'Payment not yet completed' });
+    const piVerifiedAmount = parseFloat(pmtRec.rows[0].amount || 0);
+
     const jobCheck = await query('SELECT posted_by, hired_freelancer_id FROM jobs WHERE id = $1', [job_id]);
     if (!jobCheck.rows.length) return res.status(404).json({ error: 'Job not found' });
     if (jobCheck.rows[0].posted_by !== req.userId) return res.status(403).json({ error: 'Not your job' });
@@ -1059,16 +1090,19 @@ app.post('/api/escrow', auth, checkBlocked, async (req, res) => {
       await pgClientE.query('BEGIN');
       const existing = await pgClientE.query('SELECT id FROM escrows WHERE job_id = $1 AND status = ANY($2) FOR UPDATE', [job_id, ['pending', 'funded']]);
       if (existing.rows.length) { await pgClientE.query('ROLLBACK'); return res.status(400).json({ error: 'Escrow already exists for this job' }); }
+      // Prevent reusing a payment across multiple escrows
+      const payUsed = await pgClientE.query('SELECT id FROM escrows WHERE payment_id = $1 LIMIT 1', [payment_id]);
+      if (payUsed.rows.length) { await pgClientE.query('ROLLBACK'); return res.status(400).json({ error: 'Payment already used for another escrow' }); }
       const result = await pgClientE.query(
-        'INSERT INTO escrows (job_id, client_id, freelancer_id, amount, payment_id) VALUES ($1, $2, $3, $4, $5) RETURNING *',
-        [job_id, req.userId, freelancer_id, parseFloat(amount), payment_id || null]
+        "INSERT INTO escrows (job_id, client_id, freelancer_id, amount, payment_id, status) VALUES ($1, $2, $3, $4, $5, 'funded') RETURNING *",
+        [job_id, req.userId, freelancer_id, piVerifiedAmount, payment_id]
       );
       await pgClientE.query('UPDATE jobs SET status = $1, updated_at = NOW() WHERE id = $2', ['in_progress', job_id]);
       await pgClientE.query('COMMIT');
       escrowRow = result.rows[0];
     } catch (txErr) { await pgClientE.query('ROLLBACK').catch(() => {}); throw txErr; }
     finally { pgClientE.release(); }
-    await audit('escrow_created', { escrow_id: escrowRow.id, job_id });
+    await audit('escrow_created', { escrow_id: escrowRow.id, job_id, payment_id });
     res.json({ escrow: escrowRow });
   } catch (err) {
     serverError(err, res);
@@ -1226,8 +1260,30 @@ app.post('/api/payments/incomplete', auth, async (req, res) => {
     // If payment is pending server completion, complete it
     if (piPayment.status && piPayment.status.developer_completed === false && piPayment.transaction) {
       await piCompletePayment(paymentId, piPayment.transaction.txid);
-      await query('UPDATE payments SET status = $1, txid = $2, updated_at = NOW() WHERE id = $3',
-        ['completed', piPayment.transaction.txid, paymentId]);
+      // Idempotency guard: same pattern as /complete — only run business logic once
+      const markDone = await query(
+        "UPDATE payments SET status='completed', txid=$1, updated_at=NOW() WHERE id=$2 AND status='approved' RETURNING *",
+        [piPayment.transaction.txid, paymentId]
+      );
+      if (markDone.rows.length) {
+        const meta = markDone.rows[0].metadata || {};
+        const paymentOwner = markDone.rows[0].user_id || req.userId;
+        if (meta.type === 'connects') {
+          const piAmountPaid = parseFloat(piPayment.amount || markDone.rows[0].amount || 0);
+          const amount = Math.floor(piAmountPaid * 10);
+          if (amount > 0) {
+            await query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [amount, paymentOwner]);
+          }
+        } else if (meta.type === 'escrow' && meta.job_id && meta.freelancer_id) {
+          const existingEscrow = await query('SELECT id FROM escrows WHERE payment_id = $1 LIMIT 1', [paymentId]).catch(() => ({ rows: [] }));
+          if (!existingEscrow.rows.length) {
+            await query(
+              'INSERT INTO escrows (job_id, client_id, freelancer_id, amount, payment_id, status) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING',
+              [meta.job_id, paymentOwner, meta.freelancer_id, piPayment.amount || meta.amount || 0, paymentId, 'funded']
+            ).catch(() => {});
+          }
+        }
+      }
     }
     res.json({ success: true, payment: piPayment });
   } catch (err) {
