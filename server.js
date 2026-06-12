@@ -74,9 +74,7 @@ app.use('/api/admin', adminLimiter);
 app.use('/api/connects/purchase', connectsLimiter);
 app.use('/api/connects/buy', connectsLimiter);
 app.use('/api/payments', connectsLimiter);
-// Apply message limiter to all three chat message POST endpoints
-app.use('/api/chat/rooms', messageLimiter);
-app.use('/api/chat/conversations', messageLimiter);
+// Apply message limiter to all chat endpoints (covers /rooms, /conversations, /:roomId)
 app.use('/api/chat/', messageLimiter);
 
 // ─── Helpers ──────────────────────────────────────────────
