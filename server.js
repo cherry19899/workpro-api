@@ -1701,12 +1701,22 @@ app.get('/api/admin/audit-logs', adminAuth, async (req, res) => {
 });
 
 app.get('/api/admin/verify', async (req, res) => {
-  const key = req.headers['x-admin-key'] || req.headers['authorization'] || req.query.admin_key;
-  let token = key || '';
-  if (token.startsWith('Bearer ')) token = token.substring(7);
-  const valid = token.length > 0 && token.length === ADMIN_API_KEY.length &&
+  const authHeader = req.headers['authorization'] || '';
+  const rawKey = req.headers['x-admin-key'] || req.query.admin_key || '';
+  // Check ADMIN_API_KEY
+  let token = rawKey || (authHeader.startsWith('Bearer ') ? authHeader.slice(7) : authHeader);
+  const keyValid = token.length > 0 && token.length === ADMIN_API_KEY.length &&
     crypto.timingSafeEqual(Buffer.from(token), Buffer.from(ADMIN_API_KEY));
-  res.json({ valid });
+  if (keyValid) return res.json({ valid: true });
+  // Check JWT from admin-role user
+  if (authHeader.startsWith('Bearer ')) {
+    try {
+      const decoded = jwt.verify(authHeader.slice(7), JWT_SECRET);
+      const userRow = await query("SELECT id FROM users WHERE id = $1 AND role = 'admin' LIMIT 1", [decoded.id]);
+      if (userRow.rows.length) return res.json({ valid: true });
+    } catch (_) {}
+  }
+  res.json({ valid: false });
 });
 
 // GET /api/jobs/:id/applications — used by JobDetail.js
