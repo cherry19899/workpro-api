@@ -134,6 +134,13 @@ async function ensureNotificationsTable() {
       description TEXT, image_url TEXT, category VARCHAR(100), tags TEXT,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )`);
+    await query(`CREATE TABLE IF NOT EXISTS push_subscriptions (
+      id SERIAL PRIMARY KEY,
+      user_id TEXT UNIQUE NOT NULL,
+      endpoint TEXT NOT NULL,
+      keys JSONB,
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    )`);
   } catch (_) {}
 }
 
@@ -2930,10 +2937,14 @@ app.post('/api/payments/:paymentId/resolve-complete', auth, async (req, res) => 
           await query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [amount, paymentOwner]).catch(() => {});
         }
       } else if (meta.type === 'escrow' && meta.job_id && meta.freelancer_id) {
-        await query(
-          'INSERT INTO escrows (job_id, client_id, freelancer_id, amount, payment_id, status) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING',
-          [meta.job_id, paymentOwner, meta.freelancer_id, paymentRecord.rows[0].amount || meta.amount || 0, paymentId, 'funded']
-        ).catch(() => {});
+        // Only create escrow if this payment hasn't already funded one
+        const existingEscrowForPayment = await query('SELECT id FROM escrows WHERE payment_id = $1 LIMIT 1', [paymentId]).catch(() => ({ rows: [] }));
+        if (!existingEscrowForPayment.rows.length) {
+          await query(
+            'INSERT INTO escrows (job_id, client_id, freelancer_id, amount, payment_id, status) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING',
+            [meta.job_id, paymentOwner, meta.freelancer_id, paymentRecord.rows[0].amount || meta.amount || 0, paymentId, 'funded']
+          ).catch(() => {});
+        }
       }
     }
 
@@ -2965,23 +2976,7 @@ app.post('/api/push/subscribe', softAuth, async (req, res) => {
        VALUES ($1, $2, $3, NOW())
        ON CONFLICT (user_id) DO UPDATE SET endpoint=$2, keys=$3, updated_at=NOW()`,
       [req.userId, endpoint, JSON.stringify(keys || {})]
-    ).catch(() => {
-      // Table may not exist yet — create it and retry
-      query(`CREATE TABLE IF NOT EXISTS push_subscriptions (
-        id SERIAL PRIMARY KEY,
-        user_id TEXT UNIQUE NOT NULL,
-        endpoint TEXT NOT NULL,
-        keys JSONB,
-        updated_at TIMESTAMPTZ DEFAULT NOW()
-      )`).then(() =>
-        query(
-          `INSERT INTO push_subscriptions (user_id, endpoint, keys, updated_at)
-           VALUES ($1, $2, $3, NOW())
-           ON CONFLICT (user_id) DO UPDATE SET endpoint=$2, keys=$3, updated_at=NOW()`,
-          [req.userId, endpoint, JSON.stringify(keys || {})]
-        )
-      ).catch(() => {});
-    });
+    ).catch(() => {});
   }
   res.json({ success: true });
 });
