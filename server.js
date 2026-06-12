@@ -207,13 +207,9 @@ async function auth(req, res, next) {
          ON CONFLICT (id) DO NOTHING`,
         [userId, username]
       );
-    } else if (req.headers['x-username'] && existing.rows[0].username !== req.headers['x-username']) {
-      // Sync username only (never change role via header)
-      await query(
-        `UPDATE users SET username = $1, updated_at = NOW() WHERE id = $2`,
-        [req.headers['x-username'], userId]
-      );
     }
+    // Username sync intentionally removed from the x-user-id path:
+    // updating username from an unauthenticated header lets any caller rename any user.
   } catch (_) { /* ignore — user already exists or table error */ }
 
   next();
