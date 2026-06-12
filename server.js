@@ -916,7 +916,16 @@ app.get('/api/chat/rooms', auth, async (req, res) => {
 app.post('/api/chat/rooms', auth, checkBlocked, async (req, res) => {
   const { freelancer_id, job_id } = req.body;
   const cId = req.userId; // always use authenticated user as client
+  if (!freelancer_id || !job_id) return res.status(400).json({ error: 'freelancer_id and job_id required' });
   try {
+    // Verify caller is actually involved in this job (poster or applicant/hired freelancer)
+    const jobCheck = await query('SELECT posted_by, hired_freelancer_id FROM jobs WHERE id = $1', [job_id]);
+    if (!jobCheck.rows.length) return res.status(404).json({ error: 'Job not found' });
+    const job = jobCheck.rows[0];
+    if (job.posted_by !== cId && freelancer_id !== cId) {
+      const appCheck = await query('SELECT id FROM applications WHERE job_id = $1 AND freelancer_id = $2 LIMIT 1', [job_id, cId]);
+      if (!appCheck.rows.length) return res.status(403).json({ error: 'You are not a participant in this job' });
+    }
     // Check if room already exists
     const existing = await query(
       'SELECT * FROM chat_rooms WHERE job_id = $1 AND ((client_id = $2 AND freelancer_id = $3) OR (client_id = $3 AND freelancer_id = $2))',
@@ -1827,6 +1836,17 @@ app.post('/api/chat/conversations', auth, checkBlocked, async (req, res) => {
   const fId = freelancer_id || other_user_id;
   if (!fId || !job_id) return res.status(400).json({ error: 'freelancer_id and job_id required' });
   try {
+    // Verify caller is actually involved in this job (poster or applicant/hired freelancer)
+    const jobCheck = await query('SELECT posted_by, hired_freelancer_id FROM jobs WHERE id = $1', [job_id]);
+    if (!jobCheck.rows.length) return res.status(404).json({ error: 'Job not found' });
+    const job = jobCheck.rows[0];
+    const isJobPoster = job.posted_by === cId;
+    const isFid = fId === cId; // caller is the freelancer side
+    if (!isJobPoster && !isFid) {
+      // Also allow if caller has an application for this job
+      const appCheck = await query('SELECT id FROM applications WHERE job_id = $1 AND freelancer_id = $2 LIMIT 1', [job_id, cId]);
+      if (!appCheck.rows.length) return res.status(403).json({ error: 'You are not a participant in this job' });
+    }
     const existing = await query('SELECT * FROM chat_rooms WHERE job_id = $1 AND ((client_id = $2 AND freelancer_id = $3) OR (client_id = $3 AND freelancer_id = $2))', [job_id, cId, fId]);
     if (existing.rows.length) return res.json({ conversation: existing.rows[0], room: existing.rows[0] });
     const roomId = 'room_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
@@ -2676,14 +2696,12 @@ app.post('/api/payments/clear-pending', auth, async (req, res) => {
 
 // POST /api/payments/:paymentId/resolve-complete — called by bundle when Pi payment is developer_completed
 // Pi SDK's onIncompletePaymentFound triggers this for payments that need server-side completion
-app.post('/api/payments/:paymentId/resolve-complete', softAuth, async (req, res) => {
+app.post('/api/payments/:paymentId/resolve-complete', auth, async (req, res) => {
   const paymentId = req.params.paymentId;
-  // Only allow the payment owner (or unauthenticated for payments not yet in DB)
-  if (req.userId) {
-    const ownerCheck = await query('SELECT user_id FROM payments WHERE id = $1', [paymentId]).catch(() => ({ rows: [] }));
-    if (ownerCheck.rows.length && ownerCheck.rows[0].user_id && ownerCheck.rows[0].user_id !== req.userId) {
-      return res.status(403).json({ error: 'Payment does not belong to you' });
-    }
+  // Verify payment ownership before allowing server-side completion
+  const ownerCheck = await query('SELECT user_id FROM payments WHERE id = $1', [paymentId]).catch(() => ({ rows: [] }));
+  if (ownerCheck.rows.length && ownerCheck.rows[0].user_id && ownerCheck.rows[0].user_id !== req.userId) {
+    return res.status(403).json({ error: 'Payment does not belong to you' });
   }
   try {
     // Fetch payment details from Pi API to get txid
