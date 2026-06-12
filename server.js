@@ -175,7 +175,6 @@ async function piGetPayment(paymentId) {
 
 // ─── Auth Middleware ──────────────────────────────────────────────
 async function auth(req, res, next) {
-  // Prefer JWT from Authorization: Bearer header — verified, not spoofable
   const authHeader = req.headers['authorization'];
   if (authHeader && authHeader.startsWith('Bearer ')) {
     try {
@@ -183,39 +182,12 @@ async function auth(req, res, next) {
       req.userId = decoded.id;
       req.jwtVerified = true;
       return next();
-    } catch (_) { /* invalid/expired JWT — fall through to x-user-id */ }
+    } catch (_) { /* invalid/expired JWT */ }
   }
-  // Legacy: accept user ID from x-user-id or x-pi-token headers
-  let userId = req.headers['x-user-id'] || req.headers['x-pi-token'];
-  if (!userId) return res.status(401).json({ error: 'Access token required' });
-  // Alias cherry19899 (username) → pi_cherry19899 (canonical ID) so all data stays unified
-  if (userId === 'cherry19899') userId = 'pi_cherry19899';
-  req.userId = userId;
-
-  // Auto-register user in DB on first API call
-  try {
-    const username = req.headers['x-username'] || userId.replace(/^pi_/, '');
-    const existing = await query(
-      `SELECT id, username FROM users WHERE id = $1 LIMIT 1`,
-      [userId]
-    );
-    if (!existing.rows.length) {
-      // New user — default role is freelancer; admin role is only granted via DB
-      await query(
-        `INSERT INTO users (id, username, role, balance_connects, created_at, updated_at)
-         VALUES ($1, $2, 'freelancer', 10, NOW(), NOW())
-         ON CONFLICT (id) DO NOTHING`,
-        [userId, username]
-      );
-    }
-    // Username sync intentionally removed from the x-user-id path:
-    // updating username from an unauthenticated header lets any caller rename any user.
-  } catch (_) { /* ignore — user already exists or table error */ }
-
-  next();
+  return res.status(401).json({ error: 'Access token required' });
 }
 
-// softAuth — extracts userId but NEVER rejects (for endpoints where bundle sends no auth)
+// softAuth — extracts userId from JWT but NEVER rejects (for public endpoints)
 function softAuth(req, res, next) {
   const authHeader = req.headers['authorization'];
   if (authHeader && authHeader.startsWith('Bearer ')) {
@@ -223,12 +195,8 @@ function softAuth(req, res, next) {
       const decoded = jwt.verify(authHeader.slice(7), JWT_SECRET);
       req.userId = decoded.id;
       req.jwtVerified = true;
-      return next();
-    } catch (_) { /* invalid/expired — fall through to x-user-id */ }
+    } catch (_) { /* invalid/expired — anonymous */ }
   }
-  let uid = req.headers['x-user-id'] || req.headers['x-pi-token'] || null;
-  if (uid === 'cherry19899') uid = 'pi_cherry19899';
-  req.userId = uid;
   next();
 }
 
