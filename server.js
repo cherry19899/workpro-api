@@ -772,7 +772,14 @@ app.post('/api/jobs/:id/apply', auth, checkBlocked, async (req, res) => {
     const pgClient = await getPool().connect();
     try {
       await pgClient.query('BEGIN');
-      await pgClient.query('UPDATE users SET balance_connects = balance_connects - $1, updated_at = NOW() WHERE id = $2', [cost, req.userId]);
+      const deductResult = await pgClient.query(
+        'UPDATE users SET balance_connects = balance_connects - $1, updated_at = NOW() WHERE id = $2 AND balance_connects >= $1 RETURNING id',
+        [cost, req.userId]
+      );
+      if (!deductResult.rows.length) {
+        await pgClient.query('ROLLBACK');
+        return res.status(400).json({ error: 'Not enough connects', required: cost });
+      }
       appResult = await pgClient.query(
         'INSERT INTO applications (job_id, job_title, freelancer_id, freelancer_name, message) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (job_id, freelancer_id) DO NOTHING RETURNING *',
         [req.params.id, job.title, req.userId, user.username || req.userId, req.body.message || '']
@@ -927,9 +934,23 @@ app.delete('/api/jobs/:id', auth, checkBlocked, async (req, res) => {
     const job = jobResult.rows[0];
     if (job.posted_by !== req.userId) return res.status(403).json({ error: 'Not your job' });
     if (['in_progress', 'submitted'].includes(job.status)) return res.status(400).json({ error: 'Cannot delete a job that is in progress' });
-    await query('DELETE FROM applications WHERE job_id = $1', [req.params.id]);
-    await query('DELETE FROM jobs WHERE id = $1', [req.params.id]);
-    res.json({ success: true });
+    const applyRefundCost = job.apply_cost || 1;
+    const applicants = await query('SELECT DISTINCT freelancer_id FROM applications WHERE job_id = $1', [req.params.id]);
+    const pgClientDel = await getPool().connect();
+    try {
+      await pgClientDel.query('BEGIN');
+      for (const row of applicants.rows) {
+        await pgClientDel.query(
+          'UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2',
+          [applyRefundCost, row.freelancer_id]
+        );
+      }
+      await pgClientDel.query('DELETE FROM applications WHERE job_id = $1', [req.params.id]);
+      await pgClientDel.query('DELETE FROM jobs WHERE id = $1', [req.params.id]);
+      await pgClientDel.query('COMMIT');
+    } catch (txErr) { await pgClientDel.query('ROLLBACK').catch(() => {}); throw txErr; }
+    finally { pgClientDel.release(); }
+    res.json({ success: true, refunded: applicants.rows.length });
   } catch (err) {
     serverError(err, res);
   }
@@ -1790,7 +1811,11 @@ app.post('/api/applications', auth, checkBlocked, async (req, res) => {
     const pgClient = await getPool().connect();
     try {
       await pgClient.query('BEGIN');
-      await pgClient.query('UPDATE users SET balance_connects = balance_connects - $1, updated_at = NOW() WHERE id = $2', [cost, req.userId]);
+      const deductResult2 = await pgClient.query(
+        'UPDATE users SET balance_connects = balance_connects - $1, updated_at = NOW() WHERE id = $2 AND balance_connects >= $1 RETURNING id',
+        [cost, req.userId]
+      );
+      if (!deductResult2.rows.length) { await pgClient.query('ROLLBACK'); return res.status(400).json({ error: 'Not enough connects', required: cost }); }
       appResult = await pgClient.query(
         'INSERT INTO applications (job_id, job_title, freelancer_id, freelancer_name, message) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (job_id, freelancer_id) DO NOTHING RETURNING *',
         [job_id, job.title, req.userId, user.username || req.userId, message || '']
