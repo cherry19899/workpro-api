@@ -1163,25 +1163,29 @@ app.post('/api/payments/:paymentId/complete', auth, async (req, res) => {
       }
     }
 
-    // Update payment record
-    await query(
-      'UPDATE payments SET status = $1, txid = $2, updated_at = NOW() WHERE id = $3',
-      ['completed', txid, paymentId]
+    // Mark completed only if still in approved state — prevents double-crediting on retry
+    const markDone = await query(
+      "UPDATE payments SET status='completed', txid=$1, updated_at=NOW() WHERE id=$2 AND status='approved' RETURNING *",
+      [txid, paymentId]
     );
+    if (!markDone.rows.length) {
+      // Already completed (idempotent) — return success without re-crediting
+      return res.json({ success: true, payment: piPayment });
+    }
 
     // Handle business logic based on payment type
-    const paymentRecord = await query('SELECT * FROM payments WHERE id = $1', [paymentId]);
-    if (paymentRecord.rows.length) {
-      const meta = paymentRecord.rows[0].metadata || {};
-      const paymentOwner = paymentRecord.rows[0].user_id || req.userId;
-      if (meta.type === 'connects') {
-        // SECURITY: derives connects strictly from Pi-verified amount; never from metadata
-        const piAmountPaid = parseFloat(piPayment.amount || paymentRecord.rows[0].amount || 0);
-        const amount = Math.floor(piAmountPaid * 10);
-        if (amount <= 0) return res.status(400).json({ error: 'Payment amount too small to credit connects' });
-        await query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [amount, paymentOwner]);
-      } else if (meta.type === 'escrow' && meta.job_id && meta.freelancer_id) {
-        // Create escrow record — hireFreelancer endpoint updates job status after this
+    const meta = markDone.rows[0].metadata || {};
+    const paymentOwner = markDone.rows[0].user_id || req.userId;
+    if (meta.type === 'connects') {
+      // SECURITY: derives connects strictly from Pi-verified amount; never from metadata
+      const piAmountPaid = parseFloat(piPayment.amount || markDone.rows[0].amount || 0);
+      const amount = Math.floor(piAmountPaid * 10);
+      if (amount <= 0) return res.status(400).json({ error: 'Payment amount too small to credit connects' });
+      await query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [amount, paymentOwner]);
+    } else if (meta.type === 'escrow' && meta.job_id && meta.freelancer_id) {
+      // Only create escrow if this payment hasn't already funded one
+      const existingEscrow = await query('SELECT id FROM escrows WHERE payment_id = $1 LIMIT 1', [paymentId]).catch(() => ({ rows: [] }));
+      if (!existingEscrow.rows.length) {
         await query(
           'INSERT INTO escrows (job_id, client_id, freelancer_id, amount, payment_id, status) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING',
           [meta.job_id, req.userId, meta.freelancer_id, piPayment.amount || meta.amount || 0, paymentId, 'funded']
