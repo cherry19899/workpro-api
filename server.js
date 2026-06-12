@@ -2354,7 +2354,8 @@ app.post('/api/applications/:id/hire', auth, checkBlocked, async (req, res) => {
     const app_ = appResult.rows[0];
     if (app_.posted_by !== req.userId) return res.status(403).json({ error: 'Forbidden' });
 
-    const escrowAmount = amount || app_.bid_amount || app_.budget;
+    // Use Pi-verified payment amount — never trust client-supplied amount
+    const escrowAmount = parseFloat(paymentCheck.rows[0].amount || 0);
     const freelancerId = app_.freelancer_id;
 
     // Accept application
@@ -2458,11 +2459,30 @@ app.post('/api/payments/complete', auth, async (req, res) => {
       console.error('[Payment/complete] Pi completion failed:', completeData);
       return res.status(502).json({ error: 'Pi payment completion failed' });
     }
-    // Update using id (not payment_id column)
-    await query(
-      `UPDATE payments SET status='completed', txid=$1, updated_at=NOW() WHERE id=$2`,
+    // Idempotency guard — same pattern as /:paymentId/complete
+    const markDone = await query(
+      "UPDATE payments SET status='completed', txid=$1, updated_at=NOW() WHERE id=$2 AND status='approved' RETURNING *",
       [txid, payment_id]
-    ).catch(() => {});
+    ).catch(() => ({ rows: [] }));
+    if (markDone.rows.length) {
+      const meta = markDone.rows[0].metadata || {};
+      const paymentOwner = markDone.rows[0].user_id || req.userId;
+      if (meta.type === 'connects') {
+        const piAmountPaid = parseFloat(completeData.amount || markDone.rows[0].amount || 0);
+        const connectsAmt = Math.floor(piAmountPaid * 10);
+        if (connectsAmt > 0) {
+          await query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [connectsAmt, paymentOwner]).catch(() => {});
+        }
+      } else if (meta.type === 'escrow' && meta.job_id && meta.freelancer_id) {
+        const existingEsc = await query('SELECT id FROM escrows WHERE payment_id = $1 LIMIT 1', [payment_id]).catch(() => ({ rows: [] }));
+        if (!existingEsc.rows.length) {
+          await query(
+            'INSERT INTO escrows (job_id, client_id, freelancer_id, amount, payment_id, status) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING',
+            [meta.job_id, paymentOwner, meta.freelancer_id, completeData.amount || meta.amount || 0, payment_id, 'funded']
+          ).catch(() => {});
+        }
+      }
+    }
     res.json({ success: true, payment: completeData });
   } catch (err) { serverError(err, res); }
 });
@@ -2780,12 +2800,14 @@ app.post('/api/escrows/:id/fund', auth, async (req, res) => {
     if (escrow.client_id !== req.userId) return res.status(403).json({ error: 'Not your escrow' });
     if (escrow.status !== 'pending') return res.status(400).json({ error: 'Escrow already funded or settled' });
     // Require that the payment record exists in our DB (created by Pi payment webhook)
-    const pmtCheck = await query('SELECT id FROM payments WHERE payment_id = $1 AND status = $2 LIMIT 1', [payment_id, 'completed']);
+    const pmtCheck = await query('SELECT id, amount FROM payments WHERE payment_id = $1 AND status = $2 LIMIT 1', [payment_id, 'completed']);
     if (!pmtCheck.rows.length) return res.status(402).json({ error: 'Payment not verified — complete Pi payment first' });
     // Prevent reusing a Pi payment that already funds a different escrow
     const paymentUsedFund = await query('SELECT id FROM escrows WHERE payment_id = $1 AND id != $2 LIMIT 1', [payment_id, req.params.id]);
     if (paymentUsedFund.rows.length) return res.status(400).json({ error: 'Payment already used for another escrow' });
-    await query('UPDATE escrows SET status = $1, payment_id = $2, updated_at = NOW() WHERE id = $3', ['funded', payment_id, req.params.id]);
+    // Update status, payment_id, and amount from Pi-verified payment record
+    await query('UPDATE escrows SET status = $1, payment_id = $2, amount = COALESCE($3, amount), updated_at = NOW() WHERE id = $4',
+      ['funded', payment_id, pmtCheck.rows[0].amount, req.params.id]);
     await audit('escrow_funded', { escrow_id: req.params.id, payment_id, txid });
     res.json({ escrow: { ...escrow, status: 'funded' }, success: true });
   } catch (err) { serverError(err, res); }
@@ -2979,30 +3001,28 @@ app.post('/api/payments/:paymentId/resolve-complete', auth, async (req, res) => 
       }
     }
 
-    // Mark as completed in our DB (idempotent)
-    await query(
-      `UPDATE payments SET status = 'completed', txid = COALESCE($1, txid), updated_at = NOW() WHERE id = $2`,
+    // Mark as completed in our DB — idempotency guard prevents double-credit
+    const markDoneRC = await query(
+      `UPDATE payments SET status = 'completed', txid = COALESCE($1, txid), updated_at = NOW() WHERE id = $2 AND status != 'completed' RETURNING *`,
       [txid, paymentId]
-    ).catch(() => {});
+    ).catch(() => ({ rows: [] }));
 
-    // Run the same business logic as /complete to avoid stale credited connects or escrow
-    const paymentRecord = await query('SELECT * FROM payments WHERE id = $1', [paymentId]).catch(() => ({ rows: [] }));
-    if (paymentRecord.rows.length) {
-      const meta = paymentRecord.rows[0].metadata || {};
-      const paymentOwner = paymentRecord.rows[0].user_id || req.userId;
+    // Run business logic only on first completion
+    if (markDoneRC.rows.length) {
+      const meta = markDoneRC.rows[0].metadata || {};
+      const paymentOwner = markDoneRC.rows[0].user_id || req.userId;
       if (meta.type === 'connects') {
-        const piAmountPaid = parseFloat(txid ? (paymentRecord.rows[0].amount || 0) : 0);
+        const piAmountPaid = parseFloat(markDoneRC.rows[0].amount || 0);
         const amount = Math.floor(piAmountPaid * 10);
         if (amount > 0) {
           await query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [amount, paymentOwner]).catch(() => {});
         }
       } else if (meta.type === 'escrow' && meta.job_id && meta.freelancer_id) {
-        // Only create escrow if this payment hasn't already funded one
         const existingEscrowForPayment = await query('SELECT id FROM escrows WHERE payment_id = $1 LIMIT 1', [paymentId]).catch(() => ({ rows: [] }));
         if (!existingEscrowForPayment.rows.length) {
           await query(
             'INSERT INTO escrows (job_id, client_id, freelancer_id, amount, payment_id, status) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING',
-            [meta.job_id, paymentOwner, meta.freelancer_id, paymentRecord.rows[0].amount || meta.amount || 0, paymentId, 'funded']
+            [meta.job_id, paymentOwner, meta.freelancer_id, markDoneRC.rows[0].amount || meta.amount || 0, paymentId, 'funded']
           ).catch(() => {});
         }
       }
