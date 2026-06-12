@@ -430,10 +430,13 @@ app.post('/api/users/:id', auth, async (req, res) => {
 });
 
 app.get('/api/users/:id/ratings', async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+  const offset = parseInt(req.query.offset) || 0;
   try {
-    const result = await query('SELECT * FROM ratings WHERE to_user_id = $1 ORDER BY created_at DESC', [req.params.id]);
-    const avg = result.rows.length ? result.rows.reduce((a, b) => a + parseInt(b.rating), 0) / result.rows.length : 0;
-    res.json({ ratings: result.rows, average: Math.round(avg * 10) / 10, count: result.rows.length });
+    const result = await query('SELECT * FROM ratings WHERE to_user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3', [req.params.id, limit, offset]);
+    const totalRes = await query('SELECT COUNT(*), AVG(rating) FROM ratings WHERE to_user_id = $1', [req.params.id]);
+    const avg = parseFloat(totalRes.rows[0].avg) || 0;
+    res.json({ ratings: result.rows, average: Math.round(avg * 10) / 10, count: parseInt(totalRes.rows[0].count), limit, offset });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1031,9 +1034,12 @@ app.post('/api/payments/:paymentId/complete', auth, async (req, res) => {
 });
 
 app.get('/api/payments', auth, async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+  const offset = parseInt(req.query.offset) || 0;
   try {
-    const result = await query('SELECT * FROM payments WHERE user_id = $1 ORDER BY created_at DESC', [req.userId]);
-    res.json({ payments: result.rows });
+    const result = await query('SELECT * FROM payments WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3', [req.userId, limit, offset]);
+    const total = await query('SELECT COUNT(*) FROM payments WHERE user_id = $1', [req.userId]);
+    res.json({ payments: result.rows, total: parseInt(total.rows[0].count), limit, offset });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1044,6 +1050,10 @@ app.post('/api/payments/incomplete', auth, async (req, res) => {
   const { paymentId } = req.body;
   if (!paymentId) return res.status(400).json({ error: 'paymentId required' });
   try {
+    // Verify this payment belongs to the authenticated user
+    const paymentRecord = await query('SELECT * FROM payments WHERE id = $1 AND user_id = $2', [paymentId, req.userId]);
+    if (!paymentRecord.rows.length) return res.status(403).json({ error: 'Payment not found or does not belong to you' });
+
     const piPayment = await piGetPayment(paymentId);
     // If payment is pending server completion, complete it
     if (piPayment.status && piPayment.status.developer_completed === false && piPayment.transaction) {
@@ -1262,9 +1272,12 @@ app.post('/api/admin/users/:id/remove-admin', adminAuth, async (req, res) => {
 });
 
 app.get('/api/admin/jobs', adminAuth, async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 100, 500);
+  const offset = parseInt(req.query.offset) || 0;
   try {
-    const result = await query('SELECT * FROM jobs ORDER BY created_at DESC LIMIT 100');
-    res.json({ jobs: result.rows });
+    const result = await query('SELECT * FROM jobs ORDER BY created_at DESC LIMIT $1 OFFSET $2', [limit, offset]);
+    const total = await query('SELECT COUNT(*) FROM jobs');
+    res.json({ jobs: result.rows, total: parseInt(total.rows[0].count), limit, offset });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1354,9 +1367,12 @@ app.get('/api/admin/earnings', adminAuth, async (req, res) => {
 });
 
 app.get('/api/admin/audit-logs', adminAuth, async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 200, 1000);
+  const offset = parseInt(req.query.offset) || 0;
   try {
-    const result = await query('SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT 200');
-    res.json({ logs: result.rows });
+    const result = await query('SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT $1 OFFSET $2', [limit, offset]);
+    const total = await query('SELECT COUNT(*) FROM audit_logs');
+    res.json({ logs: result.rows, total: parseInt(total.rows[0].count), limit, offset });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1579,11 +1595,11 @@ app.post('/api/applications/:id/withdraw', auth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// PUT /api/applications/:id/status — update application status
+// PUT /api/applications/:id/status — update application status (job owner only: accepted/rejected)
 app.put('/api/applications/:id/status', auth, async (req, res) => {
   const { status } = req.body;
-  const ALLOWED = ['pending', 'accepted', 'rejected', 'withdrawn'];
-  if (!ALLOWED.includes(status)) return res.status(400).json({ error: `Invalid status. Allowed: ${ALLOWED.join(', ')}` });
+  const OWNER_ALLOWED = ['accepted', 'rejected'];
+  if (!OWNER_ALLOWED.includes(status)) return res.status(400).json({ error: `Invalid status. Job owners may set: ${OWNER_ALLOWED.join(', ')}` });
   try {
     const appResult = await query('SELECT a.*, j.posted_by FROM applications a JOIN jobs j ON a.job_id = j.id WHERE a.id = $1', [req.params.id]);
     if (!appResult.rows.length) return res.status(404).json({ error: 'Application not found' });
@@ -1718,7 +1734,8 @@ app.get('/api/chat/conversations/:id/messages', auth, async (req, res) => {
     const room = await query('SELECT * FROM chat_rooms WHERE id = $1 AND (client_id = $2 OR freelancer_id = $2)', [req.params.id, req.userId]);
     if (!room.rows.length) return res.status(403).json({ error: 'Forbidden' });
     const result = await query('SELECT * FROM chat_messages WHERE room_id = $1 ORDER BY created_at ASC LIMIT 200', [req.params.id]);
-    res.json({ messages: result.rows });
+    const messages = result.rows.map(m => ({ ...m, content: m.message, text: m.message }));
+    res.json({ messages });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -1972,7 +1989,15 @@ app.post('/api/notifications/mark-read', auth, async (req, res) => {
 // Called from frontend after client decides to hire (Pi payment flow)
 app.post('/api/applications/:id/hire', auth, checkBlocked, async (req, res) => {
   const { payment_id, txid, amount } = req.body;
+  if (!payment_id) return res.status(400).json({ error: 'payment_id required — Pi payment must be completed before hiring' });
   try {
+    // Verify payment belongs to this user and is completed
+    const paymentCheck = await query(
+      "SELECT * FROM payments WHERE id = $1 AND user_id = $2 AND status = 'completed'",
+      [payment_id, req.userId]
+    );
+    if (!paymentCheck.rows.length) return res.status(402).json({ error: 'Valid completed payment required to hire' });
+
     const appResult = await query(
       'SELECT a.*, j.posted_by, j.budget, j.title as job_title FROM applications a JOIN jobs j ON a.job_id = j.id WHERE a.id = $1',
       [req.params.id]
@@ -1990,7 +2015,7 @@ app.post('/api/applications/:id/hire', auth, checkBlocked, async (req, res) => {
     const escrow = await query(
       `INSERT INTO escrows (job_id, client_id, freelancer_id, amount, payment_id, status)
        VALUES ($1,$2,$3,$4,$5,'funded') ON CONFLICT DO NOTHING RETURNING *`,
-      [app_.job_id, req.userId, freelancerId, escrowAmount, payment_id || null]
+      [app_.job_id, req.userId, freelancerId, escrowAmount, payment_id]
     );
     // Mark job as in-progress and set hired_freelancer_id
     const freelancerNameRes = await query('SELECT username FROM users WHERE id = $1', [freelancerId]);
@@ -2048,6 +2073,9 @@ app.post('/api/payments/complete', auth, async (req, res) => {
       body: JSON.stringify({ txid })
     });
     const completeData = await completeRes.json();
+    if (!completeRes.ok) {
+      return res.status(502).json({ error: 'Pi payment completion failed', details: completeData });
+    }
     // Update using id (not payment_id column)
     await query(
       `UPDATE payments SET status='completed', txid=$1, updated_at=NOW() WHERE id=$2`,
