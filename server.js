@@ -563,16 +563,18 @@ app.post('/api/jobs', auth, checkBlocked, async (req, res) => {
 
 // GET /api/jobs/user/:userId — jobs posted by a specific user (MUST be before /:id)
 app.get('/api/jobs/user/:userId', async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+  const offset = parseInt(req.query.offset) || 0;
   try {
     const userId = req.params.userId;
     const result = await query(
       `SELECT j.*, u.username as client_username
        FROM jobs j LEFT JOIN users u ON u.id = j.posted_by
        WHERE j.posted_by = $1 OR LOWER(u.username) = LOWER($1)
-       ORDER BY j.created_at DESC`,
-      [userId]
+       ORDER BY j.created_at DESC LIMIT $2 OFFSET $3`,
+      [userId, limit, offset]
     );
-    res.json({ jobs: result.rows.map(parseJobRow) });
+    res.json({ jobs: result.rows.map(parseJobRow), limit, offset });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -602,12 +604,12 @@ app.get('/api/jobs/my', auth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.get('/api/jobs/:id', async (req, res) => {
+app.get('/api/jobs/:id', softAuth, async (req, res) => {
   try {
     const jobResult = await query('SELECT * FROM jobs WHERE id = $1', [req.params.id]);
     if (!jobResult.rows.length) return res.status(404).json({ error: 'Job not found' });
     const job_row = jobResult.rows[0];
-    const callerId = req.headers['x-user-id'] || null;
+    const callerId = req.userId || null;
     // Only return application details to the job owner
     let applications = [];
     if (callerId && callerId === job_row.posted_by) {
@@ -1728,6 +1730,8 @@ app.put('/api/users/me', auth, async (req, res) => {
 
 // ─── Chat alias endpoints (conversations = rooms) ──────────────────
 app.get('/api/chat/conversations', auth, async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+  const offset = parseInt(req.query.offset) || 0;
   try {
     const result = await query(
       `SELECT r.*,
@@ -1741,10 +1745,11 @@ app.get('/api/chat/conversations', auth, async (req, res) => {
        LEFT JOIN users uc ON uc.id = r.client_id
        LEFT JOIN users uf ON uf.id = r.freelancer_id
        WHERE r.client_id = $1 OR r.freelancer_id = $1
-       ORDER BY last_message_at DESC NULLS LAST`,
-      [req.userId]
+       ORDER BY last_message_at DESC NULLS LAST
+       LIMIT $2 OFFSET $3`,
+      [req.userId, limit, offset]
     );
-    res.json({ conversations: result.rows, rooms: result.rows });
+    res.json({ conversations: result.rows, rooms: result.rows, limit, offset });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -2210,6 +2215,8 @@ app.post('/api/connects/buy', auth, checkBlocked, async (req, res) => {
 
 // GET /api/applications/user/:userId — list applications for a user
 app.get('/api/applications/user/:userId', auth, async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+  const offset = parseInt(req.query.offset) || 0;
   try {
     // Alias cherry19899 → pi_cherry19899 in URL param for consistency
     const paramUserId = req.params.userId === 'cherry19899' ? 'pi_cherry19899' : req.params.userId;
@@ -2222,15 +2229,17 @@ app.get('/api/applications/user/:userId', auth, async (req, res) => {
        JOIN jobs j ON a.job_id = j.id
        LEFT JOIN users u ON u.id = j.posted_by
        WHERE a.freelancer_id = $1
-       ORDER BY a.created_at DESC`,
-      [userId]
+       ORDER BY a.created_at DESC LIMIT $2 OFFSET $3`,
+      [userId, limit, offset]
     );
-    res.json({ applications: result.rows });
+    res.json({ applications: result.rows, limit, offset });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // GET /api/escrows/user/:userId — list escrows for a user
 app.get('/api/escrows/user/:userId', auth, async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+  const offset = parseInt(req.query.offset) || 0;
   try {
     const paramUserId = req.params.userId === 'cherry19899' ? 'pi_cherry19899' : req.params.userId;
     if (paramUserId !== req.userId) return res.status(403).json({ error: 'Forbidden' });
@@ -2243,10 +2252,10 @@ app.get('/api/escrows/user/:userId', auth, async (req, res) => {
        LEFT JOIN users c ON c.id = e.client_id
        LEFT JOIN users f ON f.id = e.freelancer_id
        WHERE e.client_id = $1 OR e.freelancer_id = $1
-       ORDER BY e.created_at DESC`,
-      [userId]
+       ORDER BY e.created_at DESC LIMIT $2 OFFSET $3`,
+      [userId, limit, offset]
     );
-    res.json({ escrows: result.rows });
+    res.json({ escrows: result.rows, limit, offset });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -2519,11 +2528,13 @@ app.get('/api/reviews/:id', async (req, res) => {
       res.json({ review: result.rows[0] });
     } else {
       // Treat as user ID — return all reviews for this user
+      const limit2 = Math.min(parseInt(req.query.limit) || 50, 200);
+      const offset2 = parseInt(req.query.offset) || 0;
       const result = await query(
-        'SELECT r.*, u.username as from_username FROM ratings r LEFT JOIN users u ON u.id = r.from_user_id WHERE r.to_user_id = $1 ORDER BY r.created_at DESC',
-        [id]
+        'SELECT r.*, u.username as from_username FROM ratings r LEFT JOIN users u ON u.id = r.from_user_id WHERE r.to_user_id = $1 ORDER BY r.created_at DESC LIMIT $2 OFFSET $3',
+        [id, limit2, offset2]
       );
-      res.json({ reviews: result.rows, ratings: result.rows });
+      res.json({ reviews: result.rows, ratings: result.rows, limit: limit2, offset: offset2 });
     }
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
