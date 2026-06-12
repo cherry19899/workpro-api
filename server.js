@@ -647,10 +647,10 @@ app.get('/api/jobs/:id', softAuth, async (req, res) => {
     if (!jobResult.rows.length) return res.status(404).json({ error: 'Job not found' });
     const job_row = jobResult.rows[0];
     const callerId = req.userId || null;
-    // Only return application details to the job owner
+    // Only return application details to the job owner (capped to prevent huge payloads)
     let applications = [];
     if (callerId && callerId === job_row.posted_by) {
-      const appsResult = await query('SELECT * FROM applications WHERE job_id = $1 ORDER BY created_at DESC', [req.params.id]);
+      const appsResult = await query('SELECT * FROM applications WHERE job_id = $1 ORDER BY created_at DESC LIMIT 200', [req.params.id]);
       applications = appsResult.rows;
     }
     // Include chat room_id so frontend can show "Open chat" button
@@ -1294,7 +1294,7 @@ app.get('/api/admin/users', adminAuth, async (req, res) => {
 app.post('/api/admin/users/:id/block', adminAuth, async (req, res) => {
   try {
     const target = await query('SELECT username FROM users WHERE id = $1', [req.params.id]);
-    if (req.params.id === 'cherry19899' || target.rows[0]?.username === 'cherry19899') {
+    if (['cherry19899', 'pi_cherry19899'].includes(req.params.id) || target.rows[0]?.username === 'cherry19899') {
       return res.status(403).json({ error: 'Cannot block owner' });
     }
     await query('UPDATE users SET is_blocked = true, status = $1, updated_at = NOW() WHERE id = $2', ['blocked', req.params.id]);
