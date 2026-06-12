@@ -292,11 +292,11 @@ app.get('/api/health', async (req, res) => {
 app.put('/api/me', auth, checkBlocked, async (req, res) => {
   const { username, bio, skills, display_name } = req.body;
   if (bio && bio.length > 1000) return res.status(400).json({ error: 'Bio too long (max 1000)' });
-  if (skills && skills.length > 300) return res.status(400).json({ error: 'Skills too long (max 300)' });
   try {
     const uname = display_name || username;
     if (uname && uname.length > 50) return res.status(400).json({ error: 'Username too long (max 50)' });
     const skillsStr = Array.isArray(skills) ? skills.join(',') : (skills || null);
+    if (skillsStr && skillsStr.length > 300) return res.status(400).json({ error: 'Skills too long (max 300)' });
     await query(
       'UPDATE users SET username = COALESCE($1, username), bio = COALESCE($2, bio), skills = COALESCE($3, skills), updated_at = NOW() WHERE id = $4',
       [uname || null, bio || null, skillsStr, req.userId]
