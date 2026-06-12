@@ -1944,7 +1944,7 @@ app.post('/api/applications/:id/withdraw', auth, async (req, res) => {
     const app_ = appResult.rows[0];
     if (app_.freelancer_id !== req.userId) return res.status(403).json({ error: 'Forbidden' });
     if (app_.status !== 'pending') return res.status(400).json({ error: 'Can only withdraw pending applications' });
-    const result = await query('UPDATE applications SET status = $1, updated_at = NOW() WHERE id = $2 RETURNING *', ['withdrawn', req.params.id]);
+    const result = await query('UPDATE applications SET status = $1 WHERE id = $2 RETURNING *', ['withdrawn', req.params.id]);
     res.json({ application: result.rows[0], success: true });
   } catch (err) { serverError(err, res); }
 });
