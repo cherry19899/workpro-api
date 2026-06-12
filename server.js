@@ -1035,15 +1035,24 @@ app.post('/api/escrow', auth, checkBlocked, async (req, res) => {
     if (jobCheck.rows[0].hired_freelancer_id && jobCheck.rows[0].hired_freelancer_id !== freelancer_id) {
       return res.status(400).json({ error: 'freelancer_id does not match hired freelancer' });
     }
-    const existing = await query('SELECT id FROM escrows WHERE job_id = $1 AND status IN ($2, $3)', [job_id, 'pending', 'funded']);
-    if (existing.rows.length) return res.status(400).json({ error: 'Escrow already exists for this job' });
-    const result = await query(
-      'INSERT INTO escrows (job_id, client_id, freelancer_id, amount, payment_id) VALUES ($1, $2, $3, $4, $5) RETURNING *',
-      [job_id, req.userId, freelancer_id, parseFloat(amount), payment_id || null]
-    );
-    await query('UPDATE jobs SET status = $1, updated_at = NOW() WHERE id = $2', ['in_progress', job_id]);
-    await audit('escrow_created', { escrow_id: result.rows[0].id, job_id });
-    res.json({ escrow: result.rows[0] });
+    // Atomic: check + insert in one transaction to prevent duplicate escrow race
+    const pgClientE = await getPool().connect();
+    let escrowRow;
+    try {
+      await pgClientE.query('BEGIN');
+      const existing = await pgClientE.query('SELECT id FROM escrows WHERE job_id = $1 AND status = ANY($2) FOR UPDATE', [job_id, ['pending', 'funded']]);
+      if (existing.rows.length) { await pgClientE.query('ROLLBACK'); return res.status(400).json({ error: 'Escrow already exists for this job' }); }
+      const result = await pgClientE.query(
+        'INSERT INTO escrows (job_id, client_id, freelancer_id, amount, payment_id) VALUES ($1, $2, $3, $4, $5) RETURNING *',
+        [job_id, req.userId, freelancer_id, parseFloat(amount), payment_id || null]
+      );
+      await pgClientE.query('UPDATE jobs SET status = $1, updated_at = NOW() WHERE id = $2', ['in_progress', job_id]);
+      await pgClientE.query('COMMIT');
+      escrowRow = result.rows[0];
+    } catch (txErr) { await pgClientE.query('ROLLBACK').catch(() => {}); throw txErr; }
+    finally { pgClientE.release(); }
+    await audit('escrow_created', { escrow_id: escrowRow.id, job_id });
+    res.json({ escrow: escrowRow });
   } catch (err) {
     serverError(err, res);
   }
