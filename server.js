@@ -138,7 +138,17 @@ async function piGetPayment(paymentId) {
 
 // ─── Auth Middleware ──────────────────────────────────────────────
 async function auth(req, res, next) {
-  // Accept user ID from x-user-id or x-pi-token headers
+  // Prefer JWT from Authorization: Bearer header — verified, not spoofable
+  const authHeader = req.headers['authorization'];
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    try {
+      const decoded = jwt.verify(authHeader.slice(7), JWT_SECRET);
+      req.userId = decoded.id;
+      req.jwtVerified = true;
+      return next();
+    } catch (_) { /* invalid/expired JWT — fall through to x-user-id */ }
+  }
+  // Legacy: accept user ID from x-user-id or x-pi-token headers
   let userId = req.headers['x-user-id'] || req.headers['x-pi-token'];
   if (!userId) return res.status(401).json({ error: 'Access token required' });
   // Alias cherry19899 (username) → pi_cherry19899 (canonical ID) so all data stays unified
@@ -359,7 +369,7 @@ app.get('/api/auth/me', auth, async (req, res) => {
 });
 
 // ─── Users ──────────────────────────────────────────────
-app.get('/api/users', async (req, res) => {
+app.get('/api/users', softAuth, async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit) || 50, 200);
     const offset = parseInt(req.query.offset) || 0;
@@ -850,7 +860,8 @@ app.get('/api/chat/rooms/:id/messages', auth, async (req, res) => {
     const room = await query('SELECT * FROM chat_rooms WHERE id = $1 AND (client_id = $2 OR freelancer_id = $2)', [req.params.id, req.userId]);
     if (!room.rows.length) return res.status(403).json({ error: 'Forbidden' });
     const result = await query('SELECT * FROM chat_messages WHERE room_id = $1 ORDER BY created_at ASC LIMIT 200', [req.params.id]);
-    res.json({ messages: result.rows });
+    const messages = result.rows.map(m => ({ ...m, content: m.message, text: m.message }));
+    res.json({ messages });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1555,6 +1566,19 @@ app.post('/api/applications/:id/reject', auth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// POST /api/applications/:id/withdraw — freelancer withdraws their own pending application
+app.post('/api/applications/:id/withdraw', auth, async (req, res) => {
+  try {
+    const appResult = await query('SELECT * FROM applications WHERE id = $1', [req.params.id]);
+    if (!appResult.rows.length) return res.status(404).json({ error: 'Application not found' });
+    const app_ = appResult.rows[0];
+    if (app_.freelancer_id !== req.userId) return res.status(403).json({ error: 'Forbidden' });
+    if (app_.status !== 'pending') return res.status(400).json({ error: 'Can only withdraw pending applications' });
+    const result = await query('UPDATE applications SET status = $1, updated_at = NOW() WHERE id = $2 RETURNING *', ['withdrawn', req.params.id]);
+    res.json({ application: result.rows[0], success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // PUT /api/applications/:id/status — update application status
 app.put('/api/applications/:id/status', auth, async (req, res) => {
   const { status } = req.body;
@@ -1841,6 +1865,9 @@ app.get('/api/users/:id/portfolio', async (req, res) => {
 
 app.put('/api/users/me/portfolio', auth, async (req, res) => {
   const { headline, summary, experience_years, website, github, linkedin } = req.body;
+  if (experience_years !== undefined && (parseInt(experience_years) < 0 || parseInt(experience_years) > 60)) {
+    return res.status(400).json({ error: 'experience_years must be 0–60' });
+  }
   try {
     await query(`CREATE TABLE IF NOT EXISTS portfolios (
       id SERIAL PRIMARY KEY, user_id VARCHAR(255) UNIQUE, headline TEXT, summary TEXT,
@@ -1918,12 +1945,14 @@ app.get('/api/notifications/unread-count', auth, async (req, res) => {
 
 app.get('/api/notifications', auth, async (req, res) => {
   try {
+    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+    const offset = parseInt(req.query.offset) || 0;
     const result = await query(
-      'SELECT * FROM notifications WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50',
-      [req.userId]
+      'SELECT * FROM notifications WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3',
+      [req.userId, limit, offset]
     );
     const unread = result.rows.filter(r => !r.is_read).length;
-    res.json({ notifications: result.rows, unread_count: unread });
+    res.json({ notifications: result.rows, unread_count: unread, limit, offset });
   } catch (err) {
     res.json({ notifications: [], unread_count: 0 });
   }
@@ -2311,13 +2340,17 @@ app.get('/api/chat/rooms/:id', auth, async (req, res) => {
 // POST /api/escrows/:id/fund — fund an escrow after Pi payment
 app.post('/api/escrows/:id/fund', auth, async (req, res) => {
   const { payment_id, txid } = req.body;
+  if (!payment_id) return res.status(400).json({ error: 'payment_id required — provide the Pi payment identifier' });
   try {
     const result = await query('SELECT * FROM escrows WHERE id = $1', [req.params.id]);
     if (!result.rows.length) return res.status(404).json({ error: 'Escrow not found' });
     const escrow = result.rows[0];
     if (escrow.client_id !== req.userId) return res.status(403).json({ error: 'Not your escrow' });
     if (escrow.status !== 'pending') return res.status(400).json({ error: 'Escrow already funded or settled' });
-    await query('UPDATE escrows SET status = $1, payment_id = $2, updated_at = NOW() WHERE id = $3', ['funded', payment_id || escrow.payment_id, req.params.id]);
+    // Require that the payment record exists in our DB (created by Pi payment webhook)
+    const pmtCheck = await query('SELECT id FROM payments WHERE payment_id = $1 AND status = $2 LIMIT 1', [payment_id, 'completed']);
+    if (!pmtCheck.rows.length) return res.status(402).json({ error: 'Payment not verified — complete Pi payment first' });
+    await query('UPDATE escrows SET status = $1, payment_id = $2, updated_at = NOW() WHERE id = $3', ['funded', payment_id, req.params.id]);
     await audit('escrow_funded', { escrow_id: req.params.id, payment_id, txid });
     res.json({ escrow: { ...escrow, status: 'funded' }, success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
