@@ -201,23 +201,29 @@ function softAuth(req, res, next) {
 }
 
 async function adminAuth(req, res, next) {
-  // SECURITY: the x-user-id header is client-controlled — anyone could send the owner's
-  // id and pass a DB role check. Admin access therefore REQUIRES the shared ADMIN_API_KEY
-  // secret, sent as `x-admin-key`, `Authorization: Bearer <key>`, or `?admin_key=`.
-  // The frontend admin panel attaches it from localStorage.workpro_admin_token.
-  let key = req.headers['x-admin-key'] || req.headers['authorization'] || req.query.admin_key || '';
-  if (typeof key === 'string' && key.startsWith('Bearer ')) key = key.slice(7);
+  const authHeader = req.headers['authorization'] || '';
+  const rawKey = req.headers['x-admin-key'] || req.query.admin_key || '';
+  // Path 1: shared ADMIN_API_KEY secret (for direct API / scripts)
+  let key = rawKey || (authHeader.startsWith('Bearer ') ? authHeader.slice(7) : authHeader);
   const keyOk = key.length > 0 && key.length === ADMIN_API_KEY.length &&
     crypto.timingSafeEqual(Buffer.from(key), Buffer.from(ADMIN_API_KEY));
-  if (!keyOk) {
-    return res.status(403).json({ error: 'Admin access required' });
+  if (keyOk) {
+    req.isAdmin = true;
+    return next();
   }
-  // Resolve acting user id for audit logging only — the secret is what authorizes.
-  let userId = req.headers['x-user-id'] || req.query._uid || req.query.user_id || null;
-  if (userId === 'cherry19899') userId = 'pi_cherry19899';
-  req.userId = userId;
-  req.isAdmin = true;
-  return next();
+  // Path 2: valid JWT from a user with role='admin' (for the in-app admin panel)
+  if (authHeader.startsWith('Bearer ')) {
+    try {
+      const decoded = jwt.verify(authHeader.slice(7), JWT_SECRET);
+      const userRow = await query("SELECT id FROM users WHERE id = $1 AND role = 'admin' LIMIT 1", [decoded.id]);
+      if (userRow.rows.length) {
+        req.userId = decoded.id;
+        req.isAdmin = true;
+        return next();
+      }
+    } catch (_) {}
+  }
+  return res.status(403).json({ error: 'Admin access required' });
 }
 
 async function checkBlocked(req, res, next) {
