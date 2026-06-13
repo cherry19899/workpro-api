@@ -2387,9 +2387,11 @@ app.post('/api/users/me/portfolio/items', auth, checkBlocked, async (req, res) =
 app.delete('/api/users/me', auth, async (req, res) => {
   try {
     const active = await query(
-      `(SELECT 1 FROM jobs WHERE (posted_by=$1 OR hired_freelancer_id=$1) AND status IN ('in_progress','submitted') LIMIT 1)
+      `(SELECT 1 FROM jobs WHERE posted_by=$1 AND status IN ('open','in_progress','submitted') LIMIT 1)
        UNION ALL
-       (SELECT 1 FROM escrows WHERE (client_id=$1 OR freelancer_id=$1) AND status='funded' LIMIT 1)`,
+       (SELECT 1 FROM jobs WHERE hired_freelancer_id=$1 AND status IN ('in_progress','submitted') LIMIT 1)
+       UNION ALL
+       (SELECT 1 FROM escrows WHERE (client_id=$1 OR freelancer_id=$1) AND status IN ('pending','funded') LIMIT 1)`,
       [req.userId]
     );
     if (active.rows.length > 0) {
