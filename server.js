@@ -758,8 +758,10 @@ app.post('/api/jobs/:id/apply', auth, checkBlocked, async (req, res) => {
     if (job.posted_by === req.userId) return res.status(400).json({ error: 'Cannot apply to own job' });
     if (job.status !== 'open') return res.status(400).json({ error: 'Job is not open' });
 
-    const existingApp = await query('SELECT id FROM applications WHERE job_id = $1 AND freelancer_id = $2', [req.params.id, req.userId]);
-    if (existingApp.rows.length) return res.status(400).json({ error: 'Already applied' });
+    const existingApp = await query('SELECT id, status FROM applications WHERE job_id = $1 AND freelancer_id = $2', [req.params.id, req.userId]);
+    if (existingApp.rows.length && !['withdrawn', 'rejected'].includes(existingApp.rows[0].status)) {
+      return res.status(400).json({ error: 'Already applied' });
+    }
 
     const userResult = await query('SELECT id, username, balance_connects, is_blocked FROM users WHERE id = $1', [req.userId]);
     const user = userResult.rows[0];
@@ -768,7 +770,7 @@ app.post('/api/jobs/:id/apply', auth, checkBlocked, async (req, res) => {
       return res.status(400).json({ error: 'Not enough connects', required: cost, current: user?.balance_connects || 0 });
     }
 
-    // Atomic: deduct connects AND insert application in one transaction
+    // Atomic: deduct connects AND insert/re-activate application in one transaction
     let appResult;
     const pgClient = await getPool().connect();
     try {
@@ -782,7 +784,11 @@ app.post('/api/jobs/:id/apply', auth, checkBlocked, async (req, res) => {
         return res.status(400).json({ error: 'Not enough connects', required: cost });
       }
       appResult = await pgClient.query(
-        'INSERT INTO applications (job_id, job_title, freelancer_id, freelancer_name, message) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (job_id, freelancer_id) DO NOTHING RETURNING *',
+        `INSERT INTO applications (job_id, job_title, freelancer_id, freelancer_name, message) VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (job_id, freelancer_id) DO UPDATE
+           SET status='pending', message=EXCLUDED.message, updated_at=NOW()
+           WHERE applications.status IN ('withdrawn','rejected')
+         RETURNING *`,
         [req.params.id, job.title, req.userId, user.username || req.userId, req.body.message || '']
       );
       if (!appResult.rows.length) {
@@ -1867,8 +1873,10 @@ app.post('/api/applications', auth, checkBlocked, async (req, res) => {
     const job = jobResult.rows[0];
     if (job.posted_by === req.userId) return res.status(400).json({ error: 'Cannot apply to own job' });
     if (job.status !== 'open') return res.status(400).json({ error: 'Job is not open' });
-    const existing = await query('SELECT id FROM applications WHERE job_id = $1 AND freelancer_id = $2', [job_id, req.userId]);
-    if (existing.rows.length) return res.status(400).json({ error: 'Already applied' });
+    const existing = await query('SELECT id, status FROM applications WHERE job_id = $1 AND freelancer_id = $2', [job_id, req.userId]);
+    if (existing.rows.length && !['withdrawn', 'rejected'].includes(existing.rows[0].status)) {
+      return res.status(400).json({ error: 'Already applied' });
+    }
     const userResult = await query('SELECT id, username, balance_connects, is_blocked FROM users WHERE id = $1', [req.userId]);
     const user = userResult.rows[0];
     const cost = job.apply_cost || 1;
@@ -1883,7 +1891,11 @@ app.post('/api/applications', auth, checkBlocked, async (req, res) => {
       );
       if (!deductResult2.rows.length) { await pgClient.query('ROLLBACK'); return res.status(400).json({ error: 'Not enough connects', required: cost }); }
       appResult = await pgClient.query(
-        'INSERT INTO applications (job_id, job_title, freelancer_id, freelancer_name, message) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (job_id, freelancer_id) DO NOTHING RETURNING *',
+        `INSERT INTO applications (job_id, job_title, freelancer_id, freelancer_name, message) VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (job_id, freelancer_id) DO UPDATE
+           SET status='pending', message=EXCLUDED.message, updated_at=NOW()
+           WHERE applications.status IN ('withdrawn','rejected')
+         RETURNING *`,
         [job_id, job.title, req.userId, user.username || req.userId, message || '']
       );
       if (!appResult.rows.length) { await pgClient.query('ROLLBACK'); return res.status(400).json({ error: 'Already applied' }); }
