@@ -844,7 +844,12 @@ app.post('/api/jobs/:id/hire', auth, checkBlocked, async (req, res) => {
         return res.status(400).json({ error: 'Payment already used for another escrow' });
       }
       await pgClientJ.query('UPDATE applications SET status = $1 WHERE id = $2', ['accepted', application_id]);
+      const toRejectJ = await pgClientJ.query('SELECT freelancer_id FROM applications WHERE job_id = $1 AND id != $2 AND status = $3', [req.params.id, application_id, 'pending']);
       await pgClientJ.query('UPDATE applications SET status = $1 WHERE job_id = $2 AND id != $3 AND status = $4', ['rejected', req.params.id, application_id, 'pending']);
+      const refundCostJ = job.apply_cost || 1;
+      for (const r of toRejectJ.rows) {
+        await pgClientJ.query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [refundCostJ, r.freelancer_id]);
+      }
       if (!existingEsc.rows.length) {
         const escRes = await pgClientJ.query(
           "INSERT INTO escrows (job_id, client_id, freelancer_id, amount, payment_id, status) VALUES ($1,$2,$3,$4,$5,'funded') RETURNING *",
@@ -975,9 +980,13 @@ app.patch('/api/applications/:id', auth, checkBlocked, async (req, res) => {
   const OWNER_ALLOWED = ['accepted', 'rejected'];
   if (!OWNER_ALLOWED.includes(status)) return res.status(400).json({ error: `Invalid status. Allowed: ${OWNER_ALLOWED.join(', ')}` });
   try {
-    const appResult = await query('SELECT a.*, j.posted_by FROM applications a JOIN jobs j ON a.job_id = j.id WHERE a.id = $1', [req.params.id]);
+    const appResult = await query('SELECT a.*, j.posted_by, j.apply_cost FROM applications a JOIN jobs j ON a.job_id = j.id WHERE a.id = $1', [req.params.id]);
     if (!appResult.rows.length) return res.status(404).json({ error: 'Application not found' });
     if (appResult.rows[0].posted_by !== req.userId) return res.status(403).json({ error: 'Forbidden' });
+    const app_ = appResult.rows[0];
+    if (status === 'rejected' && app_.status === 'pending') {
+      await query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [app_.apply_cost || 1, app_.freelancer_id]);
+    }
     const result = await query('UPDATE applications SET status = $1 WHERE id = $2 RETURNING *', [status, req.params.id]);
     await audit('application_status_changed', { app_id: req.params.id, status });
     res.json({ application: result.rows[0], success: true });
@@ -1977,9 +1986,13 @@ app.post('/api/applications/:id/accept', auth, checkBlocked, async (req, res) =>
 // POST /api/applications/:id/reject — alias used by JobDetail.js
 app.post('/api/applications/:id/reject', auth, checkBlocked, async (req, res) => {
   try {
-    const appResult = await query('SELECT a.*, j.posted_by FROM applications a JOIN jobs j ON a.job_id = j.id WHERE a.id = $1', [req.params.id]);
+    const appResult = await query('SELECT a.*, j.posted_by, j.apply_cost FROM applications a JOIN jobs j ON a.job_id = j.id WHERE a.id = $1', [req.params.id]);
     if (!appResult.rows.length) return res.status(404).json({ error: 'Application not found' });
     if (appResult.rows[0].posted_by !== req.userId) return res.status(403).json({ error: 'Forbidden' });
+    const app_ = appResult.rows[0];
+    if (app_.status === 'pending') {
+      await query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [app_.apply_cost || 1, app_.freelancer_id]);
+    }
     const result = await query('UPDATE applications SET status = $1 WHERE id = $2 RETURNING *', ['rejected', req.params.id]);
     res.json({ application: result.rows[0], success: true });
   } catch (err) { serverError(err, res); }
@@ -1988,11 +2001,12 @@ app.post('/api/applications/:id/reject', auth, checkBlocked, async (req, res) =>
 // POST /api/applications/:id/withdraw — freelancer withdraws their own pending application
 app.post('/api/applications/:id/withdraw', auth, async (req, res) => {
   try {
-    const appResult = await query('SELECT * FROM applications WHERE id = $1', [req.params.id]);
+    const appResult = await query('SELECT a.*, j.apply_cost FROM applications a JOIN jobs j ON a.job_id = j.id WHERE a.id = $1', [req.params.id]);
     if (!appResult.rows.length) return res.status(404).json({ error: 'Application not found' });
     const app_ = appResult.rows[0];
     if (app_.freelancer_id !== req.userId) return res.status(403).json({ error: 'Forbidden' });
     if (app_.status !== 'pending') return res.status(400).json({ error: 'Can only withdraw pending applications' });
+    await query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [app_.apply_cost || 1, req.userId]);
     const result = await query('UPDATE applications SET status = $1 WHERE id = $2 RETURNING *', ['withdrawn', req.params.id]);
     res.json({ application: result.rows[0], success: true });
   } catch (err) { serverError(err, res); }
@@ -2004,9 +2018,13 @@ app.put('/api/applications/:id/status', auth, checkBlocked, async (req, res) => 
   const OWNER_ALLOWED = ['accepted', 'rejected'];
   if (!OWNER_ALLOWED.includes(status)) return res.status(400).json({ error: `Invalid status. Job owners may set: ${OWNER_ALLOWED.join(', ')}` });
   try {
-    const appResult = await query('SELECT a.*, j.posted_by FROM applications a JOIN jobs j ON a.job_id = j.id WHERE a.id = $1', [req.params.id]);
+    const appResult = await query('SELECT a.*, j.posted_by, j.apply_cost FROM applications a JOIN jobs j ON a.job_id = j.id WHERE a.id = $1', [req.params.id]);
     if (!appResult.rows.length) return res.status(404).json({ error: 'Application not found' });
     if (appResult.rows[0].posted_by !== req.userId) return res.status(403).json({ error: 'Forbidden' });
+    const app_ = appResult.rows[0];
+    if (status === 'rejected' && app_.status === 'pending') {
+      await query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [app_.apply_cost || 1, app_.freelancer_id]);
+    }
     const result = await query('UPDATE applications SET status = $1 WHERE id = $2 RETURNING *', [status, req.params.id]);
     res.json({ application: result.rows[0], success: true });
   } catch (err) { serverError(err, res); }
