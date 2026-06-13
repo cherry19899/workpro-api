@@ -1478,7 +1478,7 @@ app.get('/api/users/:id/level', async (req, res) => {
 // ─── Admin ──────────────────────────────────────────────
 app.get('/api/admin/stats', adminAuth, async (req, res) => {
   try {
-    const [users, jobs, applications, escrows, activeEscrows, payments, revenue, ratings, chats] = await Promise.all([
+    const [users, jobs, applications, escrows, activeEscrows, payments, revenue, ratings, chats, disputes] = await Promise.all([
       query('SELECT COUNT(*) FROM users'),
       query('SELECT COUNT(*) FROM jobs'),
       query('SELECT COUNT(*) FROM applications'),
@@ -1488,6 +1488,7 @@ app.get('/api/admin/stats', adminAuth, async (req, res) => {
       query("SELECT COALESCE(SUM(amount*0.02),0) AS total FROM payments WHERE status='completed'"),
       query('SELECT COUNT(*) FROM ratings'),
       query('SELECT COUNT(*) FROM chat_rooms'),
+      query("SELECT COUNT(*) FROM escrows WHERE status='disputed'"),
     ]);
     const u = parseInt(users.rows[0].count);
     const j = parseInt(jobs.rows[0].count);
@@ -1505,6 +1506,7 @@ app.get('/api/admin/stats', adminAuth, async (req, res) => {
       payments: parseInt(payments.rows[0].count),
       ratings: parseInt(ratings.rows[0].count),
       chats: parseInt(chats.rows[0].count),
+      pending_moderation: parseInt(disputes.rows[0].count),
     });
   } catch (err) {
     serverError(err, res);
