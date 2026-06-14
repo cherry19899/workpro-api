@@ -748,6 +748,16 @@ app.patch('/api/jobs/:id', auth, checkBlocked, async (req, res) => {
   }
 });
 
+app.get('/api/jobs/:id/check-applied', auth, async (req, res) => {
+  try {
+    const result = await query(
+      "SELECT id, status FROM applications WHERE job_id = $1 AND freelancer_id = $2 AND status NOT IN ('withdrawn','rejected') LIMIT 1",
+      [req.params.id, req.userId]
+    );
+    res.json({ applied: result.rows.length > 0, status: result.rows[0]?.status || null });
+  } catch (err) { serverError(err, res); }
+});
+
 app.post('/api/jobs/:id/apply', auth, checkBlocked, async (req, res) => {
   if (req.body.message && req.body.message.length > 2000) {
     return res.status(400).json({ error: 'Cover letter too long (max 2000 chars)' });
@@ -761,7 +771,7 @@ app.post('/api/jobs/:id/apply', auth, checkBlocked, async (req, res) => {
 
     const existingApp = await query('SELECT id, status FROM applications WHERE job_id = $1 AND freelancer_id = $2', [req.params.id, req.userId]);
     if (existingApp.rows.length && !['withdrawn', 'rejected'].includes(existingApp.rows[0].status)) {
-      return res.status(400).json({ error: 'Already applied' });
+      return res.status(409).json({ error: 'Already applied', alreadyApplied: true });
     }
 
     const userResult = await query('SELECT id, username, balance_connects, is_blocked FROM users WHERE id = $1', [req.userId]);
