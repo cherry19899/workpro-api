@@ -2492,7 +2492,7 @@ app.post('/api/applications/:id/hire', auth, checkBlocked, async (req, res) => {
     if (!paymentCheck.rows.length) return res.status(402).json({ error: 'Valid completed payment required to hire' });
 
     const appResult = await query(
-      'SELECT a.*, j.posted_by, j.budget, j.title as job_title FROM applications a JOIN jobs j ON a.job_id = j.id WHERE a.id = $1',
+      'SELECT a.*, j.posted_by, j.budget, j.title as job_title, j.apply_cost FROM applications a JOIN jobs j ON a.job_id = j.id WHERE a.id = $1',
       [req.params.id]
     );
     if (!appResult.rows.length) return res.status(404).json({ error: 'Application not found' });
