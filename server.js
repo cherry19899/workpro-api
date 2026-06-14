@@ -783,14 +783,22 @@ app.post('/api/jobs/:id/apply', auth, checkBlocked, async (req, res) => {
         await pgClient.query('ROLLBACK');
         return res.status(400).json({ error: 'Not enough connects', required: cost });
       }
-      appResult = await pgClient.query(
-        `INSERT INTO applications (job_id, job_title, freelancer_id, freelancer_name, message) VALUES ($1, $2, $3, $4, $5)
-         ON CONFLICT (job_id, freelancer_id) DO UPDATE
-           SET status='pending', message=EXCLUDED.message, updated_at=NOW()
-           WHERE applications.status IN ('withdrawn','rejected')
-         RETURNING *`,
-        [req.params.id, job.title, req.userId, user.username || req.userId, req.body.message || '']
+      // Check for existing withdrawn/rejected app to reactivate
+      const prevApp = await pgClient.query(
+        `SELECT id FROM applications WHERE job_id=$1 AND freelancer_id=$2 AND status IN ('withdrawn','rejected') LIMIT 1`,
+        [req.params.id, req.userId]
       );
+      if (prevApp.rows.length) {
+        appResult = await pgClient.query(
+          `UPDATE applications SET status='pending', message=$3, updated_at=NOW() WHERE id=$4 RETURNING *`,
+          [req.params.id, req.userId, req.body.message || '', prevApp.rows[0].id]
+        );
+      } else {
+        appResult = await pgClient.query(
+          `INSERT INTO applications (job_id, job_title, freelancer_id, freelancer_name, message) VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+          [req.params.id, job.title, req.userId, user.username || req.userId, req.body.message || '']
+        );
+      }
       if (!appResult.rows.length) {
         await pgClient.query('ROLLBACK');
         return res.status(400).json({ error: 'Already applied' });
