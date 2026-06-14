@@ -77,7 +77,7 @@ const jobPostLimiter = rateLimit({
   message: { error: 'Too many jobs posted, try again later' },
 });
 app.use('/api/auth', authLimiter);
-app.use('/api/me', authLimiter); // POST /api/me is a login endpoint — same rate limit
+// authLimiter applied directly to POST /api/me (login) — GET/PUT are profile ops, different threat model
 app.use('/api/admin', adminLimiter);
 app.use('/api/connects/purchase', connectsLimiter);
 app.use('/api/connects/buy', connectsLimiter);
@@ -122,6 +122,7 @@ async function ensureNotificationsTable() {
     await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_chat_read_at TIMESTAMPTZ`);
     // Ensure unique constraint on applications(job_id, freelancer_id) to prevent duplicate apply race
     await query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_applications_unique_apply ON applications(job_id, freelancer_id)`);
+    await query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_escrows_payment ON escrows(payment_id)`);
     // One-time migration: recalculate apply_cost for jobs still at old default
     await query(`UPDATE jobs SET apply_cost = CEIL(budget::numeric / 50.0)::int, connects_spent = CEIL(budget::numeric / 50.0)::int WHERE CEIL(budget::numeric / 50.0)::int != apply_cost`).catch((e) => console.error('[Migration] apply_cost fix error:', e.message));
     await query(`CREATE TABLE IF NOT EXISTS portfolios (
@@ -293,7 +294,7 @@ app.get('/api/me', auth, async (req, res) => {
 });
 
 // POST /api/me — alias login endpoint used by Auth.js + bundle registration
-app.post('/api/me', async (req, res) => {
+app.post('/api/me', authLimiter, async (req, res) => {
   const { uid, username, accessToken } = req.body;
   if (!uid) return res.status(400).json({ error: 'uid required' });
   if (username && username.length > 50) return res.status(400).json({ error: 'Username too long (max 50)' });
@@ -1115,7 +1116,7 @@ app.post('/api/chat/rooms/:id/messages', auth, checkBlocked, async (req, res) =>
 });
 
 // ─── Escrow ──────────────────────────────────────────────
-app.get('/api/escrow', auth, async (req, res) => {
+async function handleGetEscrow(req, res) {
   const limit = Math.min(parseInt(req.query.limit) || 50, 200);
   const offset = parseInt(req.query.offset) || 0;
   try {
@@ -1124,9 +1125,12 @@ app.get('/api/escrow', auth, async (req, res) => {
   } catch (err) {
     serverError(err, res);
   }
-});
+}
+// Bundle uses /api/escrows (plural) — both spellings handled
+app.get('/api/escrow', auth, handleGetEscrow);
+app.get('/api/escrows', auth, handleGetEscrow);
 
-app.post('/api/escrow', auth, checkBlocked, async (req, res) => {
+app.post(['/api/escrow', '/api/escrows'], auth, checkBlocked, async (req, res) => {
   const { job_id, freelancer_id, payment_id } = req.body;
   if (!job_id || !freelancer_id || !payment_id) return res.status(400).json({ error: 'job_id, freelancer_id, payment_id required' });
   try {
@@ -1169,7 +1173,7 @@ app.post('/api/escrow', auth, checkBlocked, async (req, res) => {
   }
 });
 
-app.post('/api/escrow/:id/release', auth, async (req, res) => {
+app.post('/api/escrow/:id/release', auth, checkBlocked, async (req, res) => {
   try {
     const result = await query('SELECT * FROM escrows WHERE id = $1', [req.params.id]);
     if (!result.rows.length) return res.status(404).json({ error: 'Escrow not found' });
@@ -1286,7 +1290,7 @@ app.post('/api/payments/:paymentId/complete', auth, async (req, res) => {
         ]);
         if (jobCheck.rows.length && freelancerCheck.rows.length) {
           await query(
-            'INSERT INTO escrows (job_id, client_id, freelancer_id, amount, payment_id, status) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING',
+            'INSERT INTO escrows (job_id, client_id, freelancer_id, amount, payment_id, status) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (payment_id) DO NOTHING',
             [meta.job_id, req.userId, meta.freelancer_id, parseFloat(piPayment.amount || markDone.rows[0].amount || 0), paymentId, 'funded']
           );
         }
@@ -1349,7 +1353,7 @@ app.post('/api/payments/incomplete', auth, async (req, res) => {
             ]);
             if (jobCheck.rows.length && freelancerCheck.rows.length) {
               await query(
-                'INSERT INTO escrows (job_id, client_id, freelancer_id, amount, payment_id, status) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING',
+                'INSERT INTO escrows (job_id, client_id, freelancer_id, amount, payment_id, status) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (payment_id) DO NOTHING',
                 [meta.job_id, paymentOwner, meta.freelancer_id, parseFloat(piPayment.amount || markDone.rows[0].amount || 0), paymentId, 'funded']
               ).catch(() => {});
             }
@@ -2652,7 +2656,7 @@ app.post('/api/payments/complete', auth, async (req, res) => {
           if (jobCheck.rows.length && freelancerCheck.rows.length) {
             const piVerifiedAmt = parseFloat(completeData.amount || markDone.rows[0].amount || 0);
             await query(
-              'INSERT INTO escrows (job_id, client_id, freelancer_id, amount, payment_id, status) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING',
+              'INSERT INTO escrows (job_id, client_id, freelancer_id, amount, payment_id, status) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (payment_id) DO NOTHING',
               [meta.job_id, paymentOwner, meta.freelancer_id, piVerifiedAmt, payment_id, 'funded']
             ).catch(() => {});
           }
@@ -3224,7 +3228,7 @@ app.post('/api/payments/:paymentId/resolve-complete', auth, async (req, res) => 
           ]);
           if (jobCheck.rows.length && freelancerCheck.rows.length) {
             await query(
-              'INSERT INTO escrows (job_id, client_id, freelancer_id, amount, payment_id, status) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING',
+              'INSERT INTO escrows (job_id, client_id, freelancer_id, amount, payment_id, status) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (payment_id) DO NOTHING',
               [meta.job_id, paymentOwner, meta.freelancer_id, parseFloat(markDoneRC.rows[0].amount || 0), paymentId, 'funded']
             ).catch(() => {});
           }
