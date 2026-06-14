@@ -2534,6 +2534,22 @@ app.post('/api/applications/:id/hire', auth, checkBlocked, async (req, res) => {
       }
       const freelancerNameRes = await pgClientHire.query('SELECT username FROM users WHERE id = $1', [freelancerId]);
       const freelancerName = freelancerNameRes.rows[0]?.username || freelancerId;
+      // Refund connects to other pending applicants (same as /api/jobs/:id/hire)
+      const toRejectHire = await pgClientHire.query(
+        'SELECT freelancer_id FROM applications WHERE job_id = $1 AND id != $2 AND status = $3',
+        [app_.job_id, req.params.id, 'pending']
+      );
+      await pgClientHire.query(
+        'UPDATE applications SET status = $1 WHERE job_id = $2 AND id != $3 AND status = $4',
+        ['rejected', app_.job_id, req.params.id, 'pending']
+      );
+      const refundCostHire = app_.apply_cost || 1;
+      for (const r of toRejectHire.rows) {
+        await pgClientHire.query(
+          'UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2',
+          [refundCostHire, r.freelancer_id]
+        );
+      }
       await pgClientHire.query(
         "UPDATE jobs SET status='in_progress', hired_freelancer_id=$1, hired_freelancer_name=$2, updated_at=NOW() WHERE id=$3",
         [freelancerId, freelancerName, app_.job_id]
