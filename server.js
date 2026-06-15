@@ -992,6 +992,9 @@ app.post('/api/jobs/:id/complete', auth, checkBlocked, async (req, res) => {
     const job = jobResult.rows[0];
     if (job.posted_by !== req.userId) return res.status(403).json({ error: 'Not your job' });
     if (!['in_progress', 'submitted'].includes(job.status)) return res.status(400).json({ error: 'Job is not in progress' });
+    // Block completion if there is an open dispute on this job's escrow
+    const disputedEscrow = await query("SELECT id FROM escrows WHERE job_id = $1 AND status = 'disputed' LIMIT 1", [req.params.id]);
+    if (disputedEscrow.rows.length) return res.status(400).json({ error: 'Cannot complete job while escrow is under dispute — wait for admin resolution' });
 
     let paidAmount = 0;
     const pgClient5 = await getPool().connect();
@@ -1560,7 +1563,8 @@ app.post('/api/connects/purchase', auth, checkBlocked, async (req, res) => {
 app.post('/api/ratings', auth, checkBlocked, async (req, res) => {
   const { to_user_id, job_id, rating, comment } = req.body;
   if (!to_user_id || rating === undefined || rating === null || rating === '') return res.status(400).json({ error: 'to_user_id and rating required' });
-  if (rating < 1 || rating > 5) return res.status(400).json({ error: 'Rating must be 1-5' });
+  const ratingNum = parseInt(rating);
+  if (isNaN(ratingNum) || ratingNum < 1 || ratingNum > 5) return res.status(400).json({ error: 'Rating must be 1-5' });
   if (to_user_id === req.userId) return res.status(400).json({ error: 'Cannot rate yourself' });
   if (comment && comment.length > 1000) return res.status(400).json({ error: 'Comment too long (max 1000)' });
   try {
@@ -1592,7 +1596,7 @@ app.post('/api/ratings', auth, checkBlocked, async (req, res) => {
 
     const result = await query(
       'INSERT INTO ratings (from_user_id, to_user_id, job_id, rating, comment) VALUES ($1, $2, $3, $4, $5) RETURNING *',
-      [req.userId, to_user_id, job_id || null, parseInt(rating), comment || '']
+      [req.userId, to_user_id, job_id || null, ratingNum, comment || '']
     );
     // Update user average rating
     const avgResult = await query('SELECT AVG(rating) as avg FROM ratings WHERE to_user_id = $1', [to_user_id]);
@@ -2470,7 +2474,8 @@ app.post('/api/reviews', auth, checkBlocked, async (req, res) => {
   const toId = to_user_id || target_id;  // bundle uses target_id
   const reviewComment = comment || text || '';
   if (!toId || rating === undefined || rating === null || rating === '') return res.status(400).json({ error: 'to_user_id and rating required' });
-  if (rating < 1 || rating > 5) return res.status(400).json({ error: 'Rating must be 1-5' });
+  const ratingNumR = parseInt(rating);
+  if (isNaN(ratingNumR) || ratingNumR < 1 || ratingNumR > 5) return res.status(400).json({ error: 'Rating must be 1-5' });
   if (toId === req.userId) return res.status(400).json({ error: 'Cannot rate yourself' });
   if (reviewComment.length > 1000) return res.status(400).json({ error: 'Comment too long (max 1000)' });
   try {
@@ -2498,7 +2503,7 @@ app.post('/api/reviews', auth, checkBlocked, async (req, res) => {
       [req.userId, toId, job_id || null]
     );
     if (existing.rows.length) return res.status(400).json({ error: 'Already rated this job' });
-    const result = await query('INSERT INTO ratings (from_user_id, to_user_id, job_id, rating, comment) VALUES ($1, $2, $3, $4, $5) RETURNING *', [req.userId, toId, job_id || null, parseInt(rating), reviewComment]);
+    const result = await query('INSERT INTO ratings (from_user_id, to_user_id, job_id, rating, comment) VALUES ($1, $2, $3, $4, $5) RETURNING *', [req.userId, toId, job_id || null, ratingNumR, reviewComment]);
     const avgResult = await query('SELECT AVG(rating) as avg FROM ratings WHERE to_user_id = $1', [toId]);
     const newAvg = Math.round(parseFloat(avgResult.rows[0].avg) * 10) / 10;
     await query('UPDATE users SET rating = $1, updated_at = NOW() WHERE id = $2', [newAvg, toId]);
