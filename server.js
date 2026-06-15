@@ -2843,11 +2843,24 @@ app.post('/api/offers', auth, checkBlocked, async (req, res) => {
     const callerRes = await query('SELECT username FROM users WHERE id = $1', [req.userId]);
     const callerName = callerRes.rows[0]?.username || req.userId;
     // Create application record with status='offer'
-    const result = await query(
-      `INSERT INTO applications (job_id, job_title, freelancer_id, freelancer_name, message, bid_amount, status, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, 'offer', NOW()) RETURNING *`,
-      [job_id, job.title, to_user_id, freelancer.username, message || '', amount || job.budget]
+    // If a withdrawn/rejected application already exists, reactivate it as an offer
+    const prevApp = await query(
+      `SELECT id FROM applications WHERE job_id=$1 AND freelancer_id=$2 AND status IN ('withdrawn','rejected') LIMIT 1`,
+      [job_id, to_user_id]
     );
+    let result;
+    if (prevApp.rows.length) {
+      result = await query(
+        `UPDATE applications SET status='offer', message=$3, bid_amount=$4, updated_at=NOW() WHERE id=$5 RETURNING *`,
+        [job_id, to_user_id, message || '', amount || job.budget, prevApp.rows[0].id]
+      );
+    } else {
+      result = await query(
+        `INSERT INTO applications (job_id, job_title, freelancer_id, freelancer_name, message, bid_amount, status, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, 'offer', NOW()) RETURNING *`,
+        [job_id, job.title, to_user_id, freelancer.username, message || '', amount || job.budget]
+      );
+    }
     await notify(to_user_id, 'offer', `Вам отправлено предложение по задаче "${job.title}"`,
       `${callerName} предлагает вам работу. Сумма: ${amount || job.budget} π`, job_id, null);
     res.json({ offer: result.rows[0], success: true });
@@ -2918,6 +2931,7 @@ app.post('/api/chat/:roomId/messages', auth, checkBlocked, async (req, res) => {
 
 // GET /api/offers/:id — get a specific offer
 app.get('/api/offers/:id', auth, async (req, res) => {
+  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Offer not found' });
   try {
     const result = await query(
       `SELECT a.*, j.title as job_title, j.budget, u.username as client_username
@@ -3065,6 +3079,7 @@ app.get('/api/escrows/:id/room', auth, async (req, res) => {
 
 // POST /api/offers/:id/accept — accept a job offer
 app.post('/api/offers/:id/accept', auth, checkBlocked, async (req, res) => {
+  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Offer not found' });
   try {
     const result = await query("UPDATE applications SET status = $1 WHERE id = $2 AND freelancer_id = $3 AND status = 'pending' RETURNING *", ['accepted', req.params.id, req.userId]);
     if (!result.rows.length) {
@@ -3078,6 +3093,7 @@ app.post('/api/offers/:id/accept', auth, checkBlocked, async (req, res) => {
 
 // POST /api/offers/:id/decline — decline a job offer
 app.post('/api/offers/:id/decline', auth, checkBlocked, async (req, res) => {
+  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Offer not found' });
   try {
     const result = await query("UPDATE applications SET status = $1 WHERE id = $2 AND freelancer_id = $3 AND status = 'pending' RETURNING *", ['declined', req.params.id, req.userId]);
     if (!result.rows.length) {
