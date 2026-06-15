@@ -1465,36 +1465,41 @@ app.post('/api/payments/incomplete', auth, async (req, res) => {
     // If payment is pending server completion, complete it
     if (piPayment.status && piPayment.status.developer_completed === false && piPayment.transaction) {
       await piCompletePayment(paymentId, piPayment.transaction.txid);
-      // Idempotency guard: same pattern as /complete — only run business logic once
-      const markDone = await query(
-        "UPDATE payments SET status='completed', txid=$1, updated_at=NOW() WHERE id=$2 AND status='approved' RETURNING *",
-        [piPayment.transaction.txid, paymentId]
-      );
-      if (markDone.rows.length) {
-        const meta = markDone.rows[0].metadata || {};
-        const paymentOwner = markDone.rows[0].user_id || req.userId;
-        if (meta.type === 'connects') {
-          const piAmountPaid = parseFloat(piPayment.amount || markDone.rows[0].amount || 0);
-          const amount = Math.floor(piAmountPaid * 10);
-          if (amount > 0) {
-            await query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [amount, paymentOwner]);
-          }
-        } else if (meta.type === 'escrow' && meta.job_id && meta.freelancer_id) {
-          const existingEscrow = await query('SELECT id FROM escrows WHERE payment_id = $1 LIMIT 1', [paymentId]).catch(() => ({ rows: [] }));
-          if (!existingEscrow.rows.length) {
-            const [jobCheck, freelancerCheck] = await Promise.all([
-              query('SELECT id FROM jobs WHERE id = $1 LIMIT 1', [meta.job_id]).catch(() => ({ rows: [] })),
-              query('SELECT id FROM users WHERE id = $1 LIMIT 1', [meta.freelancer_id]).catch(() => ({ rows: [] })),
-            ]);
-            if (jobCheck.rows.length && freelancerCheck.rows.length) {
-              await query(
-                'INSERT INTO escrows (job_id, client_id, freelancer_id, amount, payment_id, status) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (payment_id) DO NOTHING',
-                [meta.job_id, paymentOwner, meta.freelancer_id, parseFloat(piPayment.amount || markDone.rows[0].amount || 0), paymentId, 'funded']
-              ).catch(() => {});
+      const pgInc = await getPool().connect();
+      try {
+        await pgInc.query('BEGIN');
+        const markDone = await pgInc.query(
+          "UPDATE payments SET status='completed', txid=$1, updated_at=NOW() WHERE id=$2 AND status='approved' RETURNING *",
+          [piPayment.transaction.txid, paymentId]
+        );
+        if (markDone.rows.length) {
+          const meta = markDone.rows[0].metadata || {};
+          const paymentOwner = markDone.rows[0].user_id || req.userId;
+          if (meta.type === 'connects') {
+            const piAmountPaid = parseFloat(piPayment.amount || markDone.rows[0].amount || 0);
+            const amount = Math.floor(piAmountPaid * 10);
+            if (amount > 0) {
+              await pgInc.query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [amount, paymentOwner]);
+            }
+          } else if (meta.type === 'escrow' && meta.job_id && meta.freelancer_id) {
+            const existingEscrow = await pgInc.query('SELECT id FROM escrows WHERE payment_id = $1 LIMIT 1', [paymentId]);
+            if (!existingEscrow.rows.length) {
+              const [jobCheck, freelancerCheck] = await Promise.all([
+                pgInc.query('SELECT id FROM jobs WHERE id = $1 LIMIT 1', [meta.job_id]),
+                pgInc.query('SELECT id FROM users WHERE id = $1 LIMIT 1', [meta.freelancer_id]),
+              ]);
+              if (jobCheck.rows.length && freelancerCheck.rows.length) {
+                await pgInc.query(
+                  'INSERT INTO escrows (job_id, client_id, freelancer_id, amount, payment_id, status) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (payment_id) DO NOTHING',
+                  [meta.job_id, paymentOwner, meta.freelancer_id, parseFloat(piPayment.amount || markDone.rows[0].amount || 0), paymentId, 'funded']
+                );
+              }
             }
           }
         }
-      }
+        await pgInc.query('COMMIT');
+      } catch (txErr) { await pgInc.query('ROLLBACK').catch(() => {}); throw txErr; }
+      finally { pgInc.release(); }
     }
     res.json({ success: true, payment: piPayment });
   } catch (err) {
