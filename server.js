@@ -2309,7 +2309,7 @@ app.put('/api/applications/:id/status', auth, checkBlocked, async (req, res) => 
   const OWNER_ALLOWED = ['accepted', 'rejected'];
   if (!OWNER_ALLOWED.includes(status)) return res.status(400).json({ error: `Invalid status. Job owners may set: ${OWNER_ALLOWED.join(', ')}` });
   try {
-    const appResult = await query('SELECT a.*, j.posted_by, j.apply_cost FROM applications a JOIN jobs j ON a.job_id = j.id WHERE a.id = $1', [req.params.id]);
+    const appResult = await query('SELECT a.*, j.posted_by, j.apply_cost, j.budget AS job_budget, j.title AS job_title_full FROM applications a JOIN jobs j ON a.job_id = j.id WHERE a.id = $1', [req.params.id]);
     if (!appResult.rows.length) return res.status(404).json({ error: 'Application not found' });
     if (appResult.rows[0].posted_by !== req.userId) return res.status(403).json({ error: 'Forbidden' });
     const app_ = appResult.rows[0];
@@ -2334,7 +2334,7 @@ app.put('/api/applications/:id/status', auth, checkBlocked, async (req, res) => 
           }
         }
         // BUG #27 fix: create pending escrow + set job in_progress
-        const escrowAmt = app_.bid_amount || app_.budget || 0;
+        const escrowAmt = app_.bid_amount || app_.job_budget || 0;
         const existingSt = await pgStatusClient.query(
           "SELECT id FROM escrows WHERE job_id=$1 AND status=ANY($2) FOR UPDATE",
           [app_.job_id, ['pending', 'funded']]
