@@ -1603,7 +1603,10 @@ app.get('/api/admin/users', adminAuth, async (req, res) => {
       params = [limit, offset];
     }
     const result = await query(sql, params);
-    const total = await query('SELECT COUNT(DISTINCT LOWER(username)) FROM users');
+    const totalSql = search
+      ? 'SELECT COUNT(DISTINCT LOWER(username)) FROM users WHERE username ILIKE $1 OR id ILIKE $1'
+      : 'SELECT COUNT(DISTINCT LOWER(username)) FROM users';
+    const total = await query(totalSql, search ? [`%${search}%`] : []);
     res.json({ users: result.rows, count: result.rows.length, total: parseInt(total.rows[0].count), limit, offset });
   } catch (err) {
     serverError(err, res);
