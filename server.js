@@ -3065,6 +3065,7 @@ app.post('/api/offers', auth, checkBlocked, async (req, res) => {
     if (!jobRes.rows.length) return res.status(404).json({ error: 'Job not found' });
     const job = jobRes.rows[0];
     if (job.posted_by !== req.userId) return res.status(403).json({ error: 'Not your job' });
+    if (job.status !== 'open') return res.status(400).json({ error: 'Can only send offers for open jobs' });
     if (to_user_id === req.userId) return res.status(400).json({ error: 'Cannot send offer to yourself' });
     const freelancerRes = await query('SELECT id, username FROM users WHERE id = $1', [to_user_id]);
     if (!freelancerRes.rows.length) return res.status(404).json({ error: 'Freelancer not found' });
@@ -3300,10 +3301,10 @@ app.get('/api/escrows/:id/room', auth, async (req, res) => {
     const escResult = await query('SELECT * FROM escrows WHERE id = $1 AND (client_id = $2 OR freelancer_id = $2)', [req.params.id, req.userId]);
     if (!escResult.rows.length) return res.status(404).json({ error: 'Escrow not found' });
     const escrow = escResult.rows[0];
-    // Find or create chat room between client and freelancer
+    // Find or create chat room between client and freelancer for this job
     const roomResult = await query(
-      `SELECT * FROM chat_rooms WHERE (client_id = $1 AND freelancer_id = $2) OR (client_id = $2 AND freelancer_id = $1) LIMIT 1`,
-      [escrow.client_id, escrow.freelancer_id]
+      `SELECT * FROM chat_rooms WHERE job_id = $3 AND ((client_id = $1 AND freelancer_id = $2) OR (client_id = $2 AND freelancer_id = $1)) LIMIT 1`,
+      [escrow.client_id, escrow.freelancer_id, escrow.job_id]
     );
     if (roomResult.rows.length) {
       return res.json({ room: roomResult.rows[0], room_id: roomResult.rows[0].id });
@@ -3311,8 +3312,8 @@ app.get('/api/escrows/:id/room', auth, async (req, res) => {
     // Create room if not exists
     const roomId = `room_${escrow.client_id}-${escrow.freelancer_id}-${Date.now()}`;
     const newRoom = await query(
-      'INSERT INTO chat_rooms (id, client_id, freelancer_id) VALUES ($1, $2, $3) RETURNING *',
-      [roomId, escrow.client_id, escrow.freelancer_id]
+      'INSERT INTO chat_rooms (id, client_id, freelancer_id, job_id) VALUES ($1, $2, $3, $4) RETURNING *',
+      [roomId, escrow.client_id, escrow.freelancer_id, escrow.job_id]
     );
     res.json({ room: newRoom.rows[0], room_id: newRoom.rows[0].id });
   } catch (err) { serverError(err, res); }
