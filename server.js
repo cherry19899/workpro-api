@@ -1122,23 +1122,26 @@ app.get('/api/chat/rooms', auth, async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit) || 50, 200);
   const offset = parseInt(req.query.offset) || 0;
   try {
-    const result = await query(
-      `SELECT r.*,
-        (SELECT message FROM chat_messages WHERE room_id = r.id ORDER BY created_at DESC LIMIT 1) as last_message,
-        (SELECT created_at FROM chat_messages WHERE room_id = r.id ORDER BY created_at DESC LIMIT 1) as last_message_at,
-        j.title as job_title,
-        CASE WHEN r.client_id = $1 THEN r.freelancer_id ELSE r.client_id END as other_user_id,
-        CASE WHEN r.client_id = $1 THEN uf.username ELSE uc.username END as other_user_name
-       FROM chat_rooms r
-       LEFT JOIN jobs j ON j.id = r.job_id
-       LEFT JOIN users uc ON uc.id = r.client_id
-       LEFT JOIN users uf ON uf.id = r.freelancer_id
-       WHERE r.client_id = $1 OR r.freelancer_id = $1
-       ORDER BY last_message_at DESC NULLS LAST
-       LIMIT $2 OFFSET $3`,
-      [req.userId, limit, offset]
-    );
-    res.json({ rooms: result.rows, limit, offset });
+    const [result, totalRes] = await Promise.all([
+      query(
+        `SELECT r.*,
+          (SELECT message FROM chat_messages WHERE room_id = r.id ORDER BY created_at DESC LIMIT 1) as last_message,
+          (SELECT created_at FROM chat_messages WHERE room_id = r.id ORDER BY created_at DESC LIMIT 1) as last_message_at,
+          j.title as job_title,
+          CASE WHEN r.client_id = $1 THEN r.freelancer_id ELSE r.client_id END as other_user_id,
+          CASE WHEN r.client_id = $1 THEN uf.username ELSE uc.username END as other_user_name
+         FROM chat_rooms r
+         LEFT JOIN jobs j ON j.id = r.job_id
+         LEFT JOIN users uc ON uc.id = r.client_id
+         LEFT JOIN users uf ON uf.id = r.freelancer_id
+         WHERE r.client_id = $1 OR r.freelancer_id = $1
+         ORDER BY last_message_at DESC NULLS LAST
+         LIMIT $2 OFFSET $3`,
+        [req.userId, limit, offset]
+      ),
+      query('SELECT COUNT(*) FROM chat_rooms WHERE client_id = $1 OR freelancer_id = $1', [req.userId]),
+    ]);
+    res.json({ rooms: result.rows, total: parseInt(totalRes.rows[0].count), limit, offset });
   } catch (err) {
     serverError(err, res);
   }
@@ -2020,14 +2023,13 @@ app.post('/api/chat/start', auth, checkBlocked, async (req, res) => {
     const otherExists = await query('SELECT id FROM users WHERE id = $1 LIMIT 1', [other_user_id]);
     if (!otherExists.rows.length) return res.status(404).json({ error: 'User not found' });
     const jobId = job_id || 0;
-    // For job-linked rooms: require caller to be owner or hired freelancer (same guard as /chat/rooms)
+    // For job-linked rooms: require caller to be job poster OR have an application (same as /chat/rooms, /chat/conversations)
     if (jobId) {
-      const jobCheck = await query('SELECT posted_by, hired_freelancer_id FROM jobs WHERE id = $1', [jobId]);
-      if (jobCheck.rows.length) {
-        const j = jobCheck.rows[0];
-        if (j.posted_by !== req.userId && j.hired_freelancer_id !== req.userId && other_user_id !== req.userId) {
-          return res.status(403).json({ error: 'You must be a participant in this job to start a chat' });
-        }
+      const jobCheck = await query('SELECT posted_by FROM jobs WHERE id = $1', [jobId]);
+      if (!jobCheck.rows.length) return res.status(404).json({ error: 'Job not found' });
+      if (jobCheck.rows[0].posted_by !== req.userId) {
+        const appCheck = await query('SELECT id FROM applications WHERE job_id = $1 AND freelancer_id = $2 LIMIT 1', [jobId, req.userId]);
+        if (!appCheck.rows.length) return res.status(403).json({ error: 'You are not a participant in this job' });
       }
     }
     const existing = await query(
@@ -2369,23 +2371,26 @@ app.get('/api/chat/conversations', auth, async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit) || 50, 200);
   const offset = parseInt(req.query.offset) || 0;
   try {
-    const result = await query(
-      `SELECT r.*,
-        (SELECT message FROM chat_messages WHERE room_id = r.id ORDER BY created_at DESC LIMIT 1) as last_message,
-        (SELECT created_at FROM chat_messages WHERE room_id = r.id ORDER BY created_at DESC LIMIT 1) as last_message_at,
-        j.title as job_title,
-        CASE WHEN r.client_id = $1 THEN r.freelancer_id ELSE r.client_id END as other_user_id,
-        CASE WHEN r.client_id = $1 THEN uf.username ELSE uc.username END as other_user_name
-       FROM chat_rooms r
-       LEFT JOIN jobs j ON j.id = r.job_id
-       LEFT JOIN users uc ON uc.id = r.client_id
-       LEFT JOIN users uf ON uf.id = r.freelancer_id
-       WHERE r.client_id = $1 OR r.freelancer_id = $1
-       ORDER BY last_message_at DESC NULLS LAST
-       LIMIT $2 OFFSET $3`,
-      [req.userId, limit, offset]
-    );
-    res.json({ conversations: result.rows, rooms: result.rows, limit, offset });
+    const [result, totalRes] = await Promise.all([
+      query(
+        `SELECT r.*,
+          (SELECT message FROM chat_messages WHERE room_id = r.id ORDER BY created_at DESC LIMIT 1) as last_message,
+          (SELECT created_at FROM chat_messages WHERE room_id = r.id ORDER BY created_at DESC LIMIT 1) as last_message_at,
+          j.title as job_title,
+          CASE WHEN r.client_id = $1 THEN r.freelancer_id ELSE r.client_id END as other_user_id,
+          CASE WHEN r.client_id = $1 THEN uf.username ELSE uc.username END as other_user_name
+         FROM chat_rooms r
+         LEFT JOIN jobs j ON j.id = r.job_id
+         LEFT JOIN users uc ON uc.id = r.client_id
+         LEFT JOIN users uf ON uf.id = r.freelancer_id
+         WHERE r.client_id = $1 OR r.freelancer_id = $1
+         ORDER BY last_message_at DESC NULLS LAST
+         LIMIT $2 OFFSET $3`,
+        [req.userId, limit, offset]
+      ),
+      query('SELECT COUNT(*) FROM chat_rooms WHERE client_id = $1 OR freelancer_id = $1', [req.userId]),
+    ]);
+    res.json({ conversations: result.rows, rooms: result.rows, total: parseInt(totalRes.rows[0].count), limit, offset });
   } catch (err) { serverError(err, res); }
 });
 
@@ -2693,14 +2698,20 @@ app.get('/api/notifications', auth, async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit) || 50, 200);
     const offset = parseInt(req.query.offset) || 0;
-    const result = await query(
-      'SELECT * FROM notifications WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3',
-      [req.userId, limit, offset]
-    );
-    const unread = result.rows.filter(r => !r.is_read).length;
-    res.json({ notifications: result.rows, unread_count: unread, limit, offset });
+    const [result, totalRes, unreadRes] = await Promise.all([
+      query('SELECT * FROM notifications WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3', [req.userId, limit, offset]),
+      query('SELECT COUNT(*) FROM notifications WHERE user_id = $1', [req.userId]),
+      query('SELECT COUNT(*) FROM notifications WHERE user_id = $1 AND is_read = false', [req.userId]),
+    ]);
+    res.json({
+      notifications: result.rows,
+      total: parseInt(totalRes.rows[0].count),
+      unread_count: parseInt(unreadRes.rows[0].count),
+      limit,
+      offset,
+    });
   } catch (err) {
-    res.json({ notifications: [], unread_count: 0 });
+    res.json({ notifications: [], unread_count: 0, total: 0 });
   }
 });
 
