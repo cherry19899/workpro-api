@@ -1476,7 +1476,7 @@ app.post('/api/connects/purchase', auth, checkBlocked, async (req, res) => {
 // ─── Ratings ──────────────────────────────────────────────
 app.post('/api/ratings', auth, checkBlocked, async (req, res) => {
   const { to_user_id, job_id, rating, comment } = req.body;
-  if (!to_user_id || !rating) return res.status(400).json({ error: 'to_user_id and rating required' });
+  if (!to_user_id || rating === undefined || rating === null || rating === '') return res.status(400).json({ error: 'to_user_id and rating required' });
   if (rating < 1 || rating > 5) return res.status(400).json({ error: 'Rating must be 1-5' });
   if (to_user_id === req.userId) return res.status(400).json({ error: 'Cannot rate yourself' });
   if (comment && comment.length > 1000) return res.status(400).json({ error: 'Comment too long (max 1000)' });
@@ -2301,7 +2301,7 @@ app.post('/api/reviews', auth, checkBlocked, async (req, res) => {
   const { to_user_id, target_id, job_id, rating, comment, text, reviewer_id } = req.body;
   const toId = to_user_id || target_id;  // bundle uses target_id
   const reviewComment = comment || text || '';
-  if (!toId || !rating) return res.status(400).json({ error: 'to_user_id and rating required' });
+  if (!toId || rating === undefined || rating === null || rating === '') return res.status(400).json({ error: 'to_user_id and rating required' });
   if (rating < 1 || rating > 5) return res.status(400).json({ error: 'Rating must be 1-5' });
   if (toId === req.userId) return res.status(400).json({ error: 'Cannot rate yourself' });
   if (reviewComment.length > 1000) return res.status(400).json({ error: 'Comment too long (max 1000)' });
