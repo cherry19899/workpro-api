@@ -2222,9 +2222,18 @@ app.post('/api/applications/:id/withdraw', auth, async (req, res) => {
     const app_ = appResult.rows[0];
     if (app_.freelancer_id !== req.userId) return res.status(403).json({ error: 'Forbidden' });
     if (app_.status !== 'pending') return res.status(400).json({ error: 'Can only withdraw pending applications' });
-    await query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [app_.apply_cost || 1, req.userId]);
-    const result = await query('UPDATE applications SET status = $1 WHERE id = $2 RETURNING *', ['withdrawn', req.params.id]);
-    res.json({ application: result.rows[0], success: true });
+    let withdrawnApp;
+    const pgWith = await getPool().connect();
+    try {
+      await pgWith.query('BEGIN');
+      const wResult = await pgWith.query("UPDATE applications SET status = 'withdrawn' WHERE id = $1 AND status = 'pending' RETURNING *", [req.params.id]);
+      if (!wResult.rows.length) { await pgWith.query('ROLLBACK'); return res.status(400).json({ error: 'Can only withdraw pending applications' }); }
+      await pgWith.query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [app_.apply_cost || 1, req.userId]);
+      await pgWith.query('COMMIT');
+      withdrawnApp = wResult.rows[0];
+    } catch (txErr) { await pgWith.query('ROLLBACK').catch(() => {}); throw txErr; }
+    finally { pgWith.release(); }
+    res.json({ application: withdrawnApp, success: true });
   } catch (err) { serverError(err, res); }
 });
 
@@ -3521,38 +3530,42 @@ app.post('/api/payments/:paymentId/resolve-complete', auth, async (req, res) => 
       }
     }
 
-    // Mark as completed in our DB — idempotency guard prevents double-credit
-    const markDoneRC = await query(
-      `UPDATE payments SET status = 'completed', txid = COALESCE($1, txid), updated_at = NOW() WHERE id = $2 AND status = 'approved' RETURNING *`,
-      [txid, paymentId]
-    ).catch(() => ({ rows: [] }));
-
-    // Run business logic only on first completion
-    if (markDoneRC.rows.length) {
-      const meta = markDoneRC.rows[0].metadata || {};
-      const paymentOwner = markDoneRC.rows[0].user_id || req.userId;
-      if (meta.type === 'connects') {
-        const piAmountPaid = parseFloat(markDoneRC.rows[0].amount || 0);
-        const amount = Math.floor(piAmountPaid * 10);
-        if (amount > 0) {
-          await query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [amount, paymentOwner]).catch(() => {});
-        }
-      } else if (meta.type === 'escrow' && meta.job_id && meta.freelancer_id) {
-        const existingEscrowForPayment = await query('SELECT id FROM escrows WHERE payment_id = $1 LIMIT 1', [paymentId]).catch(() => ({ rows: [] }));
-        if (!existingEscrowForPayment.rows.length) {
-          const [jobCheck, freelancerCheck] = await Promise.all([
-            query('SELECT id FROM jobs WHERE id = $1 LIMIT 1', [meta.job_id]).catch(() => ({ rows: [] })),
-            query('SELECT id FROM users WHERE id = $1 LIMIT 1', [meta.freelancer_id]).catch(() => ({ rows: [] })),
-          ]);
-          if (jobCheck.rows.length && freelancerCheck.rows.length) {
-            await query(
-              'INSERT INTO escrows (job_id, client_id, freelancer_id, amount, payment_id, status) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (payment_id) DO NOTHING',
-              [meta.job_id, paymentOwner, meta.freelancer_id, parseFloat(markDoneRC.rows[0].amount || 0), paymentId, 'funded']
-            ).catch(() => {});
+    // Atomic: mark completed + apply business logic in one transaction
+    const pgRC = await getPool().connect();
+    try {
+      await pgRC.query('BEGIN');
+      const markDoneRC = await pgRC.query(
+        `UPDATE payments SET status = 'completed', txid = COALESCE($1, txid), updated_at = NOW() WHERE id = $2 AND status = 'approved' RETURNING *`,
+        [txid, paymentId]
+      );
+      if (markDoneRC.rows.length) {
+        const meta = markDoneRC.rows[0].metadata || {};
+        const paymentOwner = markDoneRC.rows[0].user_id || req.userId;
+        if (meta.type === 'connects') {
+          const piAmountPaid = parseFloat(markDoneRC.rows[0].amount || 0);
+          const amount = Math.floor(piAmountPaid * 10);
+          if (amount > 0) {
+            await pgRC.query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [amount, paymentOwner]);
+          }
+        } else if (meta.type === 'escrow' && meta.job_id && meta.freelancer_id) {
+          const existingEscrowForPayment = await pgRC.query('SELECT id FROM escrows WHERE payment_id = $1 LIMIT 1', [paymentId]);
+          if (!existingEscrowForPayment.rows.length) {
+            const [jobCheck, freelancerCheck] = await Promise.all([
+              pgRC.query('SELECT id FROM jobs WHERE id = $1 LIMIT 1', [meta.job_id]),
+              pgRC.query('SELECT id FROM users WHERE id = $1 LIMIT 1', [meta.freelancer_id]),
+            ]);
+            if (jobCheck.rows.length && freelancerCheck.rows.length) {
+              await pgRC.query(
+                'INSERT INTO escrows (job_id, client_id, freelancer_id, amount, payment_id, status) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (payment_id) DO NOTHING',
+                [meta.job_id, paymentOwner, meta.freelancer_id, parseFloat(markDoneRC.rows[0].amount || 0), paymentId, 'funded']
+              );
+            }
           }
         }
       }
-    }
+      await pgRC.query('COMMIT');
+    } catch (txErr) { await pgRC.query('ROLLBACK').catch(() => {}); throw txErr; }
+    finally { pgRC.release(); }
 
     res.json({ success: true, resolved: true, txid });
   } catch (err) { res.json({ success: true, resolved: false }); }
