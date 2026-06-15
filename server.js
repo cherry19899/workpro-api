@@ -630,7 +630,7 @@ app.get('/api/jobs', async (req, res) => {
 
 app.post('/api/jobs', auth, checkBlocked, jobPostLimiter, async (req, res) => {
   const { title, description, category, budget, skills, deadline, images } = req.body;
-  if (!title || !description || !budget) {
+  if (!title || !description || budget === undefined || budget === null || budget === '') {
     return res.status(400).json({ error: 'Title, description, and budget are required' });
   }
   const budgetNum = parseFloat(budget);
@@ -640,6 +640,15 @@ app.post('/api/jobs', auth, checkBlocked, jobPostLimiter, async (req, res) => {
   if (String(description).length > 5000) return res.status(400).json({ error: 'Description too long (max 5000 chars)' });
   if (images && Array.isArray(images) && images.length > 10) return res.status(400).json({ error: 'Too many images (max 10)' });
   if (skills && String(skills).length > 500) return res.status(400).json({ error: 'Skills too long (max 500)' });
+  const VALID_CATEGORIES = ['development','design','writing','marketing','data','support','other'];
+  if (category && !VALID_CATEGORIES.includes(category.toLowerCase())) {
+    return res.status(400).json({ error: `Invalid category. Valid: ${VALID_CATEGORIES.join(', ')}` });
+  }
+  if (deadline) {
+    const dl = new Date(deadline);
+    if (isNaN(dl.getTime())) return res.status(400).json({ error: 'Invalid deadline date' });
+    if (dl < new Date()) return res.status(400).json({ error: 'Deadline must be in the future' });
+  }
   const applyCost = Math.ceil(budgetNum / 50); // 1-50π→1, 51-100π→2, 101-150π→3, ...
   try {
     const userRes = await query('SELECT username FROM users WHERE id = $1', [req.userId]);
@@ -2851,8 +2860,8 @@ app.post('/api/offers', auth, checkBlocked, async (req, res) => {
     let result;
     if (prevApp.rows.length) {
       result = await query(
-        `UPDATE applications SET status='offer', message=$3, bid_amount=$4, updated_at=NOW() WHERE id=$5 RETURNING *`,
-        [job_id, to_user_id, message || '', amount || job.budget, prevApp.rows[0].id]
+        `UPDATE applications SET status='offer', message=$1, bid_amount=$2, updated_at=NOW() WHERE id=$3 RETURNING *`,
+        [message || '', amount || job.budget, prevApp.rows[0].id]
       );
     } else {
       result = await query(
