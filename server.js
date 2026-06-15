@@ -682,16 +682,39 @@ app.post('/api/jobs', auth, checkBlocked, jobPostLimiter, async (req, res) => {
     if (dl < new Date()) return res.status(400).json({ error: 'Deadline must be in the future' });
   }
   const applyCost = Math.ceil(budgetNum / 50); // 1-50π→1, 51-100π→2, 101-150π→3, ...
+  const POST_COST = 1; // posting a job costs 1 connect
   try {
-    const userRes = await query('SELECT username FROM users WHERE id = $1', [req.userId]);
-    const username = userRes.rows[0]?.username || req.userId;
-    const result = await query(
-      'INSERT INTO jobs (title, description, category, budget, skills, images, deadline, posted_by, posted_by_name, apply_cost, connects_spent) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10) RETURNING *',
-      [title, description, (category || 'other').toLowerCase(), budgetNum, skills || null, serializeImages(images), deadline || null, req.userId, username, applyCost]
-    );
-    await query('UPDATE users SET total_jobs_posted = total_jobs_posted + 1, updated_at = NOW() WHERE id = $1', [req.userId]);
-    await audit('job_created', { job_id: result.rows[0].id, user_id: req.userId });
-    res.json({ job: parseJobRow(result.rows[0]), success: true });
+    const userRes = await query('SELECT username, balance_connects FROM users WHERE id = $1', [req.userId]);
+    const userRow = userRes.rows[0];
+    const username = userRow?.username || req.userId;
+    if ((userRow?.balance_connects || 0) < POST_COST) {
+      return res.status(400).json({ error: 'Not enough connects to post a job (costs 1 connect)', required: POST_COST, current: userRow?.balance_connects || 0 });
+    }
+    const pgClientPost = await getPool().connect();
+    let newJob;
+    try {
+      await pgClientPost.query('BEGIN');
+      const deduct = await pgClientPost.query(
+        'UPDATE users SET balance_connects = balance_connects - $1, updated_at = NOW() WHERE id = $2 AND balance_connects >= $1 RETURNING id',
+        [POST_COST, req.userId]
+      );
+      if (!deduct.rows.length) {
+        await pgClientPost.query('ROLLBACK');
+        return res.status(400).json({ error: 'Not enough connects to post a job (costs 1 connect)' });
+      }
+      const jobRes = await pgClientPost.query(
+        'INSERT INTO jobs (title, description, category, budget, skills, images, deadline, posted_by, posted_by_name, apply_cost, connects_spent) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10) RETURNING *',
+        [title, description, (category || 'other').toLowerCase(), budgetNum, skills || null, serializeImages(images), deadline || null, req.userId, username, applyCost]
+      );
+      await pgClientPost.query('UPDATE users SET total_jobs_posted = total_jobs_posted + 1, updated_at = NOW() WHERE id = $1', [req.userId]);
+      await pgClientPost.query('COMMIT');
+      newJob = jobRes.rows[0];
+    } catch (txErr) {
+      await pgClientPost.query('ROLLBACK').catch(() => {});
+      throw txErr;
+    } finally { pgClientPost.release(); }
+    await audit('job_created', { job_id: newJob.id, user_id: req.userId, post_cost: POST_COST });
+    res.json({ job: parseJobRow(newJob), success: true });
   } catch (err) {
     serverError(err, res);
   }
@@ -1018,6 +1041,9 @@ app.delete('/api/jobs/:id', auth, checkBlocked, async (req, res) => {
     const pgClientDel = await getPool().connect();
     try {
       await pgClientDel.query('BEGIN');
+      // Refund 1 connect to job poster (post cost)
+      await pgClientDel.query('UPDATE users SET balance_connects = balance_connects + 1, updated_at = NOW() WHERE id = $1', [job.posted_by]);
+      // Refund apply cost to each applicant
       for (const row of applicants.rows) {
         await pgClientDel.query(
           'UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2',
@@ -1712,9 +1738,13 @@ app.delete('/api/admin/jobs/:id', adminAuth, async (req, res) => {
       await query("UPDATE escrows SET status='refunded', updated_at=NOW() WHERE id=$1", [esc.id]);
       await query('UPDATE users SET balance_pi = COALESCE(balance_pi,0) + $1, updated_at=NOW() WHERE id=$2', [esc.amount, esc.client_id]);
     }
-    // Refund connects to applicants (mirrors client-side delete behavior)
-    const jobMeta = await query('SELECT apply_cost FROM jobs WHERE id = $1', [req.params.id]);
+    // Refund connects to job poster (post cost) and applicants
+    const jobMeta = await query('SELECT apply_cost, posted_by FROM jobs WHERE id = $1', [req.params.id]);
     const applyRefundCost = jobMeta.rows[0]?.apply_cost || 1;
+    const jobPoster = jobMeta.rows[0]?.posted_by;
+    if (jobPoster) {
+      await query('UPDATE users SET balance_connects = balance_connects + 1, updated_at=NOW() WHERE id=$1', [jobPoster]).catch(() => {});
+    }
     const applicants = await query('SELECT DISTINCT freelancer_id FROM applications WHERE job_id = $1', [req.params.id]);
     for (const row of applicants.rows) {
       await query('UPDATE users SET balance_connects = balance_connects + $1, updated_at=NOW() WHERE id=$2', [applyRefundCost, row.freelancer_id]).catch(() => {});
