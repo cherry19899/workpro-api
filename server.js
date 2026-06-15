@@ -1042,13 +1042,14 @@ app.delete('/api/jobs/:id', auth, checkBlocked, async (req, res) => {
     if (job.posted_by !== req.userId) return res.status(403).json({ error: 'Not your job' });
     if (['in_progress', 'submitted'].includes(job.status)) return res.status(400).json({ error: 'Cannot delete a job that is in progress' });
     const applyRefundCost = job.apply_cost || 1;
-    const applicants = await query('SELECT DISTINCT freelancer_id FROM applications WHERE job_id = $1', [req.params.id]);
+    // Only refund pending applications — rejected/withdrawn ones were already refunded when status changed
+    const applicants = await query("SELECT DISTINCT freelancer_id FROM applications WHERE job_id = $1 AND status = 'pending'", [req.params.id]);
     const pgClientDel = await getPool().connect();
     try {
       await pgClientDel.query('BEGIN');
       // Refund 1 connect to job poster (post cost)
       await pgClientDel.query('UPDATE users SET balance_connects = balance_connects + 1, updated_at = NOW() WHERE id = $1', [job.posted_by]);
-      // Refund apply cost to each applicant
+      // Refund apply cost to each pending applicant
       for (const row of applicants.rows) {
         await pgClientDel.query(
           'UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2',
@@ -1750,7 +1751,8 @@ app.delete('/api/admin/jobs/:id', adminAuth, async (req, res) => {
     if (jobPoster) {
       await query('UPDATE users SET balance_connects = balance_connects + 1, updated_at=NOW() WHERE id=$1', [jobPoster]).catch(() => {});
     }
-    const applicants = await query('SELECT DISTINCT freelancer_id FROM applications WHERE job_id = $1', [req.params.id]);
+    // Only refund pending applications — rejected/withdrawn ones were already refunded when status changed
+    const applicants = await query("SELECT DISTINCT freelancer_id FROM applications WHERE job_id = $1 AND status = 'pending'", [req.params.id]);
     for (const row of applicants.rows) {
       await query('UPDATE users SET balance_connects = balance_connects + $1, updated_at=NOW() WHERE id=$2', [applyRefundCost, row.freelancer_id]).catch(() => {});
     }
