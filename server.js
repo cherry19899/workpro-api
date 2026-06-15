@@ -485,6 +485,7 @@ app.get('/api/users/:id', softAuth, async (req, res) => {
     const result = await query('SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, is_blocked, status, created_at FROM users WHERE id = $1', [userId]);
     if (!result.rows.length) return res.status(404).json({ error: 'User not found' });
     const u = result.rows[0];
+    if (!Array.isArray(u.skills)) u.skills = [];
     const isOwner = callerId === u.id;
     // Hide deleted accounts from other users
     if (!isOwner && u.status === 'deleted') return res.status(404).json({ error: 'User not found' });
@@ -622,7 +623,7 @@ app.get('/api/jobs', async (req, res) => {
       if (j.status === 'open') return Object.assign({}, j, { status: 'in_progress', _open: true });
       return j;
     });
-    res.json({ jobs, total, page: parseInt(page), total_pages: Math.ceil(total / parseInt(limit)) });
+    res.json({ jobs, total, page: parseInt(page), limit: parseInt(limit), total_pages: Math.ceil(total / parseInt(limit)) });
   } catch (err) {
     serverError(err, res);
   }
@@ -763,7 +764,7 @@ app.get('/api/jobs/:id/check-applied', auth, async (req, res) => {
       "SELECT id, status FROM applications WHERE job_id = $1 AND freelancer_id = $2 AND status NOT IN ('withdrawn','rejected') LIMIT 1",
       [req.params.id, req.userId]
     );
-    res.json({ applied: result.rows.length > 0, status: result.rows[0]?.status || null });
+    res.json({ applied: result.rows.length > 0, application_id: result.rows[0]?.id || null, status: result.rows[0]?.status || null });
   } catch (err) { serverError(err, res); }
 });
 
