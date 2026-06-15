@@ -586,6 +586,8 @@ function parseJobRow(job) {
 app.get('/api/jobs', async (req, res) => {
   const { status, category, posted_by, client_uid, search, min_budget, max_budget, sort } = req.query;
   if (search && search.length > 200) return res.status(400).json({ error: 'Search query too long (max 200 chars)' });
+  if (min_budget !== undefined && isNaN(parseFloat(min_budget))) return res.status(400).json({ error: 'Invalid min_budget' });
+  if (max_budget !== undefined && isNaN(parseFloat(max_budget))) return res.status(400).json({ error: 'Invalid max_budget' });
   const limit = Math.min(parseInt(req.query.limit) || 20, 200);
   const page = Math.max(parseInt(req.query.page) || 1, 1);
   const ownerFilter = posted_by || client_uid;
@@ -2476,7 +2478,8 @@ app.delete('/api/users/me', auth, async (req, res) => {
 
 app.delete('/api/users/me/portfolio/items/:id', auth, async (req, res) => {
   try {
-    await query('DELETE FROM portfolio_items WHERE id = $1 AND user_id = $2', [req.params.id, req.userId]);
+    const result = await query('DELETE FROM portfolio_items WHERE id = $1 AND user_id = $2 RETURNING id', [req.params.id, req.userId]);
+    if (!result.rows.length) return res.status(404).json({ error: 'Portfolio item not found' });
     res.json({ success: true });
   } catch (err) { serverError(err, res); }
 });
