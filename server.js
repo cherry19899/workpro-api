@@ -2876,25 +2876,24 @@ app.post('/api/offers', auth, checkBlocked, async (req, res) => {
     const freelancerRes = await query('SELECT id, username FROM users WHERE id = $1', [to_user_id]);
     if (!freelancerRes.rows.length) return res.status(404).json({ error: 'Freelancer not found' });
     const freelancer = freelancerRes.rows[0];
-    // Prevent duplicate offers for the same job/freelancer pair
-    const existingOffer = await query(
-      "SELECT id FROM applications WHERE job_id = $1 AND freelancer_id = $2 AND status = 'offer' LIMIT 1",
-      [job_id, to_user_id]
-    );
-    if (existingOffer.rows.length) return res.status(400).json({ error: 'Offer already sent to this freelancer for this job' });
     const callerRes = await query('SELECT username FROM users WHERE id = $1', [req.userId]);
     const callerName = callerRes.rows[0]?.username || req.userId;
     // Create application record with status='offer'
-    // If a withdrawn/rejected/pending application already exists, reactivate it as an offer
-    const prevApp = await query(
-      `SELECT id FROM applications WHERE job_id=$1 AND freelancer_id=$2 AND status IN ('withdrawn','rejected','pending') LIMIT 1`,
+    // Handle any existing application for this (job, freelancer) pair
+    const anyApp = await query(
+      `SELECT id, status FROM applications WHERE job_id=$1 AND freelancer_id=$2 LIMIT 1`,
       [job_id, to_user_id]
     );
     let result;
-    if (prevApp.rows.length) {
+    if (anyApp.rows.length) {
+      const existing = anyApp.rows[0];
+      if (['accepted', 'in_progress'].includes(existing.status)) {
+        return res.status(400).json({ error: 'Freelancer is already working on this job' });
+      }
+      // Reactivate withdrawn/rejected/pending app as offer
       result = await query(
         `UPDATE applications SET status='offer', message=$1, bid_amount=$2 WHERE id=$3 RETURNING *`,
-        [message || '', amount || job.budget, prevApp.rows[0].id]
+        [message || '', amount || job.budget, existing.id]
       );
     } else {
       result = await query(
