@@ -3134,6 +3134,7 @@ app.get('/api/chat/rooms/:id', auth, async (req, res) => {
 
 // POST /api/escrows/:id/fund — fund an escrow after Pi payment
 app.post('/api/escrows/:id/fund', auth, async (req, res) => {
+  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Escrow not found' });
   const { payment_id, txid } = req.body;
   if (!payment_id) return res.status(400).json({ error: 'payment_id required — provide the Pi payment identifier' });
   try {
@@ -3183,6 +3184,7 @@ app.post('/api/escrows/:id/dispute', auth, checkBlocked, async (req, res) => {
 
 // GET /api/escrows/:id/room — chat room for an escrow
 app.get('/api/escrows/:id/room', auth, async (req, res) => {
+  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Escrow not found' });
   try {
     const escResult = await query('SELECT * FROM escrows WHERE id = $1 AND (client_id = $2 OR freelancer_id = $2)', [req.params.id, req.userId]);
     if (!escResult.rows.length) return res.status(404).json({ error: 'Escrow not found' });
