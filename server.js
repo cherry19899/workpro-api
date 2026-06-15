@@ -726,14 +726,14 @@ app.get('/api/jobs/user/:userId', async (req, res) => {
   const offset = parseInt(req.query.offset) || 0;
   try {
     const userId = req.params.userId;
-    const result = await query(
-      `SELECT j.*, u.username as client_username
-       FROM jobs j LEFT JOIN users u ON u.id = j.posted_by
-       WHERE j.posted_by = $1 OR LOWER(u.username) = LOWER($1)
-       ORDER BY j.created_at DESC LIMIT $2 OFFSET $3`,
-      [userId, limit, offset]
-    );
-    res.json({ jobs: result.rows.map(parseJobRow), limit, offset });
+    const [result, totalRes] = await Promise.all([
+      query(
+        `SELECT j.*, u.username as client_username FROM jobs j LEFT JOIN users u ON u.id = j.posted_by WHERE j.posted_by = $1 OR LOWER(u.username) = LOWER($1) ORDER BY j.created_at DESC LIMIT $2 OFFSET $3`,
+        [userId, limit, offset]
+      ),
+      query(`SELECT COUNT(*) FROM jobs j LEFT JOIN users u ON u.id = j.posted_by WHERE j.posted_by = $1 OR LOWER(u.username) = LOWER($1)`, [userId]),
+    ]);
+    res.json({ jobs: result.rows.map(parseJobRow), total: parseInt(totalRes.rows[0].count), limit, offset });
   } catch (err) { serverError(err, res); }
 });
 
@@ -742,15 +742,11 @@ app.get('/api/jobs/as-freelancer', auth, async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit) || 50, 200);
   const offset = parseInt(req.query.offset) || 0;
   try {
-    const result = await query(
-      `SELECT j.*, u.username as client_username
-       FROM jobs j
-       LEFT JOIN users u ON u.id = j.posted_by
-       WHERE j.hired_freelancer_id = $1
-       ORDER BY j.updated_at DESC LIMIT $2 OFFSET $3`,
-      [req.userId, limit, offset]
-    );
-    res.json({ jobs: result.rows.map(parseJobRow), limit, offset });
+    const [result, totalRes] = await Promise.all([
+      query(`SELECT j.*, u.username as client_username FROM jobs j LEFT JOIN users u ON u.id = j.posted_by WHERE j.hired_freelancer_id = $1 ORDER BY j.updated_at DESC LIMIT $2 OFFSET $3`, [req.userId, limit, offset]),
+      query('SELECT COUNT(*) FROM jobs WHERE hired_freelancer_id = $1', [req.userId]),
+    ]);
+    res.json({ jobs: result.rows.map(parseJobRow), total: parseInt(totalRes.rows[0].count), limit, offset });
   } catch (err) { serverError(err, res); }
 });
 
@@ -759,11 +755,11 @@ app.get('/api/jobs/my', auth, async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit) || 50, 200);
   const offset = parseInt(req.query.offset) || 0;
   try {
-    const result = await query(
-      'SELECT j.*, u.username as client_username FROM jobs j LEFT JOIN users u ON u.id = j.posted_by WHERE j.posted_by = $1 ORDER BY j.created_at DESC LIMIT $2 OFFSET $3',
-      [req.userId, limit, offset]
-    );
-    res.json({ jobs: result.rows.map(parseJobRow), limit, offset });
+    const [result, totalRes] = await Promise.all([
+      query('SELECT j.*, u.username as client_username FROM jobs j LEFT JOIN users u ON u.id = j.posted_by WHERE j.posted_by = $1 ORDER BY j.created_at DESC LIMIT $2 OFFSET $3', [req.userId, limit, offset]),
+      query('SELECT COUNT(*) FROM jobs WHERE posted_by = $1', [req.userId]),
+    ]);
+    res.json({ jobs: result.rows.map(parseJobRow), total: parseInt(totalRes.rows[0].count), limit, offset });
   } catch (err) { serverError(err, res); }
 });
 
@@ -1189,9 +1185,12 @@ app.get('/api/chat/rooms/:id/messages', auth, async (req, res) => {
   try {
     const room = await query('SELECT * FROM chat_rooms WHERE id = $1 AND (client_id = $2 OR freelancer_id = $2)', [req.params.id, req.userId]);
     if (!room.rows.length) return res.status(403).json({ error: 'Forbidden' });
-    const result = await query('SELECT * FROM chat_messages WHERE room_id = $1 ORDER BY created_at ASC LIMIT $2 OFFSET $3', [req.params.id, limit, offset]);
+    const [result, totalRes] = await Promise.all([
+      query('SELECT * FROM chat_messages WHERE room_id = $1 ORDER BY created_at ASC LIMIT $2 OFFSET $3', [req.params.id, limit, offset]),
+      query('SELECT COUNT(*) FROM chat_messages WHERE room_id = $1', [req.params.id]),
+    ]);
     const messages = result.rows.map(m => ({ ...m, content: m.message, text: m.message }));
-    res.json({ messages, limit, offset });
+    res.json({ messages, total: parseInt(totalRes.rows[0].count), limit, offset });
   } catch (err) {
     serverError(err, res);
   }
@@ -1231,8 +1230,11 @@ async function handleGetEscrow(req, res) {
   const limit = Math.min(parseInt(req.query.limit) || 50, 200);
   const offset = parseInt(req.query.offset) || 0;
   try {
-    const result = await query('SELECT * FROM escrows WHERE client_id = $1 OR freelancer_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3', [req.userId, limit, offset]);
-    res.json({ escrows: result.rows, limit, offset });
+    const [result, totalRes] = await Promise.all([
+      query('SELECT * FROM escrows WHERE client_id = $1 OR freelancer_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3', [req.userId, limit, offset]),
+      query('SELECT COUNT(*) FROM escrows WHERE client_id = $1 OR freelancer_id = $1', [req.userId]),
+    ]);
+    res.json({ escrows: result.rows, total: parseInt(totalRes.rows[0].count), limit, offset });
   } catch (err) {
     serverError(err, res);
   }
@@ -1950,8 +1952,11 @@ app.get('/api/jobs/:id/applications', auth, async (req, res) => {
     const jobResult = await query('SELECT posted_by FROM jobs WHERE id = $1', [req.params.id]);
     if (!jobResult.rows.length) return res.status(404).json({ error: 'Job not found' });
     if (jobResult.rows[0].posted_by !== req.userId) return res.status(403).json({ error: 'Forbidden' });
-    const result = await query('SELECT * FROM applications WHERE job_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3', [req.params.id, limit, offset]);
-    res.json({ applications: result.rows, limit, offset });
+    const [result, totalRes] = await Promise.all([
+      query('SELECT * FROM applications WHERE job_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3', [req.params.id, limit, offset]),
+      query('SELECT COUNT(*) FROM applications WHERE job_id = $1', [req.params.id]),
+    ]);
+    res.json({ applications: result.rows, total: parseInt(totalRes.rows[0].count), limit, offset });
   } catch (err) { serverError(err, res); }
 });
 
@@ -2137,8 +2142,11 @@ app.get('/api/applications/job/:jobId', auth, async (req, res) => {
     const jobResult = await query('SELECT posted_by FROM jobs WHERE id = $1', [req.params.jobId]);
     if (!jobResult.rows.length) return res.status(404).json({ error: 'Job not found' });
     if (jobResult.rows[0].posted_by !== req.userId) return res.status(403).json({ error: 'Forbidden' });
-    const result = await query('SELECT * FROM applications WHERE job_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3', [req.params.jobId, limit, offset]);
-    res.json({ applications: result.rows, limit, offset });
+    const [result, totalRes] = await Promise.all([
+      query('SELECT * FROM applications WHERE job_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3', [req.params.jobId, limit, offset]),
+      query('SELECT COUNT(*) FROM applications WHERE job_id = $1', [req.params.jobId]),
+    ]);
+    res.json({ applications: result.rows, total: parseInt(totalRes.rows[0].count), limit, offset });
   } catch (err) { serverError(err, res); }
 });
 
@@ -2453,9 +2461,12 @@ app.get('/api/chat/conversations/:id/messages', auth, async (req, res) => {
   try {
     const room = await query('SELECT * FROM chat_rooms WHERE id = $1 AND (client_id = $2 OR freelancer_id = $2)', [req.params.id, req.userId]);
     if (!room.rows.length) return res.status(403).json({ error: 'Forbidden' });
-    const result = await query('SELECT * FROM chat_messages WHERE room_id = $1 ORDER BY created_at ASC LIMIT $2 OFFSET $3', [req.params.id, limit, offset]);
+    const [result, totalRes] = await Promise.all([
+      query('SELECT * FROM chat_messages WHERE room_id = $1 ORDER BY created_at ASC LIMIT $2 OFFSET $3', [req.params.id, limit, offset]),
+      query('SELECT COUNT(*) FROM chat_messages WHERE room_id = $1', [req.params.id]),
+    ]);
     const messages = result.rows.map(m => ({ ...m, content: m.message, text: m.message }));
-    res.json({ messages, limit, offset });
+    res.json({ messages, total: parseInt(totalRes.rows[0].count), limit, offset });
   } catch (err) { serverError(err, res); }
 });
 
