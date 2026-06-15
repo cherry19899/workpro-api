@@ -142,6 +142,16 @@ async function ensureNotificationsTable() {
       keys JSONB,
       updated_at TIMESTAMPTZ DEFAULT NOW()
     )`);
+    // BUG #31 fix: per-room unread tracking
+    await query(`CREATE TABLE IF NOT EXISTS chat_room_reads (
+      room_id VARCHAR(255) NOT NULL,
+      user_id VARCHAR(255) NOT NULL,
+      last_read_at TIMESTAMPTZ DEFAULT NOW(),
+      PRIMARY KEY (room_id, user_id)
+    )`);
+    // BUG #32 fix: review replies
+    await query(`ALTER TABLE ratings ADD COLUMN IF NOT EXISTS reply TEXT`);
+    await query(`ALTER TABLE ratings ADD COLUMN IF NOT EXISTS replied_at TIMESTAMPTZ`);
   } catch (_) {}
 }
 
@@ -1974,7 +1984,7 @@ app.get('/api/jobs/:id/applications', auth, async (req, res) => {
 // (added below)
 
 // GET /api/escrows + /api/escrows/me — alias for /api/escrow
-app.post('/api/escrows/:id/release', auth, async (req, res) => {
+app.post('/api/escrows/:id/release', auth, checkBlocked, async (req, res) => {
   if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Escrow not found' });
   try {
     const result = await query('SELECT * FROM escrows WHERE id = $1', [req.params.id]);
@@ -1997,6 +2007,9 @@ app.post('/api/escrows/:id/release', auth, async (req, res) => {
       await pgClient4.query('COMMIT');
     } catch (txErr) { await pgClient4.query('ROLLBACK').catch(() => {}); throw txErr; }
     finally { pgClient4.release(); }
+    // BUG #30 fix: notify freelancer of payment
+    await notify(escrow.freelancer_id, 'payment', 'Оплата получена',
+      `${net2}π зачислено на ваш счёт после завершения задачи.`, escrow.job_id, null).catch(() => {});
     await audit('escrow_released', { escrow_id: req.params.id, net_paid: net2 });
     res.json({ success: true });
   } catch (err) { serverError(err, res); }
@@ -2215,6 +2228,23 @@ app.post('/api/applications/:id/accept', auth, checkBlocked, async (req, res) =>
     } catch (txErr) { await pgClientAccept.query('ROLLBACK').catch(() => {}); throw txErr; }
     finally { pgClientAccept.release(); }
 
+    // BUG #28 fix: notify freelancer they were hired
+    if (freelancerId) {
+      await notify(freelancerId, 'hired', `Вас наняли на задачу "${app_.title}"`,
+        'Заказчик принял ваш отклик. Ожидайте финансирования эскроу.', parseInt(app_.job_id), null).catch(() => {});
+    }
+    // BUG #29 fix: create chat room between client and freelancer
+    if (freelancerId) {
+      const existingRoom = await query(
+        'SELECT id FROM chat_rooms WHERE job_id=$1 AND client_id=$2 AND freelancer_id=$3',
+        [app_.job_id, req.userId, freelancerId]
+      ).catch(() => ({ rows: [] }));
+      if (!existingRoom.rows.length) {
+        const newRoomId = 'room_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
+        await query('INSERT INTO chat_rooms (id, client_id, freelancer_id, job_id) VALUES ($1,$2,$3,$4)',
+          [newRoomId, req.userId, freelancerId, app_.job_id]).catch(() => {});
+      }
+    }
     await audit('application_accepted', { app_id: req.params.id, job_id: app_.job_id, freelancer_id: freelancerId });
     res.json({ application: acceptedApp, escrow, success: true });
   } catch (err) { serverError(err, res); }
@@ -2303,10 +2333,38 @@ app.put('/api/applications/:id/status', auth, checkBlocked, async (req, res) => 
             await pgStatusClient.query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [app_.apply_cost || 1, r.freelancer_id]);
           }
         }
+        // BUG #27 fix: create pending escrow + set job in_progress
+        const escrowAmt = app_.bid_amount || app_.budget || 0;
+        const existingSt = await pgStatusClient.query(
+          "SELECT id FROM escrows WHERE job_id=$1 AND status=ANY($2) FOR UPDATE",
+          [app_.job_id, ['pending', 'funded']]
+        );
+        if (!existingSt.rows.length && app_.freelancer_id) {
+          await pgStatusClient.query(
+            "INSERT INTO escrows (job_id, client_id, freelancer_id, amount, status) VALUES ($1,$2,$3,$4,'pending')",
+            [app_.job_id, req.userId, app_.freelancer_id, escrowAmt]
+          );
+        }
+        await pgStatusClient.query(
+          "UPDATE jobs SET status='in_progress', hired_freelancer_id=$1, hired_freelancer_name=$2, updated_at=NOW() WHERE id=$3 AND status='open'",
+          [app_.freelancer_id, app_.freelancer_name, app_.job_id]
+        );
       }
       await pgStatusClient.query('COMMIT');
     } catch (txErr) { await pgStatusClient.query('ROLLBACK').catch(() => {}); throw txErr; }
     finally { pgStatusClient.release(); }
+    // BUG #27 fix: notify + create chat room after commit
+    if (status === 'accepted' && app_.freelancer_id) {
+      await notify(app_.freelancer_id, 'hired', `Вас наняли на задачу`,
+        'Заказчик принял ваш отклик. Ожидайте финансирования эскроу.', parseInt(app_.job_id), null).catch(() => {});
+      const existRm = await query('SELECT id FROM chat_rooms WHERE job_id=$1 AND client_id=$2 AND freelancer_id=$3',
+        [app_.job_id, req.userId, app_.freelancer_id]).catch(() => ({ rows: [] }));
+      if (!existRm.rows.length) {
+        const rmId = 'room_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
+        await query('INSERT INTO chat_rooms (id, client_id, freelancer_id, job_id) VALUES ($1,$2,$3,$4)',
+          [rmId, req.userId, app_.freelancer_id, app_.job_id]).catch(() => {});
+      }
+    }
     res.json({ application: updatedApp, success: true });
   } catch (err) { serverError(err, res); }
 });
@@ -2507,6 +2565,7 @@ app.post('/api/chat/conversations/:id/messages', auth, checkBlocked, async (req,
   } catch (err) { serverError(err, res); }
 });
 
+// BUG #31 fix: per-room unread count using chat_room_reads table
 app.get('/api/chat/unread', auth, async (req, res) => {
   try {
     const result = await query(
@@ -2514,7 +2573,7 @@ app.get('/api/chat/unread', auth, async (req, res) => {
        JOIN chat_rooms r ON r.id = cm.room_id
        WHERE (r.client_id = $1 OR r.freelancer_id = $1) AND cm.sender_id != $1
        AND cm.created_at > COALESCE(
-         (SELECT last_chat_read_at FROM users WHERE id = $1),
+         (SELECT last_read_at FROM chat_room_reads WHERE room_id = r.id AND user_id = $1),
          NOW() - INTERVAL '7 days'
        )`,
       [req.userId]
@@ -2523,12 +2582,51 @@ app.get('/api/chat/unread', auth, async (req, res) => {
   } catch (err) { res.json({ count: 0 }); }
 });
 
-// Mark all chat messages as read (called when user opens chat)
+// Mark a specific room as read; falls back to all rooms if no room_id provided
 app.post('/api/chat/read-all', auth, async (req, res) => {
   try {
-    await query('UPDATE users SET last_chat_read_at = NOW() WHERE id = $1', [req.userId]);
+    const { room_id } = req.body;
+    if (room_id) {
+      // Verify access before marking read
+      const access = await query('SELECT id FROM chat_rooms WHERE id=$1 AND (client_id=$2 OR freelancer_id=$2)', [room_id, req.userId]);
+      if (access.rows.length) {
+        await query(
+          `INSERT INTO chat_room_reads (room_id, user_id, last_read_at) VALUES ($1,$2,NOW())
+           ON CONFLICT (room_id, user_id) DO UPDATE SET last_read_at=NOW()`,
+          [room_id, req.userId]
+        );
+      }
+    } else {
+      // Legacy: mark all rooms as read
+      const rooms = await query('SELECT id FROM chat_rooms WHERE client_id=$1 OR freelancer_id=$1', [req.userId]);
+      for (const row of rooms.rows) {
+        await query(
+          `INSERT INTO chat_room_reads (room_id, user_id, last_read_at) VALUES ($1,$2,NOW())
+           ON CONFLICT (room_id, user_id) DO UPDATE SET last_read_at=NOW()`,
+          [row.id, req.userId]
+        ).catch(() => {});
+      }
+    }
     res.json({ success: true });
   } catch (_) { res.json({ success: true }); }
+});
+
+// GET /api/chat/unread/:roomId — per-room unread count
+app.get('/api/chat/unread/:roomId', auth, async (req, res) => {
+  try {
+    const access = await query('SELECT id FROM chat_rooms WHERE id=$1 AND (client_id=$2 OR freelancer_id=$2)', [req.params.roomId, req.userId]);
+    if (!access.rows.length) return res.status(403).json({ error: 'Forbidden' });
+    const result = await query(
+      `SELECT COUNT(*) FROM chat_messages
+       WHERE room_id=$1 AND sender_id!=$2
+       AND created_at > COALESCE(
+         (SELECT last_read_at FROM chat_room_reads WHERE room_id=$1 AND user_id=$2),
+         NOW() - INTERVAL '7 days'
+       )`,
+      [req.params.roomId, req.userId]
+    );
+    res.json({ count: parseInt(result.rows[0].count) });
+  } catch (err) { res.json({ count: 0 }); }
 });
 
 // ─── Reviews alias (= ratings) ──────────────────
@@ -3477,6 +3575,46 @@ app.get('/api/reviews/:id', async (req, res) => {
       );
       res.json({ reviews: result.rows, ratings: result.rows, limit: limit2, offset: offset2 });
     }
+  } catch (err) { serverError(err, res); }
+});
+
+// BUG #32 fix: freelancer/client can reply to a review once
+app.put('/api/reviews/:id/reply', auth, checkBlocked, async (req, res) => {
+  const { reply } = req.body;
+  if (!reply || !reply.trim()) return res.status(400).json({ error: 'reply required' });
+  if (reply.length > 1000) return res.status(400).json({ error: 'Reply too long (max 1000 chars)' });
+  const id = req.params.id;
+  if (!/^\d+$/.test(id)) return res.status(400).json({ error: 'Invalid review id' });
+  try {
+    const result = await query('SELECT * FROM ratings WHERE id=$1', [id]);
+    if (!result.rows.length) return res.status(404).json({ error: 'Review not found' });
+    const rev = result.rows[0];
+    // Only the reviewed person (to_user_id) can reply
+    if (rev.to_user_id !== req.userId) return res.status(403).json({ error: 'Only the reviewed user can reply' });
+    if (rev.reply) return res.status(400).json({ error: 'Reply already submitted' });
+    const updated = await query(
+      'UPDATE ratings SET reply=$1, replied_at=NOW() WHERE id=$2 RETURNING *',
+      [reply.trim(), id]
+    );
+    res.json({ review: updated.rows[0], success: true });
+  } catch (err) { serverError(err, res); }
+});
+
+// Alias: POST /api/ratings/:id/reply
+app.post('/api/ratings/:id/reply', auth, checkBlocked, async (req, res) => {
+  const { reply } = req.body;
+  if (!reply || !reply.trim()) return res.status(400).json({ error: 'reply required' });
+  if (reply.length > 1000) return res.status(400).json({ error: 'Reply too long (max 1000 chars)' });
+  const id = req.params.id;
+  if (!/^\d+$/.test(id)) return res.status(400).json({ error: 'Invalid review id' });
+  try {
+    const result = await query('SELECT * FROM ratings WHERE id=$1', [id]);
+    if (!result.rows.length) return res.status(404).json({ error: 'Review not found' });
+    const rev = result.rows[0];
+    if (rev.to_user_id !== req.userId) return res.status(403).json({ error: 'Only the reviewed user can reply' });
+    if (rev.reply) return res.status(400).json({ error: 'Reply already submitted' });
+    const updated = await query('UPDATE ratings SET reply=$1, replied_at=NOW() WHERE id=$2 RETURNING *', [reply.trim(), id]);
+    res.json({ review: updated.rows[0], success: true });
   } catch (err) { serverError(err, res); }
 });
 
