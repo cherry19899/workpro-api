@@ -1220,6 +1220,7 @@ app.post(['/api/escrow', '/api/escrows'], auth, checkBlocked, async (req, res) =
 });
 
 app.post('/api/escrow/:id/release', auth, checkBlocked, async (req, res) => {
+  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Escrow not found' });
   try {
     const result = await query('SELECT * FROM escrows WHERE id = $1', [req.params.id]);
     if (!result.rows.length) return res.status(404).json({ error: 'Escrow not found' });
@@ -2004,6 +2005,7 @@ app.get('/api/applications/job/:jobId', auth, async (req, res) => {
 
 // POST /api/applications/:id/accept — accept application + create escrow record
 app.post('/api/applications/:id/accept', auth, checkBlocked, async (req, res) => {
+  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Application not found' });
   try {
     const appResult = await query(
       'SELECT a.*, j.posted_by, j.budget, j.title FROM applications a JOIN jobs j ON a.job_id = j.id WHERE a.id = $1',
@@ -2055,6 +2057,7 @@ app.post('/api/applications/:id/accept', auth, checkBlocked, async (req, res) =>
 
 // POST /api/applications/:id/reject — alias used by JobDetail.js
 app.post('/api/applications/:id/reject', auth, checkBlocked, async (req, res) => {
+  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Application not found' });
   try {
     const appResult = await query('SELECT a.*, j.posted_by, j.apply_cost FROM applications a JOIN jobs j ON a.job_id = j.id WHERE a.id = $1', [req.params.id]);
     if (!appResult.rows.length) return res.status(404).json({ error: 'Application not found' });
@@ -2070,6 +2073,7 @@ app.post('/api/applications/:id/reject', auth, checkBlocked, async (req, res) =>
 
 // POST /api/applications/:id/withdraw — freelancer withdraws their own pending application
 app.post('/api/applications/:id/withdraw', auth, async (req, res) => {
+  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Application not found' });
   try {
     const appResult = await query('SELECT a.*, j.apply_cost FROM applications a JOIN jobs j ON a.job_id = j.id WHERE a.id = $1', [req.params.id]);
     if (!appResult.rows.length) return res.status(404).json({ error: 'Application not found' });
@@ -2380,6 +2384,7 @@ app.get('/api/admin/jobs/all', adminAuth, async (req, res) => {
 
 // ─── Escrow refund ──────────────────
 app.post('/api/escrow/:id/refund', auth, checkBlocked, async (req, res) => {
+  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Escrow not found' });
   try {
     const result = await query('SELECT * FROM escrows WHERE id = $1', [req.params.id]);
     if (!result.rows.length) return res.status(404).json({ error: 'Escrow not found' });
