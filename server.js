@@ -2876,9 +2876,9 @@ app.post('/api/offers', auth, checkBlocked, async (req, res) => {
     const callerRes = await query('SELECT username FROM users WHERE id = $1', [req.userId]);
     const callerName = callerRes.rows[0]?.username || req.userId;
     // Create application record with status='offer'
-    // If a withdrawn/rejected application already exists, reactivate it as an offer
+    // If a withdrawn/rejected/pending application already exists, reactivate it as an offer
     const prevApp = await query(
-      `SELECT id FROM applications WHERE job_id=$1 AND freelancer_id=$2 AND status IN ('withdrawn','rejected') LIMIT 1`,
+      `SELECT id FROM applications WHERE job_id=$1 AND freelancer_id=$2 AND status IN ('withdrawn','rejected','pending') LIMIT 1`,
       [job_id, to_user_id]
     );
     let result;
@@ -3186,21 +3186,27 @@ app.get('/api/reviews/:id', async (req, res) => {
 async function handleAvailability(req, res) {
   const { available, availability } = req.body;
   if (req.params.id !== req.userId) return res.status(403).json({ error: 'Forbidden' });
+  const ALLOWED_AVAILABILITY = ['available', 'busy', 'away', 'unavailable'];
+  // Support both boolean `available` and string `availability`
+  let newStatus;
+  if (availability !== undefined) {
+    if (!ALLOWED_AVAILABILITY.includes(availability)) return res.status(400).json({ error: `Invalid availability. Valid: ${ALLOWED_AVAILABILITY.join(', ')}` });
+    newStatus = availability;
+  } else {
+    newStatus = available ? 'available' : 'unavailable';
+  }
   const targetId = req.params.id;
   try {
-    const isAvailable = available !== undefined ? available : (availability === 'available');
-    // Update availability column (try both availability string and is_available bool)
-    await query(
-      `UPDATE users SET availability = $1, updated_at = NOW() WHERE id = $2`,
-      [isAvailable ? 'available' : 'unavailable', targetId]
-    ).catch(async () => {
-      await query('UPDATE users SET updated_at = NOW() WHERE id = $1', [targetId]).catch(() => {});
-    });
+    await query(`UPDATE users SET availability = $1, updated_at = NOW() WHERE id = $2`, [newStatus, targetId]);
     const result = await query(
       'SELECT id, username, role, rating, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, status, updated_at FROM users WHERE id = $1',
       [targetId]
     );
     const u = result.rows[0] || {};
+    if (!Array.isArray(u.skills)) {
+      u.skills = (typeof u.skills === 'string' && u.skills && u.skills !== '{}')
+        ? u.skills.split(',').map(s => s.trim()).filter(Boolean) : [];
+    }
     res.json({ ...u, uid: u.id, is_admin: u?.role === 'admin', success: true });
   } catch (err) { serverError(err, res); }
 }
