@@ -1392,41 +1392,45 @@ app.post('/api/payments/:paymentId/complete', auth, async (req, res) => {
       }
     }
 
-    // Mark completed only if still in approved state — prevents double-crediting on retry
-    const markDone = await query(
-      "UPDATE payments SET status='completed', txid=$1, updated_at=NOW() WHERE id=$2 AND status='approved' RETURNING *",
-      [txid, paymentId]
-    );
-    if (!markDone.rows.length) {
-      // Already completed (idempotent) — return success without re-crediting
-      return res.json({ success: true, payment: piPayment });
-    }
-
-    // Handle business logic based on payment type
-    const meta = markDone.rows[0].metadata || {};
-    const paymentOwner = markDone.rows[0].user_id || req.userId;
-    if (meta.type === 'connects') {
-      // SECURITY: derives connects strictly from Pi-verified amount; never from metadata
-      const piAmountPaid = parseFloat(piPayment.amount || markDone.rows[0].amount || 0);
-      const amount = Math.floor(piAmountPaid * 10);
-      if (amount <= 0) return res.status(400).json({ error: 'Payment amount too small to credit connects' });
-      await query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [amount, paymentOwner]);
-    } else if (meta.type === 'escrow' && meta.job_id && meta.freelancer_id) {
-      // Only create escrow if this payment hasn't already funded one
-      const existingEscrow = await query('SELECT id FROM escrows WHERE payment_id = $1 LIMIT 1', [paymentId]).catch(() => ({ rows: [] }));
-      if (!existingEscrow.rows.length) {
-        const [jobCheck, freelancerCheck] = await Promise.all([
-          query('SELECT id FROM jobs WHERE id = $1 LIMIT 1', [meta.job_id]).catch(() => ({ rows: [] })),
-          query('SELECT id FROM users WHERE id = $1 LIMIT 1', [meta.freelancer_id]).catch(() => ({ rows: [] })),
-        ]);
-        if (jobCheck.rows.length && freelancerCheck.rows.length) {
-          await query(
-            'INSERT INTO escrows (job_id, client_id, freelancer_id, amount, payment_id, status) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (payment_id) DO NOTHING',
-            [meta.job_id, req.userId, meta.freelancer_id, parseFloat(piPayment.amount || markDone.rows[0].amount || 0), paymentId, 'funded']
-          );
+    // Atomic: mark completed + apply business logic in one transaction
+    const pgPmtC = await getPool().connect();
+    let markDone;
+    try {
+      await pgPmtC.query('BEGIN');
+      const markRes = await pgPmtC.query(
+        "UPDATE payments SET status='completed', txid=$1, updated_at=NOW() WHERE id=$2 AND status='approved' RETURNING *",
+        [txid, paymentId]
+      );
+      if (!markRes.rows.length) {
+        await pgPmtC.query('ROLLBACK');
+        return res.json({ success: true, payment: piPayment });
+      }
+      markDone = markRes.rows[0];
+      const meta = markDone.metadata || {};
+      const paymentOwner = markDone.user_id || req.userId;
+      if (meta.type === 'connects') {
+        const piAmountPaid = parseFloat(piPayment.amount || markDone.amount || 0);
+        const amount = Math.floor(piAmountPaid * 10);
+        if (amount <= 0) { await pgPmtC.query('ROLLBACK'); return res.status(400).json({ error: 'Payment amount too small to credit connects' }); }
+        await pgPmtC.query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [amount, paymentOwner]);
+      } else if (meta.type === 'escrow' && meta.job_id && meta.freelancer_id) {
+        const existingEscrow = await pgPmtC.query('SELECT id FROM escrows WHERE payment_id = $1 LIMIT 1', [paymentId]);
+        if (!existingEscrow.rows.length) {
+          const [jobCheck, freelancerCheck] = await Promise.all([
+            pgPmtC.query('SELECT id FROM jobs WHERE id = $1 LIMIT 1', [meta.job_id]),
+            pgPmtC.query('SELECT id FROM users WHERE id = $1 LIMIT 1', [meta.freelancer_id]),
+          ]);
+          if (jobCheck.rows.length && freelancerCheck.rows.length) {
+            await pgPmtC.query(
+              'INSERT INTO escrows (job_id, client_id, freelancer_id, amount, payment_id, status) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (payment_id) DO NOTHING',
+              [meta.job_id, req.userId, meta.freelancer_id, parseFloat(piPayment.amount || markDone.amount || 0), paymentId, 'funded']
+            );
+          }
         }
       }
-    }
+      await pgPmtC.query('COMMIT');
+    } catch (txErr) { await pgPmtC.query('ROLLBACK').catch(() => {}); throw txErr; }
+    finally { pgPmtC.release(); }
 
     await audit('payment_completed', { payment_id: paymentId, txid, user_id: req.userId });
     res.json({ success: true, payment: piPayment });
