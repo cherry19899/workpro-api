@@ -11,5 +11,5 @@ jobs:
     steps:
       - name: Trigger Render Deploy
         run: |
-          curl -s "https://api.render.com/deploy/srv-d7qvgf7lk1mc73cri1ng?key=X88S-SyFKag"
+          curl -s "${{ secrets.RENDER_DEPLOY_HOOK }}"
           echo "Deploy triggered"

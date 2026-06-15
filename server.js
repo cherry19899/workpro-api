@@ -1845,11 +1845,10 @@ app.get('/api/admin/escrows', adminAuth, async (req, res) => {
 
 app.get('/api/admin/earnings', adminAuth, async (req, res) => {
   try {
-    const [result, transactions, collected, pending, recentPayments] = await Promise.all([
-      query("SELECT COALESCE(SUM(amount*0.02), 0) as total FROM payments WHERE status = 'completed'"),
+    const [result, transactions, pending, recentPayments] = await Promise.all([
+      query("SELECT COALESCE(SUM(amount*0.02), 0) as total FROM escrows WHERE status = 'released'"),
       query('SELECT COUNT(*) FROM payments'),
-      query("SELECT COALESCE(SUM(amount*0.02), 0) as total FROM payments WHERE status = 'completed'"),
-      query("SELECT COALESCE(SUM(amount*0.02), 0) as total FROM payments WHERE status != 'completed'"),
+      query("SELECT COALESCE(SUM(amount), 0) as total FROM payments WHERE status = 'approved'"),
       query(`
         SELECT p.*,
           u.username AS client_name,
@@ -1870,9 +1869,9 @@ app.get('/api/admin/earnings', adminAuth, async (req, res) => {
       history: recentPayments.rows,
       summary: {
         total_earnings,
+        collected: total_earnings,
         total_transactions: txCount,
-        collected: parseFloat(collected.rows[0].total),
-        pending: parseFloat(pending.rows[0].total),
+        pending_volume: parseFloat(pending.rows[0].total),
         average_transaction: txCount > 0 ? Math.round(total_earnings / txCount * 100) / 100 : 0,
       }
     });
@@ -2229,11 +2228,23 @@ app.post('/api/applications/:id/reject', auth, checkBlocked, async (req, res) =>
     if (!appResult.rows.length) return res.status(404).json({ error: 'Application not found' });
     if (appResult.rows[0].posted_by !== req.userId) return res.status(403).json({ error: 'Forbidden' });
     const app_ = appResult.rows[0];
-    if (app_.status === 'pending') {
-      await query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [app_.apply_cost || 1, app_.freelancer_id]);
-    }
-    const result = await query('UPDATE applications SET status = $1 WHERE id = $2 RETURNING *', ['rejected', req.params.id]);
-    res.json({ application: result.rows[0], success: true });
+    let rejectedApp;
+    const pgRej = await getPool().connect();
+    try {
+      await pgRej.query('BEGIN');
+      const rejRes = await pgRej.query("UPDATE applications SET status = 'rejected' WHERE id = $1 AND status != 'rejected' RETURNING *", [req.params.id]);
+      if (!rejRes.rows.length) {
+        await pgRej.query('ROLLBACK');
+        return res.status(400).json({ error: 'Application already rejected' });
+      }
+      if (app_.status === 'pending') {
+        await pgRej.query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [app_.apply_cost || 1, app_.freelancer_id]);
+      }
+      await pgRej.query('COMMIT');
+      rejectedApp = rejRes.rows[0];
+    } catch (txErr) { await pgRej.query('ROLLBACK').catch(() => {}); throw txErr; }
+    finally { pgRej.release(); }
+    res.json({ application: rejectedApp, success: true });
   } catch (err) { serverError(err, res); }
 });
 
@@ -2825,13 +2836,12 @@ app.post('/api/applications/:id/hire', auth, checkBlocked, async (req, res) => {
     const escrowAmount = parseFloat(paymentCheck.rows[0].amount || 0);
     const freelancerId = app_.freelancer_id;
 
-    // Accept application
-    await query('UPDATE applications SET status = $1 WHERE id = $2', ['accepted', req.params.id]);
-    // Atomic: check for duplicate funded escrow before creating (same pattern as /api/escrow)
+    // Atomic: accept application + create escrow in one transaction
     let escrowRow;
     const pgClientHire = await getPool().connect();
     try {
       await pgClientHire.query('BEGIN');
+      await pgClientHire.query('UPDATE applications SET status = $1 WHERE id = $2', ['accepted', req.params.id]);
       const existingEsc = await pgClientHire.query(
         "SELECT * FROM escrows WHERE job_id = $1 AND status = ANY($2) FOR UPDATE",
         [app_.job_id, ['pending', 'funded']]

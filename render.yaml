@@ -25,6 +25,4 @@ databases:
     databaseName: workpro
     user: workpro
     plan: free
-    ipAllowList:
-      - source: 0.0.0.0/0
-        description: everywhere
+    ipAllowList: []
