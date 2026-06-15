@@ -2860,7 +2860,7 @@ app.post('/api/offers', auth, checkBlocked, async (req, res) => {
     let result;
     if (prevApp.rows.length) {
       result = await query(
-        `UPDATE applications SET status='offer', message=$1, bid_amount=$2, updated_at=NOW() WHERE id=$3 RETURNING *`,
+        `UPDATE applications SET status='offer', message=$1, bid_amount=$2 WHERE id=$3 RETURNING *`,
         [message || '', amount || job.budget, prevApp.rows[0].id]
       );
     } else {
@@ -2873,7 +2873,7 @@ app.post('/api/offers', auth, checkBlocked, async (req, res) => {
     await notify(to_user_id, 'offer', `Вам отправлено предложение по задаче "${job.title}"`,
       `${callerName} предлагает вам работу. Сумма: ${amount || job.budget} π`, job_id, null);
     res.json({ offer: result.rows[0], success: true });
-  } catch (err) { res.status(500).json({ error: 'Internal server error', _debug: err.message, _code: err.code }); }
+  } catch (err) { serverError(err, res); }
 });
 
 // GET /api/offers — direct offers (job invitations) for freelancer
