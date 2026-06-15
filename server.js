@@ -2007,7 +2007,7 @@ app.post('/api/escrows/:id/cancel', auth, checkBlocked, async (req, res) => {
     } catch (txErr) { await pgClient6.query('ROLLBACK').catch(() => {}); throw txErr; }
     finally { pgClient6.release(); }
     if (wasFunded) {
-      await notify(escrow.client_id, 'payment', 'Эскроу отменён', `${escrow.amount}π возвращено на ваш счёт.`, escrow.job_id, null);
+      await notify(escrow.freelancer_id, 'payment', 'Задача отменена заказчиком', `Эскроу по задаче отменён. Свяжитесь с заказчиком для уточнения деталей.`, escrow.job_id, null).catch(() => {});
       await audit('escrow_cancelled_refunded', { escrow_id: req.params.id, amount: escrow.amount, client_id: escrow.client_id });
     }
     res.json({ success: true });
@@ -2906,37 +2906,45 @@ app.post('/api/payments/complete', auth, async (req, res) => {
       console.error('[Payment/complete] Pi completion failed:', completeData);
       return res.status(502).json({ error: 'Pi payment completion failed' });
     }
-    // Idempotency guard — same pattern as /:paymentId/complete
-    const markDone = await query(
-      "UPDATE payments SET status='completed', txid=$1, updated_at=NOW() WHERE id=$2 AND status='approved' RETURNING *",
-      [txid, payment_id]
-    ).catch(() => ({ rows: [] }));
-    if (markDone.rows.length) {
-      const meta = markDone.rows[0].metadata || {};
-      const paymentOwner = markDone.rows[0].user_id || req.userId;
-      if (meta.type === 'connects') {
-        const piAmountPaid = parseFloat(completeData.amount || markDone.rows[0].amount || 0);
-        const connectsAmt = Math.floor(piAmountPaid * 10);
-        if (connectsAmt > 0) {
-          await query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [connectsAmt, paymentOwner]).catch(() => {});
-        }
-      } else if (meta.type === 'escrow' && meta.job_id && meta.freelancer_id) {
-        const existingEsc = await query('SELECT id FROM escrows WHERE payment_id = $1 LIMIT 1', [payment_id]).catch(() => ({ rows: [] }));
-        if (!existingEsc.rows.length) {
-          const [jobCheck, freelancerCheck] = await Promise.all([
-            query('SELECT id FROM jobs WHERE id = $1 LIMIT 1', [meta.job_id]).catch(() => ({ rows: [] })),
-            query('SELECT id FROM users WHERE id = $1 LIMIT 1', [meta.freelancer_id]).catch(() => ({ rows: [] })),
-          ]);
-          if (jobCheck.rows.length && freelancerCheck.rows.length) {
-            const piVerifiedAmt = parseFloat(completeData.amount || markDone.rows[0].amount || 0);
-            await query(
-              'INSERT INTO escrows (job_id, client_id, freelancer_id, amount, payment_id, status) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (payment_id) DO NOTHING',
-              [meta.job_id, paymentOwner, meta.freelancer_id, piVerifiedAmt, payment_id, 'funded']
-            ).catch(() => {});
+    // Atomic: mark payment completed + apply side-effect in one transaction
+    const pgComplete = await getPool().connect();
+    let markDoneRow = null;
+    try {
+      await pgComplete.query('BEGIN');
+      const markDone = await pgComplete.query(
+        "UPDATE payments SET status='completed', txid=$1, updated_at=NOW() WHERE id=$2 AND status='approved' RETURNING *",
+        [txid, payment_id]
+      );
+      if (markDone.rows.length) {
+        markDoneRow = markDone.rows[0];
+        const meta = markDoneRow.metadata || {};
+        const paymentOwner = markDoneRow.user_id || req.userId;
+        if (meta.type === 'connects') {
+          const piAmountPaid = parseFloat(completeData.amount || markDoneRow.amount || 0);
+          const connectsAmt = Math.floor(piAmountPaid * 10);
+          if (connectsAmt > 0) {
+            await pgComplete.query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [connectsAmt, paymentOwner]);
+          }
+        } else if (meta.type === 'escrow' && meta.job_id && meta.freelancer_id) {
+          const existingEsc = await pgComplete.query('SELECT id FROM escrows WHERE payment_id = $1 LIMIT 1', [payment_id]);
+          if (!existingEsc.rows.length) {
+            const [jobCheck, freelancerCheck] = await Promise.all([
+              pgComplete.query('SELECT id FROM jobs WHERE id = $1 LIMIT 1', [meta.job_id]),
+              pgComplete.query('SELECT id FROM users WHERE id = $1 LIMIT 1', [meta.freelancer_id]),
+            ]);
+            if (jobCheck.rows.length && freelancerCheck.rows.length) {
+              const piVerifiedAmt = parseFloat(completeData.amount || markDoneRow.amount || 0);
+              await pgComplete.query(
+                'INSERT INTO escrows (job_id, client_id, freelancer_id, amount, payment_id, status) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (payment_id) DO NOTHING',
+                [meta.job_id, paymentOwner, meta.freelancer_id, piVerifiedAmt, payment_id, 'funded']
+              );
+            }
           }
         }
       }
-    }
+      await pgComplete.query('COMMIT');
+    } catch (txErr) { await pgComplete.query('ROLLBACK').catch(() => {}); throw txErr; }
+    finally { pgComplete.release(); }
     res.json({ success: true, payment: completeData });
   } catch (err) { serverError(err, res); }
 });
