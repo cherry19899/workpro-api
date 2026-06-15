@@ -82,8 +82,11 @@ app.use('/api/admin', adminLimiter);
 app.use('/api/connects/purchase', connectsLimiter);
 app.use('/api/connects/buy', connectsLimiter);
 app.use('/api/payments', connectsLimiter);
-// Apply message limiter to all chat endpoints (covers /rooms, /conversations, /:roomId)
-app.use('/api/chat/', messageLimiter);
+// Apply message limiter only to chat WRITE endpoints (send message, read-all, start)
+// BUG G fix: messageLimiter must not throttle GET reads (listing rooms, loading history)
+app.use(['/api/chat/start', '/api/chat/read-all'], messageLimiter);
+app.use('/api/chat/rooms', (req, res, next) => { if (req.method === 'POST') return messageLimiter(req, res, next); next(); });
+app.use('/api/chat/conversations', (req, res, next) => { if (req.method === 'POST') return messageLimiter(req, res, next); next(); });
 
 // ─── Helpers ──────────────────────────────────────────────
 function now() { return new Date().toISOString(); }
@@ -380,9 +383,13 @@ app.post('/api/me', authLimiter, async (req, res) => {
     }
     // Always sync total_jobs_posted from real DB count to fix drift
     await query(`UPDATE users SET total_jobs_posted = (SELECT COUNT(*) FROM jobs WHERE posted_by = $1), updated_at = NOW() WHERE id = $1`, [uid]).catch(() => {});
-    const user = await query('SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, status, created_at FROM users WHERE id = $1', [uid]);
-    await audit('user_login', { user_id: uid });
+    const user = await query('SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, is_blocked, status, created_at FROM users WHERE id = $1', [uid]);
     const u = user.rows[0];
+    // BUG #36 fix: refuse JWT issuance for deleted accounts
+    if (u && u.status === 'deleted') {
+      return res.status(403).json({ error: 'Account has been deleted' });
+    }
+    await audit('user_login', { user_id: uid });
     // Issue a real JWT instead of predictable dummy token
     const token = jwt.sign({ id: uid, username: uname }, JWT_SECRET, { expiresIn: '30d' });
     res.json({ ...u, uid: u.id, is_admin: u.role === 'admin', token });
@@ -397,9 +404,10 @@ app.post('/api/auth/refresh', async (req, res) => {
   const token = authHeader.slice(7);
   try {
     const decoded = jwt.verify(token, JWT_SECRET, { ignoreExpiration: true });
-    const user = await query('SELECT id, username, role FROM users WHERE id = $1 LIMIT 1', [decoded.id]);
+    const user = await query('SELECT id, username, role, status FROM users WHERE id = $1 LIMIT 1', [decoded.id]);
     if (!user.rows.length) return res.status(401).json({ error: 'User not found' });
     const u = user.rows[0];
+    if (u.status === 'deleted') return res.status(403).json({ error: 'Account has been deleted' });
     const newToken = jwt.sign({ id: u.id, username: u.username }, JWT_SECRET, { expiresIn: '30d' });
     res.json({ token: newToken, is_admin: u.role === 'admin' });
   } catch (err) {
@@ -786,9 +794,16 @@ app.get('/api/jobs/:id', softAuth, async (req, res) => {
       const appsResult = await query('SELECT * FROM applications WHERE job_id = $1 ORDER BY created_at DESC LIMIT 200', [req.params.id]);
       applications = appsResult.rows;
     }
-    // Include chat room_id so frontend can show "Open chat" button
-    const roomResult = await query('SELECT id FROM chat_rooms WHERE job_id = $1 LIMIT 1', [req.params.id]);
-    const job = parseJobRow({ ...job_row, room_id: roomResult.rows[0]?.id || null });
+    // Include chat room_id for the requesting user's room only (BUG #43 fix: never leak other users' room IDs)
+    let roomId = null;
+    if (callerId) {
+      const roomResult = await query(
+        'SELECT id FROM chat_rooms WHERE job_id = $1 AND (client_id = $2 OR freelancer_id = $2) LIMIT 1',
+        [req.params.id, callerId]
+      );
+      roomId = roomResult.rows[0]?.id || null;
+    }
+    const job = parseJobRow({ ...job_row, room_id: roomId });
     res.json({ job, applications });
   } catch (err) {
     serverError(err, res);
@@ -824,7 +839,7 @@ app.get('/api/jobs/:id/check-applied', auth, async (req, res) => {
   if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Job not found' });
   try {
     const result = await query(
-      "SELECT id, status FROM applications WHERE job_id = $1 AND freelancer_id = $2 AND status NOT IN ('withdrawn','rejected') LIMIT 1",
+      "SELECT id, status FROM applications WHERE job_id = $1 AND freelancer_id = $2 AND status NOT IN ('withdrawn','rejected','offer') LIMIT 1",
       [req.params.id, req.userId]
     );
     res.json({ applied: result.rows.length > 0, application_id: result.rows[0]?.id || null, status: result.rows[0]?.status || null });
@@ -1095,7 +1110,7 @@ app.patch('/api/applications/:id', auth, checkBlocked, async (req, res) => {
   const OWNER_ALLOWED = ['accepted', 'rejected'];
   if (!OWNER_ALLOWED.includes(status)) return res.status(400).json({ error: `Invalid status. Allowed: ${OWNER_ALLOWED.join(', ')}` });
   try {
-    const appResult = await query('SELECT a.*, j.posted_by, j.apply_cost FROM applications a JOIN jobs j ON a.job_id = j.id WHERE a.id = $1', [req.params.id]);
+    const appResult = await query('SELECT a.*, j.posted_by, j.apply_cost, j.budget AS job_budget, j.title AS job_title_full FROM applications a JOIN jobs j ON a.job_id = j.id WHERE a.id = $1', [req.params.id]);
     if (!appResult.rows.length) return res.status(404).json({ error: 'Application not found' });
     if (appResult.rows[0].posted_by !== req.userId) return res.status(403).json({ error: 'Forbidden' });
     const app_ = appResult.rows[0];
@@ -1119,10 +1134,39 @@ app.patch('/api/applications/:id', auth, checkBlocked, async (req, res) => {
             await pgPatch.query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [app_.apply_cost || 1, r.freelancer_id]);
           }
         }
+        // BUG #34 fix: create pending escrow + mark job in_progress (same as /accept and /status)
+        if (app_.freelancer_id) {
+          const escrowAmt = app_.bid_amount || app_.job_budget || 0;
+          const existingEscPatch = await pgPatch.query(
+            "SELECT id FROM escrows WHERE job_id=$1 AND status=ANY($2) FOR UPDATE",
+            [app_.job_id, ['pending', 'funded']]
+          );
+          if (!existingEscPatch.rows.length) {
+            await pgPatch.query(
+              "INSERT INTO escrows (job_id, client_id, freelancer_id, amount, status) VALUES ($1,$2,$3,$4,'pending')",
+              [app_.job_id, req.userId, app_.freelancer_id, escrowAmt]
+            );
+          }
+          await pgPatch.query(
+            "UPDATE jobs SET status='in_progress', hired_freelancer_id=$1, hired_freelancer_name=$2, updated_at=NOW() WHERE id=$3 AND status='open'",
+            [app_.freelancer_id, app_.freelancer_name, app_.job_id]
+          );
+        }
       }
       await pgPatch.query('COMMIT');
     } catch (txErr) { await pgPatch.query('ROLLBACK').catch(() => {}); throw txErr; }
     finally { pgPatch.release(); }
+    if (status === 'accepted' && app_.freelancer_id) {
+      await notify(app_.freelancer_id, 'hired', `Вас наняли на задачу "${app_.job_title_full || app_.job_title}"`,
+        'Заказчик принял ваш отклик. Ожидайте финансирования эскроу.', parseInt(app_.job_id), null).catch(() => {});
+      const existRmPatch = await query('SELECT id FROM chat_rooms WHERE job_id=$1 AND client_id=$2 AND freelancer_id=$3',
+        [app_.job_id, req.userId, app_.freelancer_id]).catch(() => ({ rows: [] }));
+      if (!existRmPatch.rows.length) {
+        const rmId = 'room_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
+        await query('INSERT INTO chat_rooms (id, client_id, freelancer_id, job_id) VALUES ($1,$2,$3,$4)',
+          [rmId, req.userId, app_.freelancer_id, app_.job_id]).catch(() => {});
+      }
+    }
     await audit('application_status_changed', { app_id: req.params.id, status });
     res.json({ application: patchedApp, success: true });
   } catch (err) {
@@ -1673,7 +1717,7 @@ app.get('/api/admin/stats', adminAuth, async (req, res) => {
       query('SELECT COUNT(*) FROM escrows'),
       query("SELECT COUNT(*) FROM escrows WHERE status IN ('pending','funded')"),
       query('SELECT COUNT(*) FROM payments'),
-      query("SELECT COALESCE(SUM(amount*0.02),0) AS total FROM payments WHERE status='completed'"),
+      query("SELECT COALESCE(SUM(amount*0.02),0) AS total FROM escrows WHERE status='released'"),
       query('SELECT COUNT(*) FROM ratings'),
       query('SELECT COUNT(*) FROM chat_rooms'),
       query("SELECT COUNT(*) FROM escrows WHERE status='disputed'"),
@@ -1811,6 +1855,14 @@ app.delete('/api/admin/jobs/:id', adminAuth, async (req, res) => {
       await pgAdm.query('COMMIT');
     } catch (txErr) { await pgAdm.query('ROLLBACK').catch(() => {}); throw txErr; }
     finally { pgAdm.release(); }
+    // BUG #45 fix: notify affected parties on admin job deletion
+    if (fundedEscrow.rows.length) {
+      const esc = fundedEscrow.rows[0];
+      await notify(esc.client_id, 'payment', 'Задача удалена администратором', 'Средства эскроу возвращены на ваш баланс.', parseInt(req.params.id), null).catch(() => {});
+      if (esc.freelancer_id) {
+        await notify(esc.freelancer_id, 'info', 'Задача удалена администратором', 'Задача, над которой вы работали, была удалена администратором.', parseInt(req.params.id), null).catch(() => {});
+      }
+    }
     await audit('admin_job_deleted', { job_id: req.params.id, by: req.userId, escrow_refunded: fundedEscrow.rows.length > 0, connects_refunded: applicants.rows.length });
     res.json({ success: true });
   } catch (err) {
@@ -2055,7 +2107,8 @@ app.post('/api/chat/start', auth, checkBlocked, async (req, res) => {
   try {
     const otherExists = await query('SELECT id FROM users WHERE id = $1 LIMIT 1', [other_user_id]);
     if (!otherExists.rows.length) return res.status(404).json({ error: 'User not found' });
-    const jobId = job_id || 0;
+    // BUG #41 fix: use null instead of 0 for job_id so duplicate detection works correctly
+    const jobId = job_id ? parseInt(job_id) : null;
     // For job-linked rooms: require caller to be job poster OR have an application (same as /chat/rooms, /chat/conversations)
     if (jobId) {
       const jobCheck = await query('SELECT posted_by FROM jobs WHERE id = $1', [jobId]);
@@ -2065,10 +2118,15 @@ app.post('/api/chat/start', auth, checkBlocked, async (req, res) => {
         if (!appCheck.rows.length) return res.status(403).json({ error: 'You are not a participant in this job' });
       }
     }
-    const existing = await query(
-      'SELECT * FROM chat_rooms WHERE job_id = $3 AND ((client_id = $1 AND freelancer_id = $2) OR (client_id = $2 AND freelancer_id = $1))',
-      [req.userId, other_user_id, jobId]
-    );
+    const existing = jobId
+      ? await query(
+          'SELECT * FROM chat_rooms WHERE job_id = $3 AND ((client_id = $1 AND freelancer_id = $2) OR (client_id = $2 AND freelancer_id = $1))',
+          [req.userId, other_user_id, jobId]
+        )
+      : await query(
+          'SELECT * FROM chat_rooms WHERE job_id IS NULL AND ((client_id = $1 AND freelancer_id = $2) OR (client_id = $2 AND freelancer_id = $1))',
+          [req.userId, other_user_id]
+        );
     if (existing.rows.length) return res.json({ conversation: existing.rows[0], id: existing.rows[0].id });
     const roomId = 'room_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
     const result = await query('INSERT INTO chat_rooms (id, client_id, freelancer_id, job_id) VALUES ($1, $2, $3, $4) RETURNING *', [roomId, req.userId, other_user_id, jobId]);
@@ -2090,7 +2148,7 @@ app.post('/api/applications', auth, checkBlocked, async (req, res) => {
     if (job.status !== 'open') return res.status(400).json({ error: 'Job is not open' });
     const existing = await query('SELECT id, status FROM applications WHERE job_id = $1 AND freelancer_id = $2', [job_id, req.userId]);
     if (existing.rows.length && !['withdrawn', 'rejected'].includes(existing.rows[0].status)) {
-      return res.status(400).json({ error: 'Already applied' });
+      return res.status(409).json({ error: 'Already applied', alreadyApplied: true });
     }
     const userResult = await query('SELECT id, username, balance_connects, is_blocked FROM users WHERE id = $1', [req.userId]);
     const user = userResult.rows[0];
@@ -2279,7 +2337,7 @@ app.post('/api/applications/:id/reject', auth, checkBlocked, async (req, res) =>
 });
 
 // POST /api/applications/:id/withdraw — freelancer withdraws their own pending application
-app.post('/api/applications/:id/withdraw', auth, async (req, res) => {
+app.post('/api/applications/:id/withdraw', auth, checkBlocked, async (req, res) => {
   if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Application not found' });
   try {
     const appResult = await query('SELECT a.*, j.apply_cost FROM applications a JOIN jobs j ON a.job_id = j.id WHERE a.id = $1', [req.params.id]);
@@ -2989,6 +3047,14 @@ app.post('/api/applications/:id/hire', auth, checkBlocked, async (req, res) => {
     finally { pgClientHire.release(); }
     await notify(freelancerId, 'hired', `Вас наняли на задачу "${app_.job_title || app_.job_id}"`,
       'Заказчик выбрал вас и создал эскроу. Можете приступать к работе.', parseInt(app_.job_id), null);
+    // BUG #39 fix: create chat room after Pi-hire (same as /accept and /status paths)
+    const existRmHire = await query('SELECT id FROM chat_rooms WHERE job_id=$1 AND client_id=$2 AND freelancer_id=$3',
+      [app_.job_id, req.userId, freelancerId]).catch(() => ({ rows: [] }));
+    if (!existRmHire.rows.length) {
+      const rmIdHire = 'room_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
+      await query('INSERT INTO chat_rooms (id, client_id, freelancer_id, job_id) VALUES ($1,$2,$3,$4)',
+        [rmIdHire, req.userId, freelancerId, app_.job_id]).catch(() => {});
+    }
     await audit('hire_with_escrow', { app_id: req.params.id, job_id: app_.job_id, freelancer_id: freelancerId, amount: escrowAmount });
     res.json({ success: true, escrow: escrowRow || { job_id: app_.job_id, status: 'funded' } });
   } catch (err) { serverError(err, res); }
@@ -3037,10 +3103,14 @@ app.post('/api/payments/complete', auth, async (req, res) => {
     if (ownerCheck.rows.length && ownerCheck.rows[0].user_id && ownerCheck.rows[0].user_id !== req.userId) {
       return res.status(403).json({ error: 'Payment does not belong to you' });
     }
+    // BUG #40 fix: guard against undefined PI_API_KEY (same pattern as /api/payments/:paymentId/complete)
+    if (!PI_API_KEY) {
+      return res.status(503).json({ error: 'Payments are not configured on the server' });
+    }
     const completeRes = await fetch(`https://api.minepi.com/v2/payments/${payment_id}/complete`, {
       method: 'POST',
       headers: {
-        'Authorization': `Key ${process.env.PI_API_KEY}`,
+        'Authorization': `Key ${PI_API_KEY}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({ txid })
@@ -3426,7 +3496,7 @@ app.get('/api/chat/rooms/:id', auth, async (req, res) => {
 });
 
 // POST /api/escrows/:id/fund — fund an escrow after Pi payment
-app.post('/api/escrows/:id/fund', auth, async (req, res) => {
+app.post('/api/escrows/:id/fund', auth, checkBlocked, async (req, res) => {
   if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Escrow not found' });
   const { payment_id, txid } = req.body;
   if (!payment_id) return res.status(400).json({ error: 'payment_id required — provide the Pi payment identifier' });
