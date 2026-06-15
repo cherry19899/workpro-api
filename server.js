@@ -1168,9 +1168,19 @@ app.get('/api/escrow', auth, handleGetEscrow);
 app.get('/api/escrows', auth, handleGetEscrow);
 
 app.get(['/api/escrow/:id', '/api/escrows/:id'], auth, async (req, res) => {
-  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Escrow not found' });
+  const id = req.params.id;
+  // Route specific named paths to list handler
+  if (id === 'me') {
+    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+    const offset = parseInt(req.query.offset) || 0;
+    try {
+      const result = await query('SELECT * FROM escrows WHERE client_id = $1 OR freelancer_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3', [req.userId, limit, offset]);
+      return res.json({ escrows: result.rows, limit, offset });
+    } catch (err) { return serverError(err, res); }
+  }
+  if (isNaN(parseInt(id))) return res.status(404).json({ error: 'Escrow not found' });
   try {
-    const result = await query('SELECT * FROM escrows WHERE id = $1 AND (client_id = $2 OR freelancer_id = $2)', [req.params.id, req.userId]);
+    const result = await query('SELECT * FROM escrows WHERE id = $1 AND (client_id = $2 OR freelancer_id = $2)', [id, req.userId]);
     if (!result.rows.length) return res.status(404).json({ error: 'Escrow not found' });
     res.json({ escrow: result.rows[0] });
   } catch (err) { serverError(err, res); }
