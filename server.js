@@ -1089,25 +1089,32 @@ app.patch('/api/applications/:id', auth, checkBlocked, async (req, res) => {
     if (!appResult.rows.length) return res.status(404).json({ error: 'Application not found' });
     if (appResult.rows[0].posted_by !== req.userId) return res.status(403).json({ error: 'Forbidden' });
     const app_ = appResult.rows[0];
-    if (status === 'rejected' && app_.status === 'pending') {
-      await query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [app_.apply_cost || 1, app_.freelancer_id]);
-    }
-    const result = await query('UPDATE applications SET status = $1 WHERE id = $2 RETURNING *', [status, req.params.id]);
-    // When accepting, auto-reject all other pending applications and refund their connects
-    if (status === 'accepted') {
-      const toRejectPatch = await query(
-        "SELECT freelancer_id FROM applications WHERE job_id = $1 AND id != $2 AND status = 'pending'",
-        [app_.job_id, req.params.id]
-      );
-      if (toRejectPatch.rows.length) {
-        await query("UPDATE applications SET status = 'rejected' WHERE job_id = $1 AND id != $2 AND status = 'pending'", [app_.job_id, req.params.id]);
-        for (const r of toRejectPatch.rows) {
-          await query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [app_.apply_cost || 1, r.freelancer_id]).catch(() => {});
+    let patchedApp;
+    const pgPatch = await getPool().connect();
+    try {
+      await pgPatch.query('BEGIN');
+      if (status === 'rejected' && app_.status === 'pending') {
+        await pgPatch.query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [app_.apply_cost || 1, app_.freelancer_id]);
+      }
+      const result = await pgPatch.query('UPDATE applications SET status = $1 WHERE id = $2 RETURNING *', [status, req.params.id]);
+      patchedApp = result.rows[0];
+      if (status === 'accepted') {
+        const toRejectPatch = await pgPatch.query(
+          "SELECT freelancer_id FROM applications WHERE job_id = $1 AND id != $2 AND status = 'pending'",
+          [app_.job_id, req.params.id]
+        );
+        if (toRejectPatch.rows.length) {
+          await pgPatch.query("UPDATE applications SET status = 'rejected' WHERE job_id = $1 AND id != $2 AND status = 'pending'", [app_.job_id, req.params.id]);
+          for (const r of toRejectPatch.rows) {
+            await pgPatch.query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [app_.apply_cost || 1, r.freelancer_id]);
+          }
         }
       }
-    }
+      await pgPatch.query('COMMIT');
+    } catch (txErr) { await pgPatch.query('ROLLBACK').catch(() => {}); throw txErr; }
+    finally { pgPatch.release(); }
     await audit('application_status_changed', { app_id: req.params.id, status });
-    res.json({ application: result.rows[0], success: true });
+    res.json({ application: patchedApp, success: true });
   } catch (err) {
     serverError(err, res);
   }
