@@ -867,6 +867,7 @@ app.post('/api/jobs/:id/apply', auth, checkBlocked, async (req, res) => {
         `SELECT id FROM applications WHERE job_id=$1 AND freelancer_id=$2 AND status IN ('withdrawn','rejected') LIMIT 1`,
         [req.params.id, req.userId]
       );
+      let isNewApp = false;
       if (prevApp.rows.length) {
         appResult = await pgClient.query(
           `UPDATE applications SET status='pending', message=$3, updated_at=NOW() WHERE id=$4 RETURNING *`,
@@ -877,12 +878,16 @@ app.post('/api/jobs/:id/apply', auth, checkBlocked, async (req, res) => {
           `INSERT INTO applications (job_id, job_title, freelancer_id, freelancer_name, message) VALUES ($1, $2, $3, $4, $5) RETURNING *`,
           [req.params.id, job.title, req.userId, user.username || req.userId, req.body.message || '']
         );
+        isNewApp = true;
       }
       if (!appResult.rows.length) {
         await pgClient.query('ROLLBACK');
         return res.status(400).json({ error: 'Already applied' });
       }
-      await pgClient.query('UPDATE jobs SET applications = applications + 1, updated_at = NOW() WHERE id = $1', [req.params.id]);
+      // Only increment applications counter for truly new applications, not reactivations
+      if (isNewApp) {
+        await pgClient.query('UPDATE jobs SET applications = applications + 1, updated_at = NOW() WHERE id = $1', [req.params.id]);
+      }
       await pgClient.query('COMMIT');
     } catch (txErr) {
       await pgClient.query('ROLLBACK').catch(() => {});
@@ -2019,6 +2024,11 @@ app.post('/api/applications', auth, checkBlocked, async (req, res) => {
         [cost, req.userId]
       );
       if (!deductResult2.rows.length) { await pgClient.query('ROLLBACK'); return res.status(400).json({ error: 'Not enough connects', required: cost }); }
+      const existingForAlias = await pgClient.query(
+        `SELECT id FROM applications WHERE job_id=$1 AND freelancer_id=$2 AND status IN ('withdrawn','rejected') LIMIT 1`,
+        [job_id, req.userId]
+      );
+      const isNewAlias = !existingForAlias.rows.length;
       appResult = await pgClient.query(
         `INSERT INTO applications (job_id, job_title, freelancer_id, freelancer_name, message) VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT (job_id, freelancer_id) DO UPDATE
@@ -2028,7 +2038,9 @@ app.post('/api/applications', auth, checkBlocked, async (req, res) => {
         [job_id, job.title, req.userId, user.username || req.userId, message || '']
       );
       if (!appResult.rows.length) { await pgClient.query('ROLLBACK'); return res.status(400).json({ error: 'Already applied' }); }
-      await pgClient.query('UPDATE jobs SET applications = applications + 1, updated_at = NOW() WHERE id = $1', [job_id]);
+      if (isNewAlias) {
+        await pgClient.query('UPDATE jobs SET applications = applications + 1, updated_at = NOW() WHERE id = $1', [job_id]);
+      }
       await pgClient.query('COMMIT');
     } catch (txErr) { await pgClient.query('ROLLBACK').catch(() => {}); throw txErr; }
     finally { pgClient.release(); }
