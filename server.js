@@ -463,8 +463,12 @@ app.post('/api/auth/login', async (req, res) => {
       await query('UPDATE users SET updated_at = NOW() WHERE id = $1', [uid]);
     }
 
-    const token = jwt.sign({ id: uid, username: uname }, JWT_SECRET, { expiresIn: '30d' });
     const user = await query('SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, is_blocked, status, created_at FROM users WHERE id = $1', [uid]);
+    // BUG #50 fix: refuse JWT for deleted accounts (same guard as POST /api/me)
+    if (user.rows[0]?.status === 'deleted') {
+      return res.status(403).json({ error: 'Account has been deleted' });
+    }
+    const token = jwt.sign({ id: uid, username: uname }, JWT_SECRET, { expiresIn: '30d' });
     await audit('user_login', { user_id: uid });
     res.json({ token, user: { ...user.rows[0], payments_enabled: paymentsEnabled } });
   } catch (err) {
@@ -823,7 +827,8 @@ app.patch('/api/jobs/:id', auth, checkBlocked, async (req, res) => {
       return res.status(403).json({ error: 'Forbidden' });
     }
     if (job.status !== 'in_progress') return res.status(400).json({ error: 'Job is not in progress' });
-    const result = await query('UPDATE jobs SET status = COALESCE($1, status), updated_at = NOW() WHERE id = $2 RETURNING *', [status, req.params.id]);
+    // BUG #55 fix: add status guard in UPDATE to close TOCTOU window between read and write
+    const result = await query("UPDATE jobs SET status = $1, updated_at = NOW() WHERE id = $2 AND status = 'in_progress' RETURNING *", [status, req.params.id]);
     // Notify client when freelancer submits work for review
     if (status === 'submitted' && isHiredFreelancer) {
       await notify(job.posted_by, 'submitted', `Фрилансер сдал работу по задаче "${job.title}"`,
@@ -839,7 +844,7 @@ app.get('/api/jobs/:id/check-applied', auth, async (req, res) => {
   if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Job not found' });
   try {
     const result = await query(
-      "SELECT id, status FROM applications WHERE job_id = $1 AND freelancer_id = $2 AND status NOT IN ('withdrawn','rejected','offer') LIMIT 1",
+      "SELECT id, status FROM applications WHERE job_id = $1 AND freelancer_id = $2 AND status NOT IN ('withdrawn','rejected','offer','declined') LIMIT 1",
       [req.params.id, req.userId]
     );
     res.json({ applied: result.rows.length > 0, application_id: result.rows[0]?.id || null, status: result.rows[0]?.status || null });
@@ -1360,6 +1365,18 @@ app.post(['/api/escrow', '/api/escrows'], auth, checkBlocked, async (req, res) =
     } catch (txErr) { await pgClientE.query('ROLLBACK').catch(() => {}); throw txErr; }
     finally { pgClientE.release(); }
     await audit('escrow_created', { escrow_id: escrowRow.id, job_id, payment_id });
+    // BUG #62 fix: notify freelancer and create chat room (same as other hire paths)
+    const jobTitleRes = await query('SELECT title FROM jobs WHERE id = $1', [job_id]).catch(() => ({ rows: [] }));
+    const jobTitle = jobTitleRes.rows[0]?.title || job_id;
+    await notify(freelancer_id, 'hired', `Вас наняли на задачу "${jobTitle}"`,
+      'Заказчик создал эскроу. Можете приступать к работе.', parseInt(job_id), null).catch(() => {});
+    const existRmEsc = await query('SELECT id FROM chat_rooms WHERE job_id=$1 AND client_id=$2 AND freelancer_id=$3',
+      [job_id, req.userId, freelancer_id]).catch(() => ({ rows: [] }));
+    if (!existRmEsc.rows.length) {
+      const rmId = 'room_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
+      await query('INSERT INTO chat_rooms (id, client_id, freelancer_id, job_id) VALUES ($1,$2,$3,$4)',
+        [rmId, req.userId, freelancer_id, job_id]).catch(() => {});
+    }
     res.json({ escrow: escrowRow });
   } catch (err) {
     serverError(err, res);
@@ -2084,10 +2101,16 @@ app.post('/api/escrows/:id/cancel', auth, checkBlocked, async (req, res) => {
         [req.params.id, ['pending', 'funded']]
       );
       if (!updated.rows.length) { await pgClient6.query('ROLLBACK'); return res.status(400).json({ error: 'Escrow already settled' }); }
-      await pgClient6.query('UPDATE jobs SET status = $1, hired_freelancer_id = NULL, updated_at = NOW() WHERE id = $2', ['open', escrow.job_id]);
+      await pgClient6.query('UPDATE jobs SET status = $1, hired_freelancer_id = NULL, hired_freelancer_name = NULL, updated_at = NOW() WHERE id = $2', ['open', escrow.job_id]);
       if (wasFunded) {
         await pgClient6.query('UPDATE users SET balance_pi = COALESCE(balance_pi, 0) + $1, updated_at = NOW() WHERE id = $2', [escrow.amount, escrow.client_id]);
       }
+      // BUG #53 fix: reset all non-pending applications back to 'rejected' so freelancers can re-apply
+      // (hired freelancer's 'accepted' app would block their future applications otherwise)
+      await pgClient6.query(
+        "UPDATE applications SET status='rejected' WHERE job_id=$1 AND status IN ('accepted')",
+        [escrow.job_id]
+      );
       await pgClient6.query('COMMIT');
     } catch (txErr) { await pgClient6.query('ROLLBACK').catch(() => {}); throw txErr; }
     finally { pgClient6.release(); }
@@ -2504,7 +2527,11 @@ app.put('/api/users/me', auth, checkBlocked, async (req, res) => {
   if (bio && bio.length > 1000) return res.status(400).json({ error: 'Bio too long (max 1000)' });
   const skillsStr = skills !== undefined ? (Array.isArray(skills) ? skills.join(',') : (skills || null)) : undefined;
   if (skillsStr && skillsStr.length > 300) return res.status(400).json({ error: 'Skills too long (max 300)' });
-  if (avatar && !/^https?:\/\//i.test(avatar)) return res.status(400).json({ error: 'Avatar must be a valid URL (http/https)' });
+  // BUG #54 fix: allow base64 avatars (same as POST /api/users/:id), limit to 2MB
+  if (avatar && !/^https?:\/\//i.test(avatar) && !/^data:image\//i.test(avatar)) {
+    return res.status(400).json({ error: 'Avatar must be a URL (http/https) or base64 image (data:image/...)' });
+  }
+  if (avatar && avatar.length > 2 * 1024 * 1024 * 1.37) return res.status(400).json({ error: 'Avatar too large (max 2MB)' });
   if (email && (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))) return res.status(400).json({ error: 'Invalid email address' });
   const ALLOWED_AVAILABILITY = ['available', 'busy', 'away', 'unavailable'];
   if (availability && !ALLOWED_AVAILABILITY.includes(availability)) {
@@ -2791,6 +2818,8 @@ app.post('/api/escrow/:id/refund', auth, checkBlocked, async (req, res) => {
       if (wasFunded) {
         await pgClient7.query('UPDATE users SET balance_pi = COALESCE(balance_pi, 0) + $1, updated_at = NOW() WHERE id = $2', [escrow.amount, escrow.client_id]);
       }
+      // BUG #53 fix: reset accepted application so freelancer can re-apply after refund
+      await pgClient7.query("UPDATE applications SET status='rejected' WHERE job_id=$1 AND status='accepted'", [escrow.job_id]);
       await pgClient7.query('COMMIT');
     } catch (txErr) { await pgClient7.query('ROLLBACK').catch(() => {}); throw txErr; }
     finally { pgClient7.release(); }
@@ -3396,7 +3425,7 @@ app.get('/api/reviews/stats', auth, async (req, res) => {
 // ─── Additional endpoints from bundle analysis ──────────────────────────────────────────────
 
 // POST /api/chat/:roomId/messages — send message (alias for /chat/rooms/:id/messages)
-app.post('/api/chat/:roomId/messages', auth, checkBlocked, async (req, res) => {
+app.post('/api/chat/:roomId/messages', auth, messageLimiter, checkBlocked, async (req, res) => {
   const { content, message, text } = req.body;
   const msg = content || message || text || '';
   if (!msg.trim()) return res.status(400).json({ error: 'Message content required' });
@@ -3581,13 +3610,62 @@ app.get('/api/escrows/:id/room', auth, async (req, res) => {
 app.post('/api/offers/:id/accept', auth, checkBlocked, async (req, res) => {
   if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Offer not found' });
   try {
-    const result = await query("UPDATE applications SET status = $1 WHERE id = $2 AND freelancer_id = $3 AND status = 'offer' RETURNING *", ['accepted', req.params.id, req.userId]);
-    if (!result.rows.length) {
-      const exists = await query('SELECT status FROM applications WHERE id = $1 AND freelancer_id = $2', [req.params.id, req.userId]);
-      if (!exists.rows.length) return res.status(404).json({ error: 'Offer not found' });
-      return res.status(400).json({ error: `Offer cannot be accepted (current status: ${exists.rows[0].status})` });
+    // BUG #38 fix: accepting an offer must create escrow, update job, notify client, create chat room
+    const offerRes = await query(
+      `SELECT a.*, j.posted_by, j.budget AS job_budget, j.title AS job_title, j.apply_cost
+       FROM applications a JOIN jobs j ON a.job_id = j.id WHERE a.id = $1 AND a.freelancer_id = $2`,
+      [req.params.id, req.userId]
+    );
+    if (!offerRes.rows.length) return res.status(404).json({ error: 'Offer not found' });
+    const offer = offerRes.rows[0];
+    if (offer.status !== 'offer') return res.status(400).json({ error: `Offer cannot be accepted (current status: ${offer.status})` });
+
+    const pgOffer = await getPool().connect();
+    let acceptedOffer;
+    try {
+      await pgOffer.query('BEGIN');
+      const upd = await pgOffer.query(
+        "UPDATE applications SET status='accepted' WHERE id=$1 AND status='offer' RETURNING *",
+        [req.params.id]
+      );
+      if (!upd.rows.length) { await pgOffer.query('ROLLBACK'); return res.status(409).json({ error: 'Offer already processed' }); }
+      acceptedOffer = upd.rows[0];
+      // Auto-reject other pending applications
+      const toRej = await pgOffer.query(
+        "SELECT freelancer_id FROM applications WHERE job_id=$1 AND id!=$2 AND status='pending'",
+        [offer.job_id, req.params.id]
+      );
+      if (toRej.rows.length) {
+        await pgOffer.query("UPDATE applications SET status='rejected' WHERE job_id=$1 AND id!=$2 AND status='pending'", [offer.job_id, req.params.id]);
+        for (const r of toRej.rows) {
+          await pgOffer.query('UPDATE users SET balance_connects=balance_connects+$1, updated_at=NOW() WHERE id=$2', [offer.apply_cost || 1, r.freelancer_id]);
+        }
+      }
+      // Create pending escrow
+      const escrowAmt = offer.bid_amount || offer.job_budget || 0;
+      const existEsc = await pgOffer.query("SELECT id FROM escrows WHERE job_id=$1 AND status=ANY($2) FOR UPDATE", [offer.job_id, ['pending', 'funded']]);
+      if (!existEsc.rows.length) {
+        await pgOffer.query("INSERT INTO escrows (job_id, client_id, freelancer_id, amount, status) VALUES ($1,$2,$3,$4,'pending')",
+          [offer.job_id, offer.posted_by, req.userId, escrowAmt]);
+      }
+      await pgOffer.query(
+        "UPDATE jobs SET status='in_progress', hired_freelancer_id=$1, hired_freelancer_name=$2, updated_at=NOW() WHERE id=$3 AND status='open'",
+        [req.userId, acceptedOffer.freelancer_name, offer.job_id]
+      );
+      await pgOffer.query('COMMIT');
+    } catch (txErr) { await pgOffer.query('ROLLBACK').catch(() => {}); throw txErr; }
+    finally { pgOffer.release(); }
+    // Notify client and create chat room
+    await notify(offer.posted_by, 'hired', `Фрилансер принял ваше предложение по задаче "${offer.job_title}"`,
+      'Пополните эскроу, чтобы начать работу.', parseInt(offer.job_id), null).catch(() => {});
+    const existRmOffer = await query('SELECT id FROM chat_rooms WHERE job_id=$1 AND client_id=$2 AND freelancer_id=$3',
+      [offer.job_id, offer.posted_by, req.userId]).catch(() => ({ rows: [] }));
+    if (!existRmOffer.rows.length) {
+      const rmId = 'room_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
+      await query('INSERT INTO chat_rooms (id, client_id, freelancer_id, job_id) VALUES ($1,$2,$3,$4)',
+        [rmId, offer.posted_by, req.userId, offer.job_id]).catch(() => {});
     }
-    res.json({ application: result.rows[0], success: true });
+    res.json({ application: acceptedOffer, success: true });
   } catch (err) { serverError(err, res); }
 });
 
@@ -3595,7 +3673,8 @@ app.post('/api/offers/:id/accept', auth, checkBlocked, async (req, res) => {
 app.post('/api/offers/:id/decline', auth, checkBlocked, async (req, res) => {
   if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Offer not found' });
   try {
-    const result = await query("UPDATE applications SET status = $1 WHERE id = $2 AND freelancer_id = $3 AND status = 'offer' RETURNING *", ['declined', req.params.id, req.userId]);
+    // BUG #59 fix: set status back to 'rejected' (not 'declined') so the freelancer can re-apply later
+    const result = await query("UPDATE applications SET status = $1 WHERE id = $2 AND freelancer_id = $3 AND status = 'offer' RETURNING *", ['rejected', req.params.id, req.userId]);
     if (!result.rows.length) {
       const exists = await query('SELECT status FROM applications WHERE id = $1 AND freelancer_id = $2', [req.params.id, req.userId]);
       if (!exists.rows.length) return res.status(404).json({ error: 'Offer not found' });
@@ -3756,22 +3835,22 @@ app.post('/api/payments/:paymentId/resolve-complete', auth, async (req, res) => 
     return res.status(403).json({ error: 'Payment does not belong to you' });
   }
   try {
-    // Fetch payment details from Pi API to get txid
-    const piRes = await fetch(`https://api.minepi.com/v2/payments/${paymentId}`, {
-      headers: { 'Authorization': `Key ${process.env.PI_API_KEY}` }
-    }).catch(() => null);
-
+    // BUG #63 fix: use PI_API_KEY constant (not process.env.PI_API_KEY) and guard missing key
     let txid = null;
-    if (piRes && piRes.ok) {
-      const piData = await piRes.json().catch(() => ({}));
-      txid = piData.transaction?.txid || piData.txid || null;
-      // Tell Pi to mark it as complete
-      if (txid) {
-        await fetch(`https://api.minepi.com/v2/payments/${paymentId}/complete`, {
-          method: 'POST',
-          headers: { 'Authorization': `Key ${process.env.PI_API_KEY}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ txid })
-        }).catch(() => {});
+    if (PI_API_KEY) {
+      const piRes = await fetch(`https://api.minepi.com/v2/payments/${paymentId}`, {
+        headers: { 'Authorization': `Key ${PI_API_KEY}` }
+      }).catch(() => null);
+      if (piRes && piRes.ok) {
+        const piData = await piRes.json().catch(() => ({}));
+        txid = piData.transaction?.txid || piData.txid || null;
+        if (txid) {
+          await fetch(`https://api.minepi.com/v2/payments/${paymentId}/complete`, {
+            method: 'POST',
+            headers: { 'Authorization': `Key ${PI_API_KEY}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ txid })
+          }).catch(() => {});
+        }
       }
     }
 
