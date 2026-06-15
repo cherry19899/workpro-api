@@ -1563,6 +1563,7 @@ app.post('/api/connects/purchase', auth, checkBlocked, async (req, res) => {
 app.post('/api/ratings', auth, checkBlocked, async (req, res) => {
   const { to_user_id, job_id, rating, comment } = req.body;
   if (!to_user_id || rating === undefined || rating === null || rating === '') return res.status(400).json({ error: 'to_user_id and rating required' });
+  if (job_id !== undefined && job_id !== null && isNaN(parseInt(job_id))) return res.status(400).json({ error: 'Invalid job_id' });
   const ratingNum = parseInt(rating);
   if (isNaN(ratingNum) || ratingNum < 1 || ratingNum > 5) return res.status(400).json({ error: 'Rating must be 1-5' });
   if (to_user_id === req.userId) return res.status(400).json({ error: 'Cannot rate yourself' });
@@ -1754,27 +1755,31 @@ app.get('/api/admin/jobs', adminAuth, async (req, res) => {
 app.delete('/api/admin/jobs/:id', adminAuth, async (req, res) => {
   if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Job not found' });
   try {
-    // Refund funded escrow to client before hard-deleting the job
     const fundedEscrow = await query("SELECT * FROM escrows WHERE job_id = $1 AND status = 'funded' LIMIT 1", [req.params.id]);
-    if (fundedEscrow.rows.length) {
-      const esc = fundedEscrow.rows[0];
-      await query("UPDATE escrows SET status='refunded', updated_at=NOW() WHERE id=$1", [esc.id]);
-      await query('UPDATE users SET balance_pi = COALESCE(balance_pi,0) + $1, updated_at=NOW() WHERE id=$2', [esc.amount, esc.client_id]);
-    }
-    // Refund connects to job poster (post cost) and applicants
     const jobMeta = await query('SELECT apply_cost, posted_by FROM jobs WHERE id = $1', [req.params.id]);
+    if (!jobMeta.rows.length) return res.status(404).json({ error: 'Job not found' });
     const applyRefundCost = jobMeta.rows[0]?.apply_cost || 1;
     const jobPoster = jobMeta.rows[0]?.posted_by;
-    if (jobPoster) {
-      await query('UPDATE users SET balance_connects = balance_connects + 1, updated_at=NOW() WHERE id=$1', [jobPoster]).catch(() => {});
-    }
-    // Only refund pending applications — rejected/withdrawn ones were already refunded when status changed
     const applicants = await query("SELECT DISTINCT freelancer_id FROM applications WHERE job_id = $1 AND status = 'pending'", [req.params.id]);
-    for (const row of applicants.rows) {
-      await query('UPDATE users SET balance_connects = balance_connects + $1, updated_at=NOW() WHERE id=$2', [applyRefundCost, row.freelancer_id]).catch(() => {});
-    }
-    await query('DELETE FROM applications WHERE job_id = $1', [req.params.id]);
-    await query('DELETE FROM jobs WHERE id = $1', [req.params.id]);
+    const pgAdm = await getPool().connect();
+    try {
+      await pgAdm.query('BEGIN');
+      if (fundedEscrow.rows.length) {
+        const esc = fundedEscrow.rows[0];
+        await pgAdm.query("UPDATE escrows SET status='refunded', updated_at=NOW() WHERE id=$1", [esc.id]);
+        await pgAdm.query('UPDATE users SET balance_pi = COALESCE(balance_pi,0) + $1, updated_at=NOW() WHERE id=$2', [esc.amount, esc.client_id]);
+      }
+      if (jobPoster) {
+        await pgAdm.query('UPDATE users SET balance_connects = balance_connects + 1, updated_at=NOW() WHERE id=$1', [jobPoster]);
+      }
+      for (const row of applicants.rows) {
+        await pgAdm.query('UPDATE users SET balance_connects = balance_connects + $1, updated_at=NOW() WHERE id=$2', [applyRefundCost, row.freelancer_id]);
+      }
+      await pgAdm.query('DELETE FROM applications WHERE job_id = $1', [req.params.id]);
+      await pgAdm.query('DELETE FROM jobs WHERE id = $1', [req.params.id]);
+      await pgAdm.query('COMMIT');
+    } catch (txErr) { await pgAdm.query('ROLLBACK').catch(() => {}); throw txErr; }
+    finally { pgAdm.release(); }
     await audit('admin_job_deleted', { job_id: req.params.id, by: req.userId, escrow_refunded: fundedEscrow.rows.length > 0, connects_refunded: applicants.rows.length });
     res.json({ success: true });
   } catch (err) {
@@ -2474,6 +2479,7 @@ app.post('/api/reviews', auth, checkBlocked, async (req, res) => {
   const toId = to_user_id || target_id;  // bundle uses target_id
   const reviewComment = comment || text || '';
   if (!toId || rating === undefined || rating === null || rating === '') return res.status(400).json({ error: 'to_user_id and rating required' });
+  if (job_id !== undefined && job_id !== null && isNaN(parseInt(job_id))) return res.status(400).json({ error: 'Invalid job_id' });
   const ratingNumR = parseInt(rating);
   if (isNaN(ratingNumR) || ratingNumR < 1 || ratingNumR > 5) return res.status(400).json({ error: 'Rating must be 1-5' });
   if (toId === req.userId) return res.status(400).json({ error: 'Cannot rate yourself' });
