@@ -1094,6 +1094,19 @@ app.patch('/api/applications/:id', auth, checkBlocked, async (req, res) => {
       await query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [app_.apply_cost || 1, app_.freelancer_id]);
     }
     const result = await query('UPDATE applications SET status = $1 WHERE id = $2 RETURNING *', [status, req.params.id]);
+    // When accepting, auto-reject all other pending applications and refund their connects
+    if (status === 'accepted') {
+      const toRejectPatch = await query(
+        "SELECT freelancer_id FROM applications WHERE job_id = $1 AND id != $2 AND status = 'pending'",
+        [app_.job_id, req.params.id]
+      );
+      if (toRejectPatch.rows.length) {
+        await query("UPDATE applications SET status = 'rejected' WHERE job_id = $1 AND id != $2 AND status = 'pending'", [app_.job_id, req.params.id]);
+        for (const r of toRejectPatch.rows) {
+          await query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [app_.apply_cost || 1, r.freelancer_id]).catch(() => {});
+        }
+      }
+    }
     await audit('application_status_changed', { app_id: req.params.id, status });
     res.json({ application: result.rows[0], success: true });
   } catch (err) {
@@ -2197,6 +2210,19 @@ app.put('/api/applications/:id/status', auth, checkBlocked, async (req, res) => 
       await query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [app_.apply_cost || 1, app_.freelancer_id]);
     }
     const result = await query('UPDATE applications SET status = $1 WHERE id = $2 RETURNING *', [status, req.params.id]);
+    // When accepting, auto-reject other pending applications and refund connects
+    if (status === 'accepted') {
+      const toRejectStatus = await query(
+        "SELECT freelancer_id FROM applications WHERE job_id = $1 AND id != $2 AND status = 'pending'",
+        [app_.job_id, req.params.id]
+      );
+      if (toRejectStatus.rows.length) {
+        await query("UPDATE applications SET status = 'rejected' WHERE job_id = $1 AND id != $2 AND status = 'pending'", [app_.job_id, req.params.id]);
+        for (const r of toRejectStatus.rows) {
+          await query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [app_.apply_cost || 1, r.freelancer_id]).catch(() => {});
+        }
+      }
+    }
     res.json({ application: result.rows[0], success: true });
   } catch (err) { serverError(err, res); }
 });
