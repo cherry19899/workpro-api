@@ -726,6 +726,7 @@ app.get('/api/jobs/my', auth, async (req, res) => {
 });
 
 app.get('/api/jobs/:id', softAuth, async (req, res) => {
+  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Job not found' });
   try {
     const jobResult = await query('SELECT * FROM jobs WHERE id = $1', [req.params.id]);
     if (!jobResult.rows.length) return res.status(404).json({ error: 'Job not found' });
@@ -1161,6 +1162,15 @@ async function handleGetEscrow(req, res) {
 // Bundle uses /api/escrows (plural) — both spellings handled
 app.get('/api/escrow', auth, handleGetEscrow);
 app.get('/api/escrows', auth, handleGetEscrow);
+
+app.get(['/api/escrow/:id', '/api/escrows/:id'], auth, async (req, res) => {
+  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Escrow not found' });
+  try {
+    const result = await query('SELECT * FROM escrows WHERE id = $1 AND (client_id = $2 OR freelancer_id = $2)', [req.params.id, req.userId]);
+    if (!result.rows.length) return res.status(404).json({ error: 'Escrow not found' });
+    res.json({ escrow: result.rows[0] });
+  } catch (err) { serverError(err, res); }
+});
 
 app.post(['/api/escrow', '/api/escrows'], auth, checkBlocked, async (req, res) => {
   const { job_id, freelancer_id, payment_id } = req.body;
@@ -2028,7 +2038,7 @@ app.post('/api/applications/:id/accept', auth, checkBlocked, async (req, res) =>
         } else {
           escrow = existing.rows[0];
         }
-        await pgClientAccept.query("UPDATE jobs SET status='in_progress', updated_at=NOW() WHERE id=$1", [app_.job_id]);
+        await pgClientAccept.query("UPDATE jobs SET status='in_progress', hired_freelancer_id=$1, hired_freelancer_name=$2, updated_at=NOW() WHERE id=$3", [freelancerId, app_.freelancer_name, app_.job_id]);
         await pgClientAccept.query('COMMIT');
       } catch (txErr) { await pgClientAccept.query('ROLLBACK').catch(() => {}); throw txErr; }
       finally { pgClientAccept.release(); }
