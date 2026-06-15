@@ -1087,7 +1087,8 @@ app.post('/api/chat/rooms', auth, checkBlocked, async (req, res) => {
     const jobCheck = await query('SELECT posted_by, hired_freelancer_id FROM jobs WHERE id = $1', [job_id]);
     if (!jobCheck.rows.length) return res.status(404).json({ error: 'Job not found' });
     const job = jobCheck.rows[0];
-    if (job.posted_by !== cId && freelancer_id !== cId) {
+    // Caller must be the job poster OR have an application for this job
+    if (job.posted_by !== cId) {
       const appCheck = await query('SELECT id FROM applications WHERE job_id = $1 AND freelancer_id = $2 LIMIT 1', [job_id, cId]);
       if (!appCheck.rows.length) return res.status(403).json({ error: 'You are not a participant in this job' });
     }
@@ -1680,6 +1681,7 @@ app.get('/api/admin/jobs', adminAuth, async (req, res) => {
 });
 
 app.delete('/api/admin/jobs/:id', adminAuth, async (req, res) => {
+  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Job not found' });
   try {
     // Refund funded escrow to client before hard-deleting the job
     const fundedEscrow = await query("SELECT * FROM escrows WHERE job_id = $1 AND status = 'funded' LIMIT 1", [req.params.id]);
@@ -2251,9 +2253,8 @@ app.post('/api/chat/conversations', auth, checkBlocked, async (req, res) => {
     if (!jobCheck.rows.length) return res.status(404).json({ error: 'Job not found' });
     const job = jobCheck.rows[0];
     const isJobPoster = job.posted_by === cId;
-    const isFid = fId === cId; // caller is the freelancer side
-    if (!isJobPoster && !isFid) {
-      // Also allow if caller has an application for this job
+    if (!isJobPoster) {
+      // Caller must be a freelancer with an application for this job
       const appCheck = await query('SELECT id FROM applications WHERE job_id = $1 AND freelancer_id = $2 LIMIT 1', [job_id, cId]);
       if (!appCheck.rows.length) return res.status(403).json({ error: 'You are not a participant in this job' });
     }
@@ -2288,6 +2289,10 @@ app.post('/api/chat/conversations/:id/messages', auth, checkBlocked, async (req,
     const senderName = userResult.rows[0]?.username || req.userId;
     const result = await query('INSERT INTO chat_messages (room_id, sender_id, sender_name, message) VALUES ($1, $2, $3, $4) RETURNING *', [req.params.id, req.userId, senderName, msg.trim()]);
     await query('UPDATE chat_rooms SET updated_at = NOW() WHERE id = $1', [req.params.id]);
+    const otherUserId = room.rows[0].client_id === req.userId ? room.rows[0].freelancer_id : room.rows[0].client_id;
+    if (otherUserId) {
+      await notify(otherUserId, 'message', `Новое сообщение от ${senderName}`, msg.trim().substring(0, 100), null, req.params.id).catch(() => {});
+    }
     res.json({ message: result.rows[0] });
   } catch (err) { serverError(err, res); }
 });
@@ -2509,6 +2514,7 @@ app.delete('/api/users/me', auth, async (req, res) => {
 });
 
 app.delete('/api/users/me/portfolio/items/:id', auth, async (req, res) => {
+  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Portfolio item not found' });
   try {
     const result = await query('DELETE FROM portfolio_items WHERE id = $1 AND user_id = $2 RETURNING id', [req.params.id, req.userId]);
     if (!result.rows.length) return res.status(404).json({ error: 'Portfolio item not found' });
@@ -2552,6 +2558,37 @@ app.post('/api/notifications/mark-read', auth, async (req, res) => {
   } catch (err) {
     res.json({ success: true });
   }
+});
+
+app.post('/api/notifications/:id/read', auth, async (req, res) => {
+  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Notification not found' });
+  try {
+    const result = await query(
+      'UPDATE notifications SET is_read = true WHERE id = $1 AND user_id = $2 RETURNING id',
+      [req.params.id, req.userId]
+    );
+    if (!result.rows.length) return res.status(404).json({ error: 'Notification not found' });
+    res.json({ success: true });
+  } catch (err) { serverError(err, res); }
+});
+
+app.delete('/api/notifications/:id', auth, async (req, res) => {
+  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Notification not found' });
+  try {
+    const result = await query(
+      'DELETE FROM notifications WHERE id = $1 AND user_id = $2 RETURNING id',
+      [req.params.id, req.userId]
+    );
+    if (!result.rows.length) return res.status(404).json({ error: 'Notification not found' });
+    res.json({ success: true });
+  } catch (err) { serverError(err, res); }
+});
+
+app.delete('/api/notifications', auth, async (req, res) => {
+  try {
+    await query('DELETE FROM notifications WHERE user_id = $1', [req.userId]);
+    res.json({ success: true });
+  } catch (err) { serverError(err, res); }
 });
 
 // ─── Hire with Pi payment (escrow) ──────────────────────────────────────────────
@@ -2979,6 +3016,10 @@ app.post('/api/chat/:roomId/messages', auth, checkBlocked, async (req, res) => {
       [req.params.roomId, req.userId, senderName, msg]
     );
     await query('UPDATE chat_rooms SET updated_at = NOW() WHERE id = $1', [req.params.roomId]);
+    const otherUserId2 = roomCheck.rows[0].client_id === req.userId ? roomCheck.rows[0].freelancer_id : roomCheck.rows[0].client_id;
+    if (otherUserId2) {
+      await notify(otherUserId2, 'message', `Новое сообщение от ${senderName}`, msg.substring(0, 100), null, req.params.roomId).catch(() => {});
+    }
     res.json({ message: result.rows[0], success: true });
   } catch (err) { serverError(err, res); }
 });
@@ -3135,11 +3176,11 @@ app.get('/api/escrows/:id/room', auth, async (req, res) => {
 app.post('/api/offers/:id/accept', auth, checkBlocked, async (req, res) => {
   if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Offer not found' });
   try {
-    const result = await query("UPDATE applications SET status = $1 WHERE id = $2 AND freelancer_id = $3 AND status = 'pending' RETURNING *", ['accepted', req.params.id, req.userId]);
+    const result = await query("UPDATE applications SET status = $1 WHERE id = $2 AND freelancer_id = $3 AND status = 'offer' RETURNING *", ['accepted', req.params.id, req.userId]);
     if (!result.rows.length) {
       const exists = await query('SELECT status FROM applications WHERE id = $1 AND freelancer_id = $2', [req.params.id, req.userId]);
       if (!exists.rows.length) return res.status(404).json({ error: 'Offer not found' });
-      return res.status(400).json({ error: 'Offer is no longer pending' });
+      return res.status(400).json({ error: `Offer cannot be accepted (current status: ${exists.rows[0].status})` });
     }
     res.json({ application: result.rows[0], success: true });
   } catch (err) { serverError(err, res); }
@@ -3149,11 +3190,11 @@ app.post('/api/offers/:id/accept', auth, checkBlocked, async (req, res) => {
 app.post('/api/offers/:id/decline', auth, checkBlocked, async (req, res) => {
   if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Offer not found' });
   try {
-    const result = await query("UPDATE applications SET status = $1 WHERE id = $2 AND freelancer_id = $3 AND status = 'pending' RETURNING *", ['declined', req.params.id, req.userId]);
+    const result = await query("UPDATE applications SET status = $1 WHERE id = $2 AND freelancer_id = $3 AND status = 'offer' RETURNING *", ['declined', req.params.id, req.userId]);
     if (!result.rows.length) {
       const exists = await query('SELECT status FROM applications WHERE id = $1 AND freelancer_id = $2', [req.params.id, req.userId]);
       if (!exists.rows.length) return res.status(404).json({ error: 'Offer not found' });
-      return res.status(400).json({ error: 'Offer is no longer pending' });
+      return res.status(400).json({ error: `Offer cannot be declined (current status: ${exists.rows[0].status})` });
     }
     res.json({ application: result.rows[0], success: true });
   } catch (err) { serverError(err, res); }
