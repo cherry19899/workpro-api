@@ -752,6 +752,7 @@ app.get('/api/jobs/:id', softAuth, async (req, res) => {
 });
 
 app.patch('/api/jobs/:id', auth, checkBlocked, async (req, res) => {
+  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Job not found' });
   try {
     const jobResult = await query('SELECT * FROM jobs WHERE id = $1', [req.params.id]);
     if (!jobResult.rows.length) return res.status(404).json({ error: 'Job not found' });
@@ -776,6 +777,7 @@ app.patch('/api/jobs/:id', auth, checkBlocked, async (req, res) => {
 });
 
 app.get('/api/jobs/:id/check-applied', auth, async (req, res) => {
+  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Job not found' });
   try {
     const result = await query(
       "SELECT id, status FROM applications WHERE job_id = $1 AND freelancer_id = $2 AND status NOT IN ('withdrawn','rejected') LIMIT 1",
@@ -786,6 +788,7 @@ app.get('/api/jobs/:id/check-applied', auth, async (req, res) => {
 });
 
 app.post('/api/jobs/:id/apply', auth, checkBlocked, async (req, res) => {
+  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Job not found' });
   if (req.body.message && req.body.message.length > 2000) {
     return res.status(400).json({ error: 'Cover letter too long (max 2000 chars)' });
   }
@@ -860,6 +863,7 @@ app.post('/api/jobs/:id/apply', auth, checkBlocked, async (req, res) => {
 });
 
 app.post('/api/jobs/:id/hire', auth, checkBlocked, async (req, res) => {
+  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Job not found' });
   const { application_id, freelancer_id, payment_id } = req.body;
   if (!application_id || !freelancer_id || !payment_id) return res.status(400).json({ error: 'application_id, freelancer_id, and payment_id required' });
   try {
@@ -938,6 +942,7 @@ app.post('/api/jobs/:id/hire', auth, checkBlocked, async (req, res) => {
 });
 
 app.post('/api/jobs/:id/complete', auth, checkBlocked, async (req, res) => {
+  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Job not found' });
   try {
     const jobResult = await query('SELECT * FROM jobs WHERE id = $1', [req.params.id]);
     if (!jobResult.rows.length) return res.status(404).json({ error: 'Job not found' });
@@ -986,6 +991,7 @@ app.post('/api/jobs/:id/complete', auth, checkBlocked, async (req, res) => {
 });
 
 app.delete('/api/jobs/:id', auth, checkBlocked, async (req, res) => {
+  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Job not found' });
   try {
     const jobResult = await query('SELECT * FROM jobs WHERE id = $1', [req.params.id]);
     if (!jobResult.rows.length) return res.status(404).json({ error: 'Job not found' });
@@ -1028,6 +1034,7 @@ app.get('/api/applications', auth, async (req, res) => {
 });
 
 app.patch('/api/applications/:id', auth, checkBlocked, async (req, res) => {
+  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Application not found' });
   const { status } = req.body;
   const OWNER_ALLOWED = ['accepted', 'rejected'];
   if (!OWNER_ALLOWED.includes(status)) return res.status(400).json({ error: `Invalid status. Allowed: ${OWNER_ALLOWED.join(', ')}` });
@@ -1812,6 +1819,7 @@ app.get('/api/admin/verify', async (req, res) => {
 
 // GET /api/jobs/:id/applications — used by JobDetail.js
 app.get('/api/jobs/:id/applications', auth, async (req, res) => {
+  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Job not found' });
   const limit = Math.min(parseInt(req.query.limit) || 100, 500);
   const offset = parseInt(req.query.offset) || 0;
   try {
@@ -1848,6 +1856,7 @@ app.get('/api/escrows/me', auth, async (req, res) => {
   } catch (err) { serverError(err, res); }
 });
 app.post('/api/escrows/:id/release', auth, async (req, res) => {
+  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Escrow not found' });
   try {
     const result = await query('SELECT * FROM escrows WHERE id = $1', [req.params.id]);
     if (!result.rows.length) return res.status(404).json({ error: 'Escrow not found' });
@@ -1874,6 +1883,7 @@ app.post('/api/escrows/:id/release', auth, async (req, res) => {
   } catch (err) { serverError(err, res); }
 });
 app.post('/api/escrows/:id/cancel', auth, checkBlocked, async (req, res) => {
+  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Escrow not found' });
   try {
     const result = await query('SELECT * FROM escrows WHERE id = $1', [req.params.id]);
     if (!result.rows.length) return res.status(404).json({ error: 'Escrow not found' });
@@ -2103,6 +2113,7 @@ app.post('/api/applications/:id/withdraw', auth, async (req, res) => {
 
 // PUT /api/applications/:id/status — update application status (job owner only: accepted/rejected)
 app.put('/api/applications/:id/status', auth, checkBlocked, async (req, res) => {
+  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Application not found' });
   const { status } = req.body;
   const OWNER_ALLOWED = ['accepted', 'rejected'];
   if (!OWNER_ALLOWED.includes(status)) return res.status(400).json({ error: `Invalid status. Job owners may set: ${OWNER_ALLOWED.join(', ')}` });
@@ -2121,6 +2132,7 @@ app.put('/api/applications/:id/status', auth, checkBlocked, async (req, res) => 
 
 // PUT /api/jobs/:id — update job
 app.put('/api/jobs/:id', auth, checkBlocked, async (req, res) => {
+  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Job not found' });
   // status is NOT accepted here — use dedicated endpoints (hire/complete/patch) for status transitions
   const { title, description, category, budget, skills, deadline, images } = req.body;
   try {
@@ -2595,6 +2607,7 @@ app.delete('/api/notifications', auth, async (req, res) => {
 // POST /api/applications/:id/hire — initiate Pi escrow for hired freelancer
 // Called from frontend after client decides to hire (Pi payment flow)
 app.post('/api/applications/:id/hire', auth, checkBlocked, async (req, res) => {
+  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Application not found' });
   const { payment_id, txid, amount } = req.body;
   if (!payment_id) return res.status(400).json({ error: 'payment_id required — Pi payment must be completed before hiring' });
   try {
@@ -3043,6 +3056,7 @@ app.get('/api/offers/:id', auth, async (req, res) => {
 
 // POST /api/applications/:id/view — mark application as viewed
 app.post('/api/applications/:id/view', auth, async (req, res) => {
+  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Application not found' });
   try {
     // Only the job owner may mark an application as viewed
     const appRes = await query(
@@ -3125,6 +3139,7 @@ app.post('/api/escrows/:id/fund', auth, async (req, res) => {
 
 // POST /api/escrows/:id/dispute — open a dispute
 app.post('/api/escrows/:id/dispute', auth, checkBlocked, async (req, res) => {
+  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Escrow not found' });
   const { reason } = req.body;
   if (reason && reason.length > 1000) return res.status(400).json({ error: 'Reason too long (max 1000 chars)' });
   try {
