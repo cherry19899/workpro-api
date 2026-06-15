@@ -2103,25 +2103,37 @@ app.post('/api/applications/:id/accept', auth, checkBlocked, async (req, res) =>
       return res.status(400).json({ error: 'Cannot accept application — job is already completed or cancelled' });
     }
 
-    // Accept the application
-    const result = await query('UPDATE applications SET status = $1 WHERE id = $2 RETURNING *', ['accepted', req.params.id]);
-
-    // Create escrow record (pending state — will be funded after Pi payment)
+    // Accept the application + auto-reject others + create escrow — all in one transaction
     const freelancerId = app_.freelancer_id;
     const escrowAmount = app_.bid_amount || app_.budget || 0;
     let escrow = null;
-    if (freelancerId) {
-      const pgClientAccept = await getPool().connect();
-      try {
-        await pgClientAccept.query('BEGIN');
+    let acceptedApp = null;
+    const pgClientAccept = await getPool().connect();
+    try {
+      await pgClientAccept.query('BEGIN');
+      const acceptRes = await pgClientAccept.query('UPDATE applications SET status = $1 WHERE id = $2 RETURNING *', ['accepted', req.params.id]);
+      acceptedApp = acceptRes.rows[0];
+      // Auto-reject all other pending applications for this job and refund their connects
+      const jobApplyCost = await pgClientAccept.query('SELECT apply_cost FROM jobs WHERE id = $1', [app_.job_id]);
+      const refundCost = jobApplyCost.rows[0]?.apply_cost || 1;
+      const toReject = await pgClientAccept.query(
+        "SELECT freelancer_id FROM applications WHERE job_id = $1 AND id != $2 AND status = 'pending'",
+        [app_.job_id, req.params.id]
+      );
+      if (toReject.rows.length) {
+        await pgClientAccept.query("UPDATE applications SET status = 'rejected' WHERE job_id = $1 AND id != $2 AND status = 'pending'", [app_.job_id, req.params.id]);
+        for (const r of toReject.rows) {
+          await pgClientAccept.query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [refundCost, r.freelancer_id]);
+        }
+      }
+      if (freelancerId) {
         const existing = await pgClientAccept.query(
           "SELECT * FROM escrows WHERE job_id = $1 AND status = ANY($2) FOR UPDATE",
           [app_.job_id, ['pending', 'funded']]
         );
         if (!existing.rows.length) {
           const escrowResult = await pgClientAccept.query(
-            `INSERT INTO escrows (job_id, client_id, freelancer_id, amount, status)
-             VALUES ($1,$2,$3,$4,'pending') RETURNING *`,
+            `INSERT INTO escrows (job_id, client_id, freelancer_id, amount, status) VALUES ($1,$2,$3,$4,'pending') RETURNING *`,
             [app_.job_id, req.userId, freelancerId, escrowAmount]
           );
           escrow = escrowResult.rows[0];
@@ -2129,13 +2141,13 @@ app.post('/api/applications/:id/accept', auth, checkBlocked, async (req, res) =>
           escrow = existing.rows[0];
         }
         await pgClientAccept.query("UPDATE jobs SET status='in_progress', hired_freelancer_id=$1, hired_freelancer_name=$2, updated_at=NOW() WHERE id=$3", [freelancerId, app_.freelancer_name, app_.job_id]);
-        await pgClientAccept.query('COMMIT');
-      } catch (txErr) { await pgClientAccept.query('ROLLBACK').catch(() => {}); throw txErr; }
-      finally { pgClientAccept.release(); }
-    }
+      }
+      await pgClientAccept.query('COMMIT');
+    } catch (txErr) { await pgClientAccept.query('ROLLBACK').catch(() => {}); throw txErr; }
+    finally { pgClientAccept.release(); }
 
     await audit('application_accepted', { app_id: req.params.id, job_id: app_.job_id, freelancer_id: freelancerId });
-    res.json({ application: result.rows[0], escrow, success: true });
+    res.json({ application: acceptedApp, escrow, success: true });
   } catch (err) { serverError(err, res); }
 });
 
