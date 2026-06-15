@@ -278,6 +278,10 @@ app.put('/api/me', auth, checkBlocked, async (req, res) => {
     );
     const result = await query('SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, is_blocked, status, created_at, updated_at FROM users WHERE id = $1', [req.userId]);
     const u = result.rows[0];
+    if (!Array.isArray(u.skills)) {
+      u.skills = (typeof u.skills === 'string' && u.skills && u.skills !== '{}')
+        ? u.skills.split(',').map(s => s.trim()).filter(Boolean) : [];
+    }
     res.json({ ...u, uid: u.id, is_admin: u.role === 'admin' });
   } catch (err) { serverError(err, res); }
 });
@@ -458,6 +462,10 @@ app.get('/api/auth/me', auth, async (req, res) => {
     );
     if (!result.rows.length) return res.status(404).json({ error: 'User not found' });
     const u = result.rows[0];
+    if (!Array.isArray(u.skills)) {
+      u.skills = (typeof u.skills === 'string' && u.skills && u.skills !== '{}')
+        ? u.skills.split(',').map(s => s.trim()).filter(Boolean) : [];
+    }
     res.json({ ...u, uid: u.id, is_admin: u.role === 'admin' });
   } catch (err) {
     serverError(err, res);
@@ -475,7 +483,14 @@ app.get('/api/users', softAuth, async (req, res) => {
       [limit, offset]
     );
     const total = await query("SELECT COUNT(*) FROM users WHERE status != 'deleted'");
-    res.json({ users: result.rows, count: result.rowCount, total: parseInt(total.rows[0].count), limit, offset });
+    const users = result.rows.map(u => {
+      if (!Array.isArray(u.skills)) {
+        u.skills = (typeof u.skills === 'string' && u.skills && u.skills !== '{}')
+          ? u.skills.split(',').map(s => s.trim()).filter(Boolean) : [];
+      }
+      return u;
+    });
+    res.json({ users, count: users.length, total: parseInt(total.rows[0].count), limit, offset });
   } catch (err) {
     serverError(err, res);
   }
@@ -2221,6 +2236,10 @@ app.put('/api/users/me', auth, checkBlocked, async (req, res) => {
     await query(`UPDATE users SET ${fields.join(',')} WHERE id=$${i}`, vals);
     const result = await query('SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, is_blocked, status, created_at, updated_at FROM users WHERE id = $1', [req.userId]);
     const u = result.rows[0];
+    if (!Array.isArray(u.skills)) {
+      u.skills = (typeof u.skills === 'string' && u.skills && u.skills !== '{}')
+        ? u.skills.split(',').map(s => s.trim()).filter(Boolean) : [];
+    }
     res.json({ ...u, uid: u.id, is_admin: u.role === 'admin' });
   } catch (err) { serverError(err, res); }
 });
