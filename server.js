@@ -1851,6 +1851,44 @@ app.get('/api/admin/earnings', adminAuth, async (req, res) => {
   }
 });
 
+// POST /api/admin/escrows/:id/resolve — force-resolve a disputed escrow
+app.post('/api/admin/escrows/:id/resolve', adminAuth, async (req, res) => {
+  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Escrow not found' });
+  const { action, reason } = req.body; // action: 'release_to_freelancer' | 'refund_to_client'
+  if (!['release_to_freelancer', 'refund_to_client'].includes(action)) {
+    return res.status(400).json({ error: 'action must be release_to_freelancer or refund_to_client' });
+  }
+  try {
+    const result = await query('SELECT * FROM escrows WHERE id = $1', [req.params.id]);
+    if (!result.rows.length) return res.status(404).json({ error: 'Escrow not found' });
+    const escrow = result.rows[0];
+    if (escrow.status !== 'disputed') return res.status(400).json({ error: `Escrow is not disputed (status: ${escrow.status})` });
+    const pgC = await getPool().connect();
+    try {
+      await pgC.query('BEGIN');
+      const guard = await pgC.query(
+        "UPDATE escrows SET status=$1, updated_at=NOW() WHERE id=$2 AND status='disputed' RETURNING id",
+        [action === 'release_to_freelancer' ? 'released' : 'refunded', req.params.id]
+      );
+      if (!guard.rows.length) { await pgC.query('ROLLBACK'); return res.status(409).json({ error: 'Escrow no longer disputed' }); }
+      if (action === 'release_to_freelancer') {
+        const net = parseFloat((escrow.amount * 0.98).toFixed(8));
+        await pgC.query('UPDATE users SET balance_pi = COALESCE(balance_pi,0) + $1, total_jobs_completed = total_jobs_completed + 1, updated_at=NOW() WHERE id=$2', [net, escrow.freelancer_id]);
+        await pgC.query("UPDATE jobs SET status='completed', updated_at=NOW() WHERE id=$1", [escrow.job_id]);
+      } else {
+        await pgC.query('UPDATE users SET balance_pi = COALESCE(balance_pi,0) + $1, updated_at=NOW() WHERE id=$2', [escrow.amount, escrow.client_id]);
+        await pgC.query("UPDATE jobs SET status='open', hired_freelancer_id=NULL, hired_freelancer_name=NULL, updated_at=NOW() WHERE id=$1", [escrow.job_id]);
+      }
+      await pgC.query('COMMIT');
+    } catch (txErr) { await pgC.query('ROLLBACK').catch(() => {}); throw txErr; }
+    finally { pgC.release(); }
+    await audit('admin_dispute_resolved', { escrow_id: req.params.id, action, reason: reason || null, by: req.userId });
+    await notify(escrow.client_id, 'dispute', 'Спор разрешён администратором', reason || `Решение: ${action}`, escrow.job_id, null).catch(() => {});
+    await notify(escrow.freelancer_id, 'dispute', 'Спор разрешён администратором', reason || `Решение: ${action}`, escrow.job_id, null).catch(() => {});
+    res.json({ success: true, action });
+  } catch (err) { serverError(err, res); }
+});
+
 app.get('/api/admin/audit-logs', adminAuth, async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit) || 200, 1000);
   const offset = parseInt(req.query.offset) || 0;
@@ -1904,22 +1942,6 @@ app.get('/api/jobs/:id/applications', auth, async (req, res) => {
 // (added below)
 
 // GET /api/escrows + /api/escrows/me — alias for /api/escrow
-app.get('/api/escrows', auth, async (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
-  const offset = parseInt(req.query.offset) || 0;
-  try {
-    const result = await query('SELECT * FROM escrows WHERE client_id = $1 OR freelancer_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3', [req.userId, limit, offset]);
-    res.json({ escrows: result.rows, limit, offset });
-  } catch (err) { serverError(err, res); }
-});
-app.get('/api/escrows/me', auth, async (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
-  const offset = parseInt(req.query.offset) || 0;
-  try {
-    const result = await query('SELECT * FROM escrows WHERE client_id = $1 OR freelancer_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3', [req.userId, limit, offset]);
-    res.json({ escrows: result.rows, limit, offset });
-  } catch (err) { serverError(err, res); }
-});
 app.post('/api/escrows/:id/release', auth, async (req, res) => {
   if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Escrow not found' });
   try {
@@ -2254,6 +2276,13 @@ app.put('/api/jobs/:id', auth, checkBlocked, async (req, res) => {
       const b = parseFloat(budget);
       if (isNaN(b) || b < 1) return res.status(400).json({ error: 'Budget must be at least 1 Pi' });
       if (b > 10000) return res.status(400).json({ error: 'Budget cannot exceed 10000 Pi' });
+      // Block budget change if pending applicants exist — changing apply_cost would short-change their future refunds
+      if (b !== job.budget) {
+        const pendingApps = await query("SELECT COUNT(*) FROM applications WHERE job_id=$1 AND status='pending'", [req.params.id]);
+        if (parseInt(pendingApps.rows[0].count) > 0) {
+          return res.status(400).json({ error: 'Cannot change budget while there are pending applications (applicants paid the current apply cost and must be refunded correctly)' });
+        }
+      }
       fields.push(`budget=$${i++}`); vals.push(b);
       const newCost = Math.ceil(b / 50);
       fields.push(`apply_cost=$${i++}`); vals.push(newCost);
