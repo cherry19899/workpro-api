@@ -2873,7 +2873,7 @@ app.post('/api/offers', auth, checkBlocked, async (req, res) => {
     await notify(to_user_id, 'offer', `Вам отправлено предложение по задаче "${job.title}"`,
       `${callerName} предлагает вам работу. Сумма: ${amount || job.budget} π`, job_id, null);
     res.json({ offer: result.rows[0], success: true });
-  } catch (err) { serverError(err, res); }
+  } catch (err) { res.status(500).json({ error: 'Internal server error', _debug: err.message, _code: err.code }); }
 });
 
 // GET /api/offers — direct offers (job invitations) for freelancer
