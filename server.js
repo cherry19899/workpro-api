@@ -2239,24 +2239,31 @@ app.put('/api/applications/:id/status', auth, checkBlocked, async (req, res) => 
     if (!appResult.rows.length) return res.status(404).json({ error: 'Application not found' });
     if (appResult.rows[0].posted_by !== req.userId) return res.status(403).json({ error: 'Forbidden' });
     const app_ = appResult.rows[0];
-    if (status === 'rejected' && app_.status === 'pending') {
-      await query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [app_.apply_cost || 1, app_.freelancer_id]);
-    }
-    const result = await query('UPDATE applications SET status = $1 WHERE id = $2 RETURNING *', [status, req.params.id]);
-    // When accepting, auto-reject other pending applications and refund connects
-    if (status === 'accepted') {
-      const toRejectStatus = await query(
-        "SELECT freelancer_id FROM applications WHERE job_id = $1 AND id != $2 AND status = 'pending'",
-        [app_.job_id, req.params.id]
-      );
-      if (toRejectStatus.rows.length) {
-        await query("UPDATE applications SET status = 'rejected' WHERE job_id = $1 AND id != $2 AND status = 'pending'", [app_.job_id, req.params.id]);
-        for (const r of toRejectStatus.rows) {
-          await query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [app_.apply_cost || 1, r.freelancer_id]).catch(() => {});
+    let updatedApp;
+    const pgStatusClient = await getPool().connect();
+    try {
+      await pgStatusClient.query('BEGIN');
+      if (status === 'rejected' && app_.status === 'pending') {
+        await pgStatusClient.query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [app_.apply_cost || 1, app_.freelancer_id]);
+      }
+      const result = await pgStatusClient.query('UPDATE applications SET status = $1 WHERE id = $2 RETURNING *', [status, req.params.id]);
+      updatedApp = result.rows[0];
+      if (status === 'accepted') {
+        const toRejectStatus = await pgStatusClient.query(
+          "SELECT freelancer_id FROM applications WHERE job_id = $1 AND id != $2 AND status = 'pending'",
+          [app_.job_id, req.params.id]
+        );
+        if (toRejectStatus.rows.length) {
+          await pgStatusClient.query("UPDATE applications SET status = 'rejected' WHERE job_id = $1 AND id != $2 AND status = 'pending'", [app_.job_id, req.params.id]);
+          for (const r of toRejectStatus.rows) {
+            await pgStatusClient.query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [app_.apply_cost || 1, r.freelancer_id]);
+          }
         }
       }
-    }
-    res.json({ application: result.rows[0], success: true });
+      await pgStatusClient.query('COMMIT');
+    } catch (txErr) { await pgStatusClient.query('ROLLBACK').catch(() => {}); throw txErr; }
+    finally { pgStatusClient.release(); }
+    res.json({ application: updatedApp, success: true });
   } catch (err) { serverError(err, res); }
 });
 
@@ -3272,20 +3279,26 @@ app.post('/api/escrows/:id/fund', auth, async (req, res) => {
   const { payment_id, txid } = req.body;
   if (!payment_id) return res.status(400).json({ error: 'payment_id required — provide the Pi payment identifier' });
   try {
-    const result = await query('SELECT * FROM escrows WHERE id = $1', [req.params.id]);
-    if (!result.rows.length) return res.status(404).json({ error: 'Escrow not found' });
-    const escrow = result.rows[0];
-    if (escrow.client_id !== req.userId) return res.status(403).json({ error: 'Not your escrow' });
-    if (escrow.status !== 'pending') return res.status(400).json({ error: 'Escrow already funded or settled' });
-    // Require that the payment record exists in our DB (created by Pi payment webhook)
+    const preCheck = await query('SELECT * FROM escrows WHERE id = $1', [req.params.id]);
+    if (!preCheck.rows.length) return res.status(404).json({ error: 'Escrow not found' });
+    if (preCheck.rows[0].client_id !== req.userId) return res.status(403).json({ error: 'Not your escrow' });
     const pmtCheck = await query('SELECT id, amount FROM payments WHERE payment_id = $1 AND status = $2 LIMIT 1', [payment_id, 'completed']);
     if (!pmtCheck.rows.length) return res.status(402).json({ error: 'Payment not verified — complete Pi payment first' });
-    // Prevent reusing a Pi payment that already funds a different escrow
-    const paymentUsedFund = await query('SELECT id FROM escrows WHERE payment_id = $1 AND id != $2 LIMIT 1', [payment_id, req.params.id]);
-    if (paymentUsedFund.rows.length) return res.status(400).json({ error: 'Payment already used for another escrow' });
-    // Update status, payment_id, and amount from Pi-verified payment record
-    await query('UPDATE escrows SET status = $1, payment_id = $2, amount = COALESCE($3, amount), updated_at = NOW() WHERE id = $4',
-      ['funded', payment_id, pmtCheck.rows[0].amount, req.params.id]);
+    let escrow;
+    const pgFund = await getPool().connect();
+    try {
+      await pgFund.query('BEGIN');
+      const locked = await pgFund.query('SELECT * FROM escrows WHERE id = $1 FOR UPDATE', [req.params.id]);
+      if (!locked.rows.length) { await pgFund.query('ROLLBACK'); return res.status(404).json({ error: 'Escrow not found' }); }
+      escrow = locked.rows[0];
+      if (escrow.status !== 'pending') { await pgFund.query('ROLLBACK'); return res.status(400).json({ error: 'Escrow already funded or settled' }); }
+      const paymentUsedFund = await pgFund.query('SELECT id FROM escrows WHERE payment_id = $1 AND id != $2 LIMIT 1', [payment_id, req.params.id]);
+      if (paymentUsedFund.rows.length) { await pgFund.query('ROLLBACK'); return res.status(400).json({ error: 'Payment already used for another escrow' }); }
+      await pgFund.query('UPDATE escrows SET status = $1, payment_id = $2, amount = COALESCE($3, amount), updated_at = NOW() WHERE id = $4',
+        ['funded', payment_id, pmtCheck.rows[0].amount, req.params.id]);
+      await pgFund.query('COMMIT');
+    } catch (txErr) { await pgFund.query('ROLLBACK').catch(() => {}); throw txErr; }
+    finally { pgFund.release(); }
     await audit('escrow_funded', { escrow_id: req.params.id, payment_id, txid });
     res.json({ escrow: { ...escrow, status: 'funded' }, success: true });
   } catch (err) { serverError(err, res); }
@@ -3303,8 +3316,8 @@ app.post('/api/escrows/:id/dispute', auth, checkBlocked, async (req, res) => {
     if (escrow.client_id !== req.userId && escrow.freelancer_id !== req.userId) {
       return res.status(403).json({ error: 'Not your escrow' });
     }
-    if (!['funded', 'pending'].includes(escrow.status)) {
-      return res.status(400).json({ error: `Cannot dispute an escrow with status '${escrow.status}'` });
+    if (escrow.status !== 'funded') {
+      return res.status(400).json({ error: `Can only dispute a funded escrow (current status: '${escrow.status}')` });
     }
     await query('UPDATE escrows SET status = $1, updated_at = NOW() WHERE id = $2', ['disputed', req.params.id]);
     await audit('escrow_disputed', { escrow_id: req.params.id, reason, user_id: req.userId });
