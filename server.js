@@ -288,6 +288,10 @@ app.get('/api/me', auth, async (req, res) => {
     const result = await query('SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, is_blocked, status, created_at, updated_at FROM users WHERE id = $1', [req.userId]);
     if (!result.rows.length) return res.status(404).json({ error: 'User not found' });
     const u = result.rows[0];
+    if (!Array.isArray(u.skills)) {
+      u.skills = (typeof u.skills === 'string' && u.skills && u.skills !== '{}')
+        ? u.skills.split(',').map(s => s.trim()).filter(Boolean) : [];
+    }
     const levelInfo = computeLevel(u.total_jobs_completed, u.rating);
     res.json({ ...u, uid: u.id, is_admin: u.role === 'admin', level: levelInfo });
   } catch (err) { serverError(err, res); }
