@@ -829,6 +829,8 @@ app.patch('/api/jobs/:id', auth, checkBlocked, async (req, res) => {
     if (job.status !== 'in_progress') return res.status(400).json({ error: 'Job is not in progress' });
     // BUG #55 fix: add status guard in UPDATE to close TOCTOU window between read and write
     const result = await query("UPDATE jobs SET status = $1, updated_at = NOW() WHERE id = $2 AND status = 'in_progress' RETURNING *", [status, req.params.id]);
+    // BUG #67 fix: if another request changed status between our read and write, 0 rows are returned
+    if (!result.rows.length) return res.status(409).json({ error: 'Job status changed concurrently — try again' });
     // Notify client when freelancer submits work for review
     if (status === 'submitted' && isHiredFreelancer) {
       await notify(job.posted_by, 'submitted', `Фрилансер сдал работу по задаче "${job.title}"`,
@@ -864,7 +866,8 @@ app.post('/api/jobs/:id/apply', auth, checkBlocked, async (req, res) => {
     if (job.status !== 'open') return res.status(400).json({ error: 'Job is not open' });
 
     const existingApp = await query('SELECT id, status FROM applications WHERE job_id = $1 AND freelancer_id = $2', [req.params.id, req.userId]);
-    if (existingApp.rows.length && !['withdrawn', 'rejected'].includes(existingApp.rows[0].status)) {
+    // BUG #68 fix: 'offer' and 'declined' must also be reactivatable (same as check-applied exclusion list)
+    if (existingApp.rows.length && !['withdrawn', 'rejected', 'offer', 'declined'].includes(existingApp.rows[0].status)) {
       return res.status(409).json({ error: 'Already applied', alreadyApplied: true });
     }
 
@@ -890,7 +893,7 @@ app.post('/api/jobs/:id/apply', auth, checkBlocked, async (req, res) => {
       }
       // Check for existing withdrawn/rejected app to reactivate
       const prevApp = await pgClient.query(
-        `SELECT id FROM applications WHERE job_id=$1 AND freelancer_id=$2 AND status IN ('withdrawn','rejected') LIMIT 1`,
+        `SELECT id FROM applications WHERE job_id=$1 AND freelancer_id=$2 AND status IN ('withdrawn','rejected','offer','declined') LIMIT 1`,
         [req.params.id, req.userId]
       );
       let isNewApp = false;
@@ -1669,6 +1672,9 @@ app.post('/api/ratings', auth, checkBlocked, async (req, res) => {
         const isParticipant = job.posted_by === req.userId || job.hired_freelancer_id === req.userId;
         if (!isParticipant) return res.status(403).json({ error: 'You were not a participant in this job' });
         if (job.status !== 'completed') return res.status(400).json({ error: 'Job must be completed before rating' });
+        // BUG #66 fix: to_user_id must be the OTHER participant, not an arbitrary user
+        const expectedTarget = job.posted_by === req.userId ? job.hired_freelancer_id : job.posted_by;
+        if (to_user_id !== expectedTarget) return res.status(403).json({ error: 'You can only rate the other participant of this job' });
       }
     } else {
       // No job_id provided — verify they share at least one completed job
@@ -1770,17 +1776,18 @@ app.get('/api/admin/users', adminAuth, async (req, res) => {
     if (search.length > 200) return res.status(400).json({ error: 'Search query too long (max 200 chars)' });
     const safeFields = 'id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, is_blocked, status, created_at, updated_at';
     let sql, params = [];
+    // BUG H fix: DISTINCT ON was hiding duplicate-username accounts from admin panel
     if (search) {
-      sql = `SELECT ${safeFields} FROM (SELECT DISTINCT ON (LOWER(username)) ${safeFields} FROM users WHERE username ILIKE $1 OR id ILIKE $1 ORDER BY LOWER(username), CASE role WHEN 'admin' THEN 0 ELSE 1 END, updated_at DESC) sub ORDER BY created_at DESC LIMIT $2 OFFSET $3`;
+      sql = `SELECT ${safeFields} FROM users WHERE username ILIKE $1 OR id ILIKE $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3`;
       params = [`%${search}%`, limit, offset];
     } else {
-      sql = `SELECT ${safeFields} FROM (SELECT DISTINCT ON (LOWER(username)) ${safeFields} FROM users ORDER BY LOWER(username), CASE role WHEN 'admin' THEN 0 ELSE 1 END, updated_at DESC) sub ORDER BY created_at DESC LIMIT $1 OFFSET $2`;
+      sql = `SELECT ${safeFields} FROM users ORDER BY created_at DESC LIMIT $1 OFFSET $2`;
       params = [limit, offset];
     }
     const result = await query(sql, params);
     const totalSql = search
-      ? 'SELECT COUNT(DISTINCT LOWER(username)) FROM users WHERE username ILIKE $1 OR id ILIKE $1'
-      : 'SELECT COUNT(DISTINCT LOWER(username)) FROM users';
+      ? 'SELECT COUNT(*) FROM users WHERE username ILIKE $1 OR id ILIKE $1'
+      : 'SELECT COUNT(*) FROM users';
     const total = await query(totalSql, search ? [`%${search}%`] : []);
     res.json({ users: result.rows, count: result.rows.length, total: parseInt(total.rows[0].count), limit, offset });
   } catch (err) {
@@ -2170,7 +2177,8 @@ app.post('/api/applications', auth, checkBlocked, async (req, res) => {
     if (job.posted_by === req.userId) return res.status(400).json({ error: 'Cannot apply to own job' });
     if (job.status !== 'open') return res.status(400).json({ error: 'Job is not open' });
     const existing = await query('SELECT id, status FROM applications WHERE job_id = $1 AND freelancer_id = $2', [job_id, req.userId]);
-    if (existing.rows.length && !['withdrawn', 'rejected'].includes(existing.rows[0].status)) {
+    // BUG #68 fix: 'offer' and 'declined' are also reactivatable (consistent with check-applied)
+    if (existing.rows.length && !['withdrawn', 'rejected', 'offer', 'declined'].includes(existing.rows[0].status)) {
       return res.status(409).json({ error: 'Already applied', alreadyApplied: true });
     }
     const userResult = await query('SELECT id, username, balance_connects, is_blocked FROM users WHERE id = $1', [req.userId]);
@@ -2187,7 +2195,7 @@ app.post('/api/applications', auth, checkBlocked, async (req, res) => {
       );
       if (!deductResult2.rows.length) { await pgClient.query('ROLLBACK'); return res.status(400).json({ error: 'Not enough connects', required: cost }); }
       const existingForAlias = await pgClient.query(
-        `SELECT id FROM applications WHERE job_id=$1 AND freelancer_id=$2 AND status IN ('withdrawn','rejected') LIMIT 1`,
+        `SELECT id FROM applications WHERE job_id=$1 AND freelancer_id=$2 AND status IN ('withdrawn','rejected','offer','declined') LIMIT 1`,
         [job_id, req.userId]
       );
       const isNewAlias = !existingForAlias.rows.length;
@@ -2735,6 +2743,9 @@ app.post('/api/reviews', auth, checkBlocked, async (req, res) => {
         const isParticipant = job.posted_by === req.userId || job.hired_freelancer_id === req.userId;
         if (!isParticipant) return res.status(403).json({ error: 'You were not a participant in this job' });
         if (job.status !== 'completed') return res.status(400).json({ error: 'Job must be completed before rating' });
+        // BUG #66 fix: to_user_id must be the OTHER participant, not an arbitrary user
+        const expectedTargetR = job.posted_by === req.userId ? job.hired_freelancer_id : job.posted_by;
+        if (toId !== expectedTargetR) return res.status(403).json({ error: 'You can only rate the other participant of this job' });
       }
     } else {
       const sharedJob = await query(
