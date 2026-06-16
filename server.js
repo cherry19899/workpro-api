@@ -1418,66 +1418,55 @@ app.post('/api/escrow/:id/release', auth, checkBlocked, async (req, res) => {
 });
 
 // ─── Pi Payments ──────────────────────────────────────────────
-app.post('/api/payments/:paymentId/approve', auth, async (req, res) => {
-  const { paymentId } = req.params;
-  const { metadata } = req.body;
+// Shared handlers called by both /:paymentId/approve|complete (RESTful)
+// and /approve|complete (legacy flat URL) so logic lives in one place.
+
+async function handlePaymentApprove(paymentId, metadata, userId, res) {
   try {
-    // Verify ownership if payment already in DB
     const ownerCheck = await query('SELECT user_id FROM payments WHERE id = $1', [paymentId]).catch(() => ({ rows: [] }));
-    if (ownerCheck.rows.length && ownerCheck.rows[0].user_id && ownerCheck.rows[0].user_id !== req.userId) {
+    if (ownerCheck.rows.length && ownerCheck.rows[0].user_id && ownerCheck.rows[0].user_id !== userId) {
       return res.status(403).json({ error: 'Payment does not belong to you' });
     }
     let piPayment = { amount: 0 };
-    // When PI_API_KEY is configured, verification with Pi Platform is mandatory
     if (PI_API_KEY) {
       try {
         piPayment = await piApprovePayment(paymentId);
       } catch (piErr) {
         console.error('[Payment] Pi approval failed:', piErr.message);
-        return res.status(502).json({ error: 'Pi payment verification failed. Try again.' });
+        return res.status(502).json({ error: 'Pi payment verification failed' });
       }
     }
-
-    // Store in DB (UPSERT — idempotent)
+    // UPSERT — also updates Pi-verified amount on conflict (flat-route improvement)
     await query(
       `INSERT INTO payments (id, user_id, type, amount, metadata, status, payment_id)
        VALUES ($1,$2,$3,$4,$5,'approved',$1)
-       ON CONFLICT (id) DO UPDATE SET status='approved', updated_at=NOW()`,
-      [paymentId, req.userId, metadata?.type || 'payment', piPayment.amount || 0, JSON.stringify(metadata || {})]
+       ON CONFLICT (id) DO UPDATE SET status='approved', amount=EXCLUDED.amount, updated_at=NOW()`,
+      [paymentId, userId, metadata?.type || 'payment', piPayment.amount || 0, JSON.stringify(metadata || {})]
     ).catch(() => {});
-
-    await audit('payment_approved', { payment_id: paymentId, user_id: req.userId, amount: piPayment.amount });
+    await audit('payment_approved', { payment_id: paymentId, user_id: userId, amount: piPayment.amount });
     res.json({ success: true, payment: piPayment });
   } catch (err) {
     console.error('[Payment] Approve error:', err.message);
     serverError(err, res);
   }
-});
+}
 
-app.post('/api/payments/:paymentId/complete', auth, async (req, res) => {
-  const { paymentId } = req.params;
-  const { txid, metadata } = req.body;
+async function handlePaymentComplete(paymentId, txid, metadata, userId, res) {
   if (!txid) return res.status(400).json({ error: 'txid required' });
+  if (!PI_API_KEY) return res.status(503).json({ error: 'Payments are not configured on the server' });
   try {
-    // Verify ownership if payment already in DB
-    const ownerCheck2 = await query('SELECT user_id FROM payments WHERE id = $1', [paymentId]).catch(() => ({ rows: [] }));
-    if (ownerCheck2.rows.length && ownerCheck2.rows[0].user_id && ownerCheck2.rows[0].user_id !== req.userId) {
+    const ownerCheck = await query('SELECT user_id FROM payments WHERE id = $1', [paymentId]).catch(() => ({ rows: [] }));
+    if (ownerCheck.rows.length && ownerCheck.rows[0].user_id && ownerCheck.rows[0].user_id !== userId) {
       return res.status(403).json({ error: 'Payment does not belong to you' });
     }
     let piPayment = { amount: 0 };
-    // When PI_API_KEY is configured, completion with Pi Platform is mandatory
-    if (PI_API_KEY) {
-      try {
-        piPayment = await piCompletePayment(paymentId, txid);
-      } catch (piErr) {
-        console.error('[Payment] Pi complete failed:', piErr.message);
-        return res.status(502).json({ error: 'Pi payment completion failed. Try again.' });
-      }
+    try {
+      piPayment = await piCompletePayment(paymentId, txid);
+    } catch (piErr) {
+      console.error('[Payment] Pi complete failed:', piErr.message);
+      return res.status(502).json({ error: 'Pi payment completion failed. Try again.' });
     }
-
-    // Atomic: mark completed + apply business logic in one transaction
     const pgPmtC = await getPool().connect();
-    let markDone;
     try {
       await pgPmtC.query('BEGIN');
       const markRes = await pgPmtC.query(
@@ -1488,9 +1477,9 @@ app.post('/api/payments/:paymentId/complete', auth, async (req, res) => {
         await pgPmtC.query('ROLLBACK');
         return res.json({ success: true, payment: piPayment });
       }
-      markDone = markRes.rows[0];
+      const markDone = markRes.rows[0];
       const meta = markDone.metadata || {};
-      const paymentOwner = markDone.user_id || req.userId;
+      const paymentOwner = markDone.user_id || userId;
       if (meta.type === 'connects') {
         const piAmountPaid = parseFloat(piPayment.amount || markDone.amount || 0);
         const amount = Math.floor(piAmountPaid * 10);
@@ -1505,8 +1494,8 @@ app.post('/api/payments/:paymentId/complete', auth, async (req, res) => {
           ]);
           if (jobCheck.rows.length && freelancerCheck.rows.length) {
             await pgPmtC.query(
-              'INSERT INTO escrows (job_id, client_id, freelancer_id, amount, payment_id, status) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (payment_id) DO NOTHING',
-              [meta.job_id, req.userId, meta.freelancer_id, parseFloat(piPayment.amount || markDone.amount || 0), paymentId, 'funded']
+              'INSERT INTO escrows (job_id, client_id, freelancer_id, amount, payment_id, status) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (payment_id) DO NOTHING',
+              [meta.job_id, paymentOwner, meta.freelancer_id, parseFloat(piPayment.amount || markDone.amount || 0), paymentId, 'funded']
             );
           }
         }
@@ -1514,13 +1503,20 @@ app.post('/api/payments/:paymentId/complete', auth, async (req, res) => {
       await pgPmtC.query('COMMIT');
     } catch (txErr) { await pgPmtC.query('ROLLBACK').catch(() => {}); throw txErr; }
     finally { pgPmtC.release(); }
-
-    await audit('payment_completed', { payment_id: paymentId, txid, user_id: req.userId });
+    await audit('payment_completed', { payment_id: paymentId, txid, user_id: userId });
     res.json({ success: true, payment: piPayment });
   } catch (err) {
     console.error('[Payment] Complete error:', err.message);
     serverError(err, res);
   }
+}
+
+app.post('/api/payments/:paymentId/approve', auth, async (req, res) => {
+  await handlePaymentApprove(req.params.paymentId, req.body.metadata, req.userId, res);
+});
+
+app.post('/api/payments/:paymentId/complete', auth, async (req, res) => {
+  await handlePaymentComplete(req.params.paymentId, req.body.txid, req.body.metadata, req.userId, res);
 });
 
 app.get('/api/payments', auth, async (req, res) => {
@@ -3100,107 +3096,17 @@ app.post('/api/applications/:id/hire', auth, checkBlocked, async (req, res) => {
   } catch (err) { serverError(err, res); }
 });
 
-// POST /api/payments/approve — Pi payment server-side approval
+// Legacy flat-URL aliases — delegate to shared handlers above
 app.post('/api/payments/approve', auth, async (req, res) => {
   const { payment_id, metadata } = req.body;
   if (!payment_id) return res.status(400).json({ error: 'payment_id required' });
-  try {
-    // Verify ownership if payment already exists in DB
-    const ownerCheck = await query('SELECT user_id FROM payments WHERE id = $1', [payment_id]).catch(() => ({ rows: [] }));
-    if (ownerCheck.rows.length && ownerCheck.rows[0].user_id && ownerCheck.rows[0].user_id !== req.userId) {
-      return res.status(403).json({ error: 'Payment does not belong to you' });
-    }
-    // Pi verification is mandatory when configured. piApprovePayment throws on a
-    // non-OK Pi response (e.g. payment_not_found), so a forged payment id can never
-    // be recorded as 'approved' — which would otherwise let it be redeemed for connects.
-    let approveData = { amount: 0 };
-    if (PI_API_KEY) {
-      try {
-        approveData = await piApprovePayment(payment_id);
-      } catch (piErr) {
-        console.error('[Payment] approve failed:', piErr.message);
-        return res.status(502).json({ error: 'Pi payment verification failed' });
-      }
-    }
-    // Record in DB using id as primary key (UPSERT). Store the Pi-verified amount.
-    await query(
-      `INSERT INTO payments (id, user_id, amount, status, metadata, payment_id)
-       VALUES ($1,$2,$3,'approved',$4,$5)
-       ON CONFLICT (id) DO UPDATE SET status='approved', amount=EXCLUDED.amount, updated_at=NOW()`,
-      [payment_id, req.userId, approveData.amount || 0, JSON.stringify(metadata || {}), payment_id]
-    ).catch(() => {});
-    res.json({ success: true, payment: approveData });
-  } catch (err) { serverError(err, res); }
+  await handlePaymentApprove(payment_id, metadata, req.userId, res);
 });
 
-// POST /api/payments/complete — Pi payment server-side completion
 app.post('/api/payments/complete', auth, async (req, res) => {
   const { payment_id, txid, metadata } = req.body;
-  if (!payment_id || !txid) return res.status(400).json({ error: 'payment_id and txid required' });
-  try {
-    // Verify payment ownership (allow if payment not in DB yet — first completion)
-    const ownerCheck = await query('SELECT user_id FROM payments WHERE id = $1', [payment_id]).catch(() => ({ rows: [] }));
-    if (ownerCheck.rows.length && ownerCheck.rows[0].user_id && ownerCheck.rows[0].user_id !== req.userId) {
-      return res.status(403).json({ error: 'Payment does not belong to you' });
-    }
-    // BUG #40 fix: guard against undefined PI_API_KEY (same pattern as /api/payments/:paymentId/complete)
-    if (!PI_API_KEY) {
-      return res.status(503).json({ error: 'Payments are not configured on the server' });
-    }
-    const completeRes = await fetch(`https://api.minepi.com/v2/payments/${payment_id}/complete`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Key ${PI_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ txid })
-    });
-    const completeData = await completeRes.json();
-    if (!completeRes.ok) {
-      console.error('[Payment/complete] Pi completion failed:', completeData);
-      return res.status(502).json({ error: 'Pi payment completion failed' });
-    }
-    // Atomic: mark payment completed + apply side-effect in one transaction
-    const pgComplete = await getPool().connect();
-    let markDoneRow = null;
-    try {
-      await pgComplete.query('BEGIN');
-      const markDone = await pgComplete.query(
-        "UPDATE payments SET status='completed', txid=$1, updated_at=NOW() WHERE id=$2 AND status='approved' RETURNING *",
-        [txid, payment_id]
-      );
-      if (markDone.rows.length) {
-        markDoneRow = markDone.rows[0];
-        const meta = markDoneRow.metadata || {};
-        const paymentOwner = markDoneRow.user_id || req.userId;
-        if (meta.type === 'connects') {
-          const piAmountPaid = parseFloat(completeData.amount || markDoneRow.amount || 0);
-          const connectsAmt = Math.floor(piAmountPaid * 10);
-          if (connectsAmt > 0) {
-            await pgComplete.query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [connectsAmt, paymentOwner]);
-          }
-        } else if (meta.type === 'escrow' && meta.job_id && meta.freelancer_id) {
-          const existingEsc = await pgComplete.query('SELECT id FROM escrows WHERE payment_id = $1 LIMIT 1', [payment_id]);
-          if (!existingEsc.rows.length) {
-            const [jobCheck, freelancerCheck] = await Promise.all([
-              pgComplete.query('SELECT id FROM jobs WHERE id = $1 LIMIT 1', [meta.job_id]),
-              pgComplete.query('SELECT id FROM users WHERE id = $1 LIMIT 1', [meta.freelancer_id]),
-            ]);
-            if (jobCheck.rows.length && freelancerCheck.rows.length) {
-              const piVerifiedAmt = parseFloat(completeData.amount || markDoneRow.amount || 0);
-              await pgComplete.query(
-                'INSERT INTO escrows (job_id, client_id, freelancer_id, amount, payment_id, status) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (payment_id) DO NOTHING',
-                [meta.job_id, paymentOwner, meta.freelancer_id, piVerifiedAmt, payment_id, 'funded']
-              );
-            }
-          }
-        }
-      }
-      await pgComplete.query('COMMIT');
-    } catch (txErr) { await pgComplete.query('ROLLBACK').catch(() => {}); throw txErr; }
-    finally { pgComplete.release(); }
-    res.json({ success: true, payment: completeData });
-  } catch (err) { serverError(err, res); }
+  if (!payment_id) return res.status(400).json({ error: 'payment_id required' });
+  await handlePaymentComplete(payment_id, txid, metadata, req.userId, res);
 });
 
 // POST /api/connects/buy — credit connects ONLY after a Pi-verified payment.
