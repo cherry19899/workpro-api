@@ -166,6 +166,21 @@ async function ensureNotificationsTable() {
     )`);
     await query(`ALTER TABLE ratings ADD COLUMN IF NOT EXISTS reply TEXT`);
     await query(`ALTER TABLE ratings ADD COLUMN IF NOT EXISTS replied_at TIMESTAMPTZ`);
+    // ─── Performance indexes ───────────────────────────────────────────────
+    await query(`CREATE INDEX IF NOT EXISTS idx_jobs_posted_by ON jobs(posted_by)`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_applications_job_id ON applications(job_id)`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_applications_freelancer_id ON applications(freelancer_id)`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_applications_status ON applications(status)`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_escrows_client_id ON escrows(client_id)`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_escrows_freelancer_id ON escrows(freelancer_id)`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_escrows_job_id ON escrows(job_id)`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_chat_messages_room_id ON chat_messages(room_id)`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_payments_user_id ON payments(user_id)`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_ratings_to_user_id ON ratings(to_user_id)`);
+    // ─── Missing columns ───────────────────────────────────────────────────
+    await query(`ALTER TABLE applications ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
+    await query(`ALTER TABLE offers ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`).catch(() => {});
   } catch (_) {}
 }
 

@@ -400,9 +400,9 @@ router.post('/api/jobs/:id/hire', auth, checkBlocked, async (req, res) => {
         await pgClientJ.query('ROLLBACK');
         return res.status(400).json({ error: 'Payment already used for another escrow' });
       }
-      await pgClientJ.query('UPDATE applications SET status = $1 WHERE id = $2', ['accepted', application_id]);
+      await pgClientJ.query('UPDATE applications SET status = $1, updated_at = NOW() WHERE id = $2', ['accepted', application_id]);
       const toRejectJ = await pgClientJ.query('SELECT freelancer_id FROM applications WHERE job_id = $1 AND id != $2 AND status = $3', [req.params.id, application_id, 'pending']);
-      await pgClientJ.query('UPDATE applications SET status = $1 WHERE job_id = $2 AND id != $3 AND status = $4', ['rejected', req.params.id, application_id, 'pending']);
+      await pgClientJ.query('UPDATE applications SET status = $1, updated_at = NOW() WHERE job_id = $2 AND id != $3 AND status = $4', ['rejected', req.params.id, application_id, 'pending']);
       const refundCostJ = job.apply_cost || 1;
       for (const r of toRejectJ.rows) {
         await pgClientJ.query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [refundCostJ, r.freelancer_id]);
@@ -678,7 +678,7 @@ router.patch('/api/applications/:id', auth, checkBlocked, async (req, res) => {
       if (status === 'rejected' && app_.status === 'pending') {
         await pgPatch.query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [app_.apply_cost || 1, app_.freelancer_id]);
       }
-      const result = await pgPatch.query('UPDATE applications SET status = $1 WHERE id = $2 RETURNING *', [status, req.params.id]);
+      const result = await pgPatch.query('UPDATE applications SET status = $1, updated_at = NOW() WHERE id = $2 RETURNING *', [status, req.params.id]);
       patchedApp = result.rows[0];
       if (status === 'accepted') {
         const toRejectPatch = await pgPatch.query(
@@ -686,7 +686,7 @@ router.patch('/api/applications/:id', auth, checkBlocked, async (req, res) => {
           [app_.job_id, req.params.id]
         );
         if (toRejectPatch.rows.length) {
-          await pgPatch.query("UPDATE applications SET status = 'rejected' WHERE job_id = $1 AND id != $2 AND status = 'pending'", [app_.job_id, req.params.id]);
+          await pgPatch.query("UPDATE applications SET status = 'rejected', updated_at = NOW() WHERE job_id = $1 AND id != $2 AND status = 'pending'", [app_.job_id, req.params.id]);
           for (const r of toRejectPatch.rows) {
             await pgPatch.query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [app_.apply_cost || 1, r.freelancer_id]);
           }
@@ -750,7 +750,7 @@ router.post('/api/applications/:id/accept', auth, checkBlocked, async (req, res)
     const pgClientAccept = await getPool().connect();
     try {
       await pgClientAccept.query('BEGIN');
-      const acceptRes = await pgClientAccept.query('UPDATE applications SET status = $1 WHERE id = $2 RETURNING *', ['accepted', req.params.id]);
+      const acceptRes = await pgClientAccept.query('UPDATE applications SET status = $1, updated_at = NOW() WHERE id = $2 RETURNING *', ['accepted', req.params.id]);
       acceptedApp = acceptRes.rows[0];
       const jobApplyCost = await pgClientAccept.query('SELECT apply_cost FROM jobs WHERE id = $1', [app_.job_id]);
       const refundCost = jobApplyCost.rows[0]?.apply_cost || 1;
@@ -759,7 +759,7 @@ router.post('/api/applications/:id/accept', auth, checkBlocked, async (req, res)
         [app_.job_id, req.params.id]
       );
       if (toReject.rows.length) {
-        await pgClientAccept.query("UPDATE applications SET status = 'rejected' WHERE job_id = $1 AND id != $2 AND status = 'pending'", [app_.job_id, req.params.id]);
+        await pgClientAccept.query("UPDATE applications SET status = 'rejected', updated_at = NOW() WHERE job_id = $1 AND id != $2 AND status = 'pending'", [app_.job_id, req.params.id]);
         for (const r of toReject.rows) {
           await pgClientAccept.query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [refundCost, r.freelancer_id]);
         }
@@ -815,7 +815,7 @@ router.post('/api/applications/:id/reject', auth, checkBlocked, async (req, res)
     const pgRej = await getPool().connect();
     try {
       await pgRej.query('BEGIN');
-      const rejRes = await pgRej.query("UPDATE applications SET status = 'rejected' WHERE id = $1 AND status != 'rejected' RETURNING *", [req.params.id]);
+      const rejRes = await pgRej.query("UPDATE applications SET status = 'rejected', updated_at = NOW() WHERE id = $1 AND status != 'rejected' RETURNING *", [req.params.id]);
       if (!rejRes.rows.length) {
         await pgRej.query('ROLLBACK');
         return res.status(400).json({ error: 'Application already rejected' });
@@ -844,7 +844,7 @@ router.post('/api/applications/:id/withdraw', auth, checkBlocked, async (req, re
     const pgWith = await getPool().connect();
     try {
       await pgWith.query('BEGIN');
-      const wResult = await pgWith.query("UPDATE applications SET status = 'withdrawn' WHERE id = $1 AND status = 'pending' RETURNING *", [req.params.id]);
+      const wResult = await pgWith.query("UPDATE applications SET status = 'withdrawn', updated_at = NOW() WHERE id = $1 AND status = 'pending' RETURNING *", [req.params.id]);
       if (!wResult.rows.length) { await pgWith.query('ROLLBACK'); return res.status(400).json({ error: 'Can only withdraw pending applications' }); }
       await pgWith.query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [app_.apply_cost || 1, req.userId]);
       await pgWith.query('COMMIT');
@@ -873,7 +873,7 @@ router.put('/api/applications/:id/status', auth, checkBlocked, async (req, res) 
       if (status === 'rejected' && app_.status === 'pending') {
         await pgStatusClient.query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [app_.apply_cost || 1, app_.freelancer_id]);
       }
-      const result = await pgStatusClient.query('UPDATE applications SET status = $1 WHERE id = $2 RETURNING *', [status, req.params.id]);
+      const result = await pgStatusClient.query('UPDATE applications SET status = $1, updated_at = NOW() WHERE id = $2 RETURNING *', [status, req.params.id]);
       updatedApp = result.rows[0];
       if (status === 'accepted') {
         const toRejectStatus = await pgStatusClient.query(
@@ -881,7 +881,7 @@ router.put('/api/applications/:id/status', auth, checkBlocked, async (req, res) 
           [app_.job_id, req.params.id]
         );
         if (toRejectStatus.rows.length) {
-          await pgStatusClient.query("UPDATE applications SET status = 'rejected' WHERE job_id = $1 AND id != $2 AND status = 'pending'", [app_.job_id, req.params.id]);
+          await pgStatusClient.query("UPDATE applications SET status = 'rejected', updated_at = NOW() WHERE job_id = $1 AND id != $2 AND status = 'pending'", [app_.job_id, req.params.id]);
           for (const r of toRejectStatus.rows) {
             await pgStatusClient.query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [app_.apply_cost || 1, r.freelancer_id]);
           }
@@ -944,7 +944,7 @@ router.post('/api/applications/:id/hire', auth, checkBlocked, async (req, res) =
     const pgClientHire = await getPool().connect();
     try {
       await pgClientHire.query('BEGIN');
-      await pgClientHire.query('UPDATE applications SET status = $1 WHERE id = $2', ['accepted', req.params.id]);
+      await pgClientHire.query('UPDATE applications SET status = $1, updated_at = NOW() WHERE id = $2', ['accepted', req.params.id]);
       const existingEsc = await pgClientHire.query(
         "SELECT * FROM escrows WHERE job_id = $1 AND status = ANY($2) FOR UPDATE",
         [app_.job_id, ['pending', 'funded']]
@@ -970,7 +970,7 @@ router.post('/api/applications/:id/hire', auth, checkBlocked, async (req, res) =
         [app_.job_id, req.params.id, 'pending']
       );
       await pgClientHire.query(
-        'UPDATE applications SET status = $1 WHERE job_id = $2 AND id != $3 AND status = $4',
+        'UPDATE applications SET status = $1, updated_at = NOW() WHERE job_id = $2 AND id != $3 AND status = $4',
         ['rejected', app_.job_id, req.params.id, 'pending']
       );
       const refundCostHire = app_.apply_cost || 1;

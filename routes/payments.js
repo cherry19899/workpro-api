@@ -573,7 +573,7 @@ router.post('/api/escrows/:id/cancel', auth, checkBlocked, async (req, res) => {
         await pgClient6.query('UPDATE users SET balance_pi = COALESCE(balance_pi, 0) + $1, updated_at = NOW() WHERE id = $2', [escrow.amount, escrow.client_id]);
       }
       await pgClient6.query(
-        "UPDATE applications SET status='rejected' WHERE job_id=$1 AND status IN ('accepted')",
+        "UPDATE applications SET status='rejected', updated_at=NOW() WHERE job_id=$1 AND status IN ('accepted')",
         [escrow.job_id]
       );
       await pgClient6.query('COMMIT');
@@ -608,7 +608,7 @@ router.post('/api/escrow/:id/refund', auth, checkBlocked, async (req, res) => {
       if (wasFunded) {
         await pgClient7.query('UPDATE users SET balance_pi = COALESCE(balance_pi, 0) + $1, updated_at = NOW() WHERE id = $2', [escrow.amount, escrow.client_id]);
       }
-      await pgClient7.query("UPDATE applications SET status='rejected' WHERE job_id=$1 AND status='accepted'", [escrow.job_id]);
+      await pgClient7.query("UPDATE applications SET status='rejected', updated_at=NOW() WHERE job_id=$1 AND status='accepted'", [escrow.job_id]);
       await pgClient7.query('COMMIT');
     } catch (txErr) { await pgClient7.query('ROLLBACK').catch(() => {}); throw txErr; }
     finally { pgClient7.release(); }
@@ -751,7 +751,7 @@ router.post('/api/offers', auth, checkBlocked, async (req, res) => {
         return res.status(400).json({ error: 'Freelancer is already working on this job' });
       }
       result = await query(
-        `UPDATE applications SET status='offer', message=$1, bid_amount=$2 WHERE id=$3 RETURNING *`,
+        `UPDATE applications SET status='offer', message=$1, bid_amount=$2, updated_at=NOW() WHERE id=$3 RETURNING *`,
         [message || '', amount || job.budget, existing.id]
       );
     } else {
@@ -817,7 +817,7 @@ router.post('/api/offers/:id/accept', auth, checkBlocked, async (req, res) => {
     try {
       await pgOffer.query('BEGIN');
       const upd = await pgOffer.query(
-        "UPDATE applications SET status='accepted' WHERE id=$1 AND status='offer' RETURNING *",
+        "UPDATE applications SET status='accepted', updated_at=NOW() WHERE id=$1 AND status='offer' RETURNING *",
         [req.params.id]
       );
       if (!upd.rows.length) { await pgOffer.query('ROLLBACK'); return res.status(409).json({ error: 'Offer already processed' }); }
@@ -827,7 +827,7 @@ router.post('/api/offers/:id/accept', auth, checkBlocked, async (req, res) => {
         [offer.job_id, req.params.id]
       );
       if (toRej.rows.length) {
-        await pgOffer.query("UPDATE applications SET status='rejected' WHERE job_id=$1 AND id!=$2 AND status='pending'", [offer.job_id, req.params.id]);
+        await pgOffer.query("UPDATE applications SET status='rejected', updated_at=NOW() WHERE job_id=$1 AND id!=$2 AND status='pending'", [offer.job_id, req.params.id]);
         for (const r of toRej.rows) {
           await pgOffer.query('UPDATE users SET balance_connects=balance_connects+$1, updated_at=NOW() WHERE id=$2', [offer.apply_cost || 1, r.freelancer_id]);
         }
@@ -861,7 +861,7 @@ router.post('/api/offers/:id/accept', auth, checkBlocked, async (req, res) => {
 router.post('/api/offers/:id/decline', auth, checkBlocked, async (req, res) => {
   if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Offer not found' });
   try {
-    const result = await query("UPDATE applications SET status = $1 WHERE id = $2 AND freelancer_id = $3 AND status = 'offer' RETURNING *", ['rejected', req.params.id, req.userId]);
+    const result = await query("UPDATE applications SET status = $1, updated_at = NOW() WHERE id = $2 AND freelancer_id = $3 AND status = 'offer' RETURNING *", ['rejected', req.params.id, req.userId]);
     if (!result.rows.length) {
       const exists = await query('SELECT status FROM applications WHERE id = $1 AND freelancer_id = $2', [req.params.id, req.userId]);
       if (!exists.rows.length) return res.status(404).json({ error: 'Offer not found' });
