@@ -124,64 +124,64 @@ app.use((err, req, res, next) => {
 
 // ─── Schema migrations run on startup ──────────────────────────────────────────────
 async function ensureNotificationsTable() {
-  try {
-    await query(`CREATE TABLE IF NOT EXISTS notifications (
-      id SERIAL PRIMARY KEY,
-      user_id TEXT NOT NULL,
-      type TEXT NOT NULL,
-      title TEXT NOT NULL,
-      body TEXT,
-      job_id INTEGER,
-      room_id TEXT,
-      is_read BOOLEAN DEFAULT false,
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    )`);
-    await query(`CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, is_read, created_at DESC)`);
-    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_chat_read_at TIMESTAMPTZ`);
-    await query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_applications_unique_apply ON applications(job_id, freelancer_id)`);
-    await query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_escrows_payment ON escrows(payment_id)`);
-    await query(`UPDATE jobs SET apply_cost = CEIL(budget::numeric / 50.0)::int, connects_spent = CEIL(budget::numeric / 50.0)::int WHERE CEIL(budget::numeric / 50.0)::int != apply_cost`).catch((e) => console.error('[Migration] apply_cost fix error:', e.message));
-    await query(`CREATE TABLE IF NOT EXISTS portfolios (
-      id SERIAL PRIMARY KEY, user_id VARCHAR(255) UNIQUE, headline TEXT, summary TEXT,
-      experience_years INTEGER DEFAULT 0, website TEXT, github TEXT, linkedin TEXT,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )`);
-    await query(`CREATE TABLE IF NOT EXISTS portfolio_items (
-      id SERIAL PRIMARY KEY, user_id VARCHAR(255), title VARCHAR(500) NOT NULL,
-      description TEXT, image_url TEXT, category VARCHAR(100), tags TEXT,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )`);
-    await query(`CREATE TABLE IF NOT EXISTS push_subscriptions (
-      id SERIAL PRIMARY KEY,
-      user_id TEXT UNIQUE NOT NULL,
-      endpoint TEXT NOT NULL,
-      keys JSONB,
-      updated_at TIMESTAMPTZ DEFAULT NOW()
-    )`);
-    await query(`CREATE TABLE IF NOT EXISTS chat_room_reads (
-      room_id VARCHAR(255) NOT NULL,
-      user_id VARCHAR(255) NOT NULL,
-      last_read_at TIMESTAMPTZ DEFAULT NOW(),
-      PRIMARY KEY (room_id, user_id)
-    )`);
-    await query(`ALTER TABLE ratings ADD COLUMN IF NOT EXISTS reply TEXT`);
-    await query(`ALTER TABLE ratings ADD COLUMN IF NOT EXISTS replied_at TIMESTAMPTZ`);
-    // ─── Performance indexes ───────────────────────────────────────────────
-    await query(`CREATE INDEX IF NOT EXISTS idx_jobs_posted_by ON jobs(posted_by)`);
-    await query(`CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)`);
-    await query(`CREATE INDEX IF NOT EXISTS idx_applications_job_id ON applications(job_id)`);
-    await query(`CREATE INDEX IF NOT EXISTS idx_applications_freelancer_id ON applications(freelancer_id)`);
-    await query(`CREATE INDEX IF NOT EXISTS idx_applications_status ON applications(status)`);
-    await query(`CREATE INDEX IF NOT EXISTS idx_escrows_client_id ON escrows(client_id)`);
-    await query(`CREATE INDEX IF NOT EXISTS idx_escrows_freelancer_id ON escrows(freelancer_id)`);
-    await query(`CREATE INDEX IF NOT EXISTS idx_escrows_job_id ON escrows(job_id)`);
-    await query(`CREATE INDEX IF NOT EXISTS idx_chat_messages_room_id ON chat_messages(room_id)`);
-    await query(`CREATE INDEX IF NOT EXISTS idx_payments_user_id ON payments(user_id)`);
-    await query(`CREATE INDEX IF NOT EXISTS idx_ratings_to_user_id ON ratings(to_user_id)`);
-    // ─── Missing columns ───────────────────────────────────────────────────
-    await query(`ALTER TABLE applications ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`);
-    await query(`ALTER TABLE offers ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`).catch(() => {});
-  } catch (_) {}
+  const run = (sql, tag) => query(sql).catch(e => console.error(`[Migration] ${tag}:`, e.message));
+  await run(`CREATE TABLE IF NOT EXISTS notifications (
+    id SERIAL PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    type TEXT NOT NULL,
+    title TEXT NOT NULL,
+    body TEXT,
+    job_id INTEGER,
+    room_id TEXT,
+    is_read BOOLEAN DEFAULT false,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  )`, 'notifications table');
+  await run(`CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, is_read, created_at DESC)`, 'idx_notifications_user');
+  await run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_chat_read_at TIMESTAMPTZ`, 'users.last_chat_read_at');
+  // Critical: must run before any UPDATE that references updated_at
+  await run(`ALTER TABLE applications ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`, 'applications.updated_at');
+  await run(`ALTER TABLE offers ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`, 'offers.updated_at');
+  // Unique indexes — may fail if duplicate rows exist in DB; logged but non-fatal
+  await run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_applications_unique_apply ON applications(job_id, freelancer_id)`, 'idx_applications_unique_apply');
+  await run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_escrows_payment ON escrows(payment_id)`, 'idx_escrows_payment');
+  await run(`UPDATE jobs SET apply_cost = CEIL(budget::numeric / 50.0)::int, connects_spent = CEIL(budget::numeric / 50.0)::int WHERE CEIL(budget::numeric / 50.0)::int != apply_cost`, 'apply_cost fix');
+  await run(`CREATE TABLE IF NOT EXISTS portfolios (
+    id SERIAL PRIMARY KEY, user_id VARCHAR(255) UNIQUE, headline TEXT, summary TEXT,
+    experience_years INTEGER DEFAULT 0, website TEXT, github TEXT, linkedin TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  )`, 'portfolios table');
+  await run(`CREATE TABLE IF NOT EXISTS portfolio_items (
+    id SERIAL PRIMARY KEY, user_id VARCHAR(255), title VARCHAR(500) NOT NULL,
+    description TEXT, image_url TEXT, category VARCHAR(100), tags TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  )`, 'portfolio_items table');
+  await run(`CREATE TABLE IF NOT EXISTS push_subscriptions (
+    id SERIAL PRIMARY KEY,
+    user_id TEXT UNIQUE NOT NULL,
+    endpoint TEXT NOT NULL,
+    keys JSONB,
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  )`, 'push_subscriptions table');
+  await run(`CREATE TABLE IF NOT EXISTS chat_room_reads (
+    room_id VARCHAR(255) NOT NULL,
+    user_id VARCHAR(255) NOT NULL,
+    last_read_at TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (room_id, user_id)
+  )`, 'chat_room_reads table');
+  await run(`ALTER TABLE ratings ADD COLUMN IF NOT EXISTS reply TEXT`, 'ratings.reply');
+  await run(`ALTER TABLE ratings ADD COLUMN IF NOT EXISTS replied_at TIMESTAMPTZ`, 'ratings.replied_at');
+  // ─── Performance indexes ───────────────────────────────────────────────
+  await run(`CREATE INDEX IF NOT EXISTS idx_jobs_posted_by ON jobs(posted_by)`, 'idx_jobs_posted_by');
+  await run(`CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)`, 'idx_jobs_status');
+  await run(`CREATE INDEX IF NOT EXISTS idx_applications_job_id ON applications(job_id)`, 'idx_applications_job_id');
+  await run(`CREATE INDEX IF NOT EXISTS idx_applications_freelancer_id ON applications(freelancer_id)`, 'idx_applications_freelancer_id');
+  await run(`CREATE INDEX IF NOT EXISTS idx_applications_status ON applications(status)`, 'idx_applications_status');
+  await run(`CREATE INDEX IF NOT EXISTS idx_escrows_client_id ON escrows(client_id)`, 'idx_escrows_client_id');
+  await run(`CREATE INDEX IF NOT EXISTS idx_escrows_freelancer_id ON escrows(freelancer_id)`, 'idx_escrows_freelancer_id');
+  await run(`CREATE INDEX IF NOT EXISTS idx_escrows_job_id ON escrows(job_id)`, 'idx_escrows_job_id');
+  await run(`CREATE INDEX IF NOT EXISTS idx_chat_messages_room_id ON chat_messages(room_id)`, 'idx_chat_messages_room_id');
+  await run(`CREATE INDEX IF NOT EXISTS idx_payments_user_id ON payments(user_id)`, 'idx_payments_user_id');
+  await run(`CREATE INDEX IF NOT EXISTS idx_ratings_to_user_id ON ratings(to_user_id)`, 'idx_ratings_to_user_id');
 }
 
 // ─── Start ──────────────────────────────────────────────
