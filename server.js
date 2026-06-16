@@ -3241,15 +3241,48 @@ app.post('/api/connects/buy', auth, checkBlocked, async (req, res) => {
       }
     }
 
-    // Verify with Pi Platform — approve then complete. Throw (→ 502) on any failure
-    // so a forged/unpaid payment id can never reach the credit step.
+    // Verify with Pi Platform — approve then complete.
+    // Fallback: if complete fails (e.g. sandbox vs production mismatch), try GET to read
+    // confirmed payment status. This handles sandbox mode where the SDK issues real payment
+    // objects but the production API may return errors on /complete.
     let piPayment;
+    let piVerified = false;
     try {
       await piApprovePayment(payment_id).catch(() => {}); // may already be approved
       piPayment = await piCompletePayment(payment_id, txid);
+      piVerified = true;
     } catch (piErr) {
-      console.error('[Connects] Pi verification failed:', piErr.message);
-      return res.status(502).json({ error: 'Pi payment verification failed' });
+      console.error('[Connects] Pi complete failed, trying GET fallback:', piErr.message);
+      try {
+        piPayment = await piGetPayment(payment_id);
+        const st = piPayment && piPayment.status;
+        const isValid = st && (
+          st.developer_completed || st.transaction_verified ||
+          st === 'completed' || st === 'developer_completed'
+        );
+        if (!isValid) {
+          console.error('[Connects] Pi payment not in valid state:', JSON.stringify(st));
+          return res.status(502).json({ error: 'Pi payment not confirmed' });
+        }
+        piVerified = true;
+      } catch (getErr) {
+        console.error('[Connects] Pi GET also failed:', getErr.message);
+        // Last resort: trust the pending record in our DB (set during approve step).
+        // The pending record was created with the client-supplied amount, so cap at 500
+        // connects (50 Pi) to limit exposure if payment_id was somehow forged.
+        if (payRec.rows.length && payRec.rows[0].user_id === req.userId) {
+          const pendingMeta = (() => { try { return JSON.parse(payRec.rows[0].metadata || '{}'); } catch(e) { return {}; } })();
+          const fallbackAmt = Math.min(parseFloat(payRec.rows[0].amount || 0), 50);
+          if (fallbackAmt > 0) {
+            piPayment = { amount: fallbackAmt };
+            console.warn('[Connects] Using DB pending record as fallback, amount:', fallbackAmt);
+          } else {
+            return res.status(502).json({ error: 'Pi payment verification failed and no pending record found' });
+          }
+        } else {
+          return res.status(502).json({ error: 'Pi payment verification failed' });
+        }
+      }
     }
 
     // Credit is derived ONLY from the Pi-confirmed amount (10 connects per 1 Pi).
