@@ -339,8 +339,8 @@ router.post('/api/jobs/:id/apply', auth, checkBlocked, async (req, res) => {
       let isNewApp = false;
       if (prevApp.rows.length) {
         appResult = await pgClient.query(
-          `UPDATE applications SET status='pending', message=$3, updated_at=NOW() WHERE id=$4 RETURNING *`,
-          [req.params.id, req.userId, req.body.message || '', prevApp.rows[0].id]
+          `UPDATE applications SET status='pending', message=$1, updated_at=NOW() WHERE id=$2 RETURNING *`,
+          [req.body.message || '', prevApp.rows[0].id]
         );
       } else {
         appResult = await pgClient.query(
@@ -577,14 +577,17 @@ router.post('/api/applications', auth, checkBlocked, async (req, res) => {
         [job_id, req.userId]
       );
       const isNewAlias = !existingForAlias.rows.length;
-      appResult = await pgClient.query(
-        `INSERT INTO applications (job_id, job_title, freelancer_id, freelancer_name, message) VALUES ($1, $2, $3, $4, $5)
-         ON CONFLICT (job_id, freelancer_id) DO UPDATE
-           SET status='pending', message=EXCLUDED.message, updated_at=NOW()
-           WHERE applications.status IN ('withdrawn','rejected')
-         RETURNING *`,
-        [job_id, job.title, req.userId, user.username || req.userId, message || '']
-      );
+      if (existingForAlias.rows.length) {
+        appResult = await pgClient.query(
+          `UPDATE applications SET status='pending', message=$1, updated_at=NOW() WHERE id=$2 RETURNING *`,
+          [message || '', existingForAlias.rows[0].id]
+        );
+      } else {
+        appResult = await pgClient.query(
+          `INSERT INTO applications (job_id, job_title, freelancer_id, freelancer_name, message) VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+          [job_id, job.title, req.userId, user.username || req.userId, message || '']
+        );
+      }
       if (!appResult.rows.length) { await pgClient.query('ROLLBACK'); return res.status(400).json({ error: 'Already applied' }); }
       if (isNewAlias) {
         await pgClient.query('UPDATE jobs SET applications = applications + 1, updated_at = NOW() WHERE id = $1', [job_id]);
