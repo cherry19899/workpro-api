@@ -189,6 +189,12 @@ initDb().then(async () => {
   await ensureNotificationsTable();
   // Ensure the canonical owner always has admin role
   await query(`UPDATE users SET role = 'admin' WHERE id = 'pi_cherry19899' AND role != 'admin'`).catch(() => {});
+  // Fix double-prefix corruption from old registration bug (idempotent)
+  await query(`UPDATE jobs SET posted_by = 'pi_cherry19899' WHERE posted_by = 'pi_pi_cherry19899'`).catch(() => {});
+  await query(`UPDATE applications SET freelancer_id = 'pi_cherry19899' WHERE freelancer_id = 'pi_pi_cherry19899'`).catch(() => {});
+  // Remove test clutter jobs (description='test', title contains 'test') — idempotent
+  await query(`DELETE FROM applications WHERE job_id IN (SELECT id FROM jobs WHERE description = 'test' AND title ILIKE '%test%')`).catch(() => {});
+  await query(`DELETE FROM jobs WHERE description = 'test' AND title ILIKE '%test%'`).catch(() => {});
   app.listen(PORT, () => {
     console.log(`[WorkPro API] v3.2.0 on port ${PORT} (${NODE_ENV})`);
   });
