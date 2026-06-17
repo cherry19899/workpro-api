@@ -228,6 +228,9 @@ router.patch('/api/jobs/:id', auth, checkBlocked, async (req, res) => {
       return res.status(403).json({ error: 'Forbidden' });
     }
     if (job.status !== 'in_progress') return res.status(400).json({ error: 'Job is not in progress' });
+    // Don't let the freelancer submit work until the client has actually funded the escrow.
+    const unfundedSubmit = await query("SELECT id FROM escrows WHERE job_id = $1 AND status = 'pending' LIMIT 1", [req.params.id]);
+    if (unfundedSubmit.rows.length) return res.status(400).json({ error: 'Дождитесь, пока заказчик пополнит эскроу, прежде чем сдавать работу' });
     const result = await query("UPDATE jobs SET status = $1, updated_at = NOW() WHERE id = $2 AND status = 'in_progress' RETURNING *", [status, req.params.id]);
     if (!result.rows.length) return res.status(409).json({ error: 'Job status changed concurrently — try again' });
     if (status === 'submitted' && isHiredFreelancer) {
@@ -454,6 +457,9 @@ router.post('/api/jobs/:id/complete', auth, checkBlocked, async (req, res) => {
     if (!['in_progress', 'submitted'].includes(job.status)) return res.status(400).json({ error: 'Job is not in progress' });
     const disputedEscrow = await query("SELECT id FROM escrows WHERE job_id = $1 AND status = 'disputed' LIMIT 1", [req.params.id]);
     if (disputedEscrow.rows.length) return res.status(400).json({ error: 'Cannot complete job while escrow is under dispute — wait for admin resolution' });
+    // Block completion until the escrow is funded — otherwise the freelancer is paid 0π for finished work.
+    const unfundedComplete = await query("SELECT id FROM escrows WHERE job_id = $1 AND status = 'pending' LIMIT 1", [req.params.id]);
+    if (unfundedComplete.rows.length) return res.status(400).json({ error: 'Пополните эскроу, прежде чем принимать работу и завершать задачу' });
     let paidAmount = 0;
     const pgClient5 = await getPool().connect();
     try {
@@ -483,7 +489,7 @@ router.post('/api/jobs/:id/complete', auth, checkBlocked, async (req, res) => {
     if (job.hired_freelancer_id) {
       const payMsg = paidAmount > 0
         ? `Заказчик принял работу. Зачислено ${paidAmount}π на ваш счёт.`
-        : 'Заказчик принял работу. Оплата была согласована отдельно.';
+        : 'Заказчик принял работу.';
       await notify(job.hired_freelancer_id, 'completed', `Задача "${job.title}" принята`, payMsg, parseInt(req.params.id), null);
     }
     res.json({ success: true, paid: paidAmount });
