@@ -74,11 +74,11 @@ router.get('/api/jobs', async (req, res) => {
       [...params, parseInt(limit), offset]
     );
     // Workaround: bundle v200 has inverted filter hiding 'open' jobs in Find Work feed.
-    // Also strip pi_ prefix from posted_by so bundle's own-job filter (posted_by !== username) works.
+    // Use posted_by_name as posted_by so bundle's own-job filter (posted_by !== username) works
+    // correctly with case-sensitive Pi SDK username (e.g. 'Cherry19899' not 'pi_cherry19899').
     const jobs = dataResult.rows.map(parseJobRow).map(function(j) {
       const normalized = Object.assign({}, j, {
-        posted_by: j.posted_by ? j.posted_by.replace(/^pi_/, '') : j.posted_by,
-        posted_by_name: j.posted_by_name,
+        posted_by: j.posted_by_name || (j.posted_by ? j.posted_by.replace(/^pi_/, '') : j.posted_by),
       });
       if (normalized.status === 'open') return Object.assign({}, normalized, { status: 'in_progress', _open: true });
       return normalized;
