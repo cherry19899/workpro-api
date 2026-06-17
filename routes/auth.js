@@ -62,40 +62,31 @@ router.post('/api/me', authLimiter, async (req, res) => {
   if (!uid) return res.status(400).json({ error: 'uid required' });
   if (username && username.length > 50) return res.status(400).json({ error: 'Username too long (max 50)' });
   try {
-    if (accessToken) {
-      try {
-        const piUser = await piApiRequest('/v2/me', 'GET', null, accessToken);
-        const piUid = piUser && (piUser.uid || piUser.username);
-        if (!piUid) return res.status(403).json({ error: 'Pi identity verification failed: no uid returned' });
-        const normalizedPiUid = piUid.startsWith('pi_') ? piUid : 'pi_' + piUid;
-        if (normalizedPiUid !== uid && piUid !== uid) {
-          return res.status(403).json({ error: 'Token does not match uid' });
-        }
-      } catch (e) {
-        return res.status(401).json({ error: 'Pi token verification failed. Please re-authenticate.' });
+    // SECURITY: a JWT may only be issued after proving ownership of the Pi identity.
+    // Without a valid Pi accessToken anyone who knows a uid (e.g. pi_cherry19899) could mint
+    // a token and impersonate that account, incl. admin. Returning clients that already hold a
+    // (even expired) JWT renew without re-auth via POST /api/auth/refresh.
+    if (!accessToken) {
+      return res.status(401).json({ error: 'accessToken required — re-authenticate with Pi' });
+    }
+    try {
+      const piUser = await piApiRequest('/v2/me', 'GET', null, accessToken);
+      const piUid = piUser && (piUser.uid || piUser.username);
+      if (!piUid) return res.status(403).json({ error: 'Pi identity verification failed: no uid returned' });
+      const normalizedPiUid = piUid.startsWith('pi_') ? piUid : 'pi_' + piUid;
+      if (normalizedPiUid !== uid && piUid !== uid) {
+        return res.status(403).json({ error: 'Token does not match uid' });
       }
-    } else {
-      const existing = await query('SELECT id FROM users WHERE id = $1', [uid]);
-      if (!existing.rows.length) {
-        return res.status(401).json({ error: 'accessToken required for new account registration' });
-      }
+    } catch (e) {
+      return res.status(401).json({ error: 'Pi token verification failed. Please re-authenticate.' });
     }
     const uname = username || uid.replace(/^pi_/, '') || uid;
-    if (accessToken) {
-      await query(
-        `INSERT INTO users (id, username, role, balance_connects, created_at, updated_at)
-         VALUES ($1, $2, 'freelancer', 10, NOW(), NOW())
-         ON CONFLICT (id) DO UPDATE SET username = EXCLUDED.username, updated_at = NOW()`,
-        [uid, uname]
-      );
-    } else {
-      await query(
-        `INSERT INTO users (id, username, role, balance_connects, created_at, updated_at)
-         VALUES ($1, $2, 'freelancer', 10, NOW(), NOW())
-         ON CONFLICT (id) DO UPDATE SET updated_at = NOW()`,
-        [uid, uname]
-      );
-    }
+    await query(
+      `INSERT INTO users (id, username, role, balance_connects, created_at, updated_at)
+       VALUES ($1, $2, 'freelancer', 10, NOW(), NOW())
+       ON CONFLICT (id) DO UPDATE SET username = EXCLUDED.username, updated_at = NOW()`,
+      [uid, uname]
+    );
     // Migrate legacy 'cherry19899' records to 'pi_cherry19899' (idempotent, runs every login)
     if (uid === 'pi_cherry19899') {
       try {
@@ -151,24 +142,22 @@ router.post('/api/auth/login', async (req, res) => {
   if (!userId) return res.status(400).json({ error: 'userId required' });
   if (username && username.length > 50) return res.status(400).json({ error: 'Username too long (max 50)' });
   try {
+    // SECURITY: require Pi accessToken to issue a JWT (see POST /api/me). No token = no login;
+    // returning clients renew via POST /api/auth/refresh using their existing JWT.
+    if (!accessToken) {
+      return res.status(401).json({ error: 'accessToken required — re-authenticate with Pi' });
+    }
     let piUser = null;
-    if (accessToken) {
-      try {
-        piUser = await piApiRequest('/v2/me', 'GET', null, accessToken);
-      } catch (e) {
-        return res.status(401).json({ error: 'Pi token verification failed. Please re-authenticate.' });
-      }
-      const piUid = piUser && (piUser.uid || piUser.username);
-      if (!piUid) return res.status(403).json({ error: 'Pi identity verification failed: no uid returned' });
-      const normalizedPiUid = piUid.startsWith('pi_') ? piUid : 'pi_' + piUid;
-      if (normalizedPiUid !== userId && piUid !== userId) {
-        return res.status(403).json({ error: 'Token does not match userId' });
-      }
-    } else {
-      const existing = await query('SELECT id FROM users WHERE id = $1', [userId]);
-      if (!existing.rows.length) {
-        return res.status(401).json({ error: 'accessToken required for new account registration' });
-      }
+    try {
+      piUser = await piApiRequest('/v2/me', 'GET', null, accessToken);
+    } catch (e) {
+      return res.status(401).json({ error: 'Pi token verification failed. Please re-authenticate.' });
+    }
+    const piUid = piUser && (piUser.uid || piUser.username);
+    if (!piUid) return res.status(403).json({ error: 'Pi identity verification failed: no uid returned' });
+    const normalizedPiUid = piUid.startsWith('pi_') ? piUid : 'pi_' + piUid;
+    if (normalizedPiUid !== userId && piUid !== userId) {
+      return res.status(403).json({ error: 'Token does not match userId' });
     }
     const uid = userId;
     const uname = (piUser && piUser.username) || username || uid;
