@@ -51,6 +51,7 @@ router.get('/api/jobs', async (req, res) => {
     const params = [];
     let idx = 1;
     if (status) { conditions.push(`status = $${idx++}`); params.push(status); }
+    else { conditions.push(`status = 'open'`); }
     if (category && category !== 'all' && category !== 'All') { conditions.push(`LOWER(category) = LOWER($${idx++})`); params.push(category); }
     if (ownerFilter) { conditions.push(`posted_by = $${idx++}`); params.push(ownerFilter); }
     if (search) { conditions.push(`(title ILIKE $${idx} OR description ILIKE $${idx})`); params.push(`%${search}%`); idx++; }
@@ -538,7 +539,12 @@ router.get('/api/applications', auth, async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit) || 50, 200);
   const offset = parseInt(req.query.offset) || 0;
   try {
-    const result = await query('SELECT * FROM applications WHERE freelancer_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3', [req.userId, limit, offset]);
+    const result = await query(
+      `SELECT a.*, j.posted_by_name as client_name, j.posted_by as client_id
+       FROM applications a LEFT JOIN jobs j ON j.id = a.job_id
+       WHERE a.freelancer_id = $1 ORDER BY a.created_at DESC LIMIT $2 OFFSET $3`,
+      [req.userId, limit, offset]
+    );
     const total = await query('SELECT COUNT(*) FROM applications WHERE freelancer_id = $1', [req.userId]);
     res.json({ applications: result.rows, total: parseInt(total.rows[0].count), limit, offset });
   } catch (err) { serverError(err, res); }
@@ -608,7 +614,12 @@ router.get('/api/applications/my', auth, async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit) || 50, 200);
   const offset = parseInt(req.query.offset) || 0;
   try {
-    const result = await query('SELECT * FROM applications WHERE freelancer_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3', [req.userId, limit, offset]);
+    const result = await query(
+      `SELECT a.*, j.posted_by_name as client_name, j.posted_by as client_id
+       FROM applications a LEFT JOIN jobs j ON j.id = a.job_id
+       WHERE a.freelancer_id = $1 ORDER BY a.created_at DESC LIMIT $2 OFFSET $3`,
+      [req.userId, limit, offset]
+    );
     const total = await query('SELECT COUNT(*) FROM applications WHERE freelancer_id = $1', [req.userId]);
     res.json({ applications: result.rows, total: parseInt(total.rows[0].count), limit, offset });
   } catch (err) { serverError(err, res); }
@@ -619,7 +630,12 @@ router.get('/api/applications/me', auth, async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit) || 50, 200);
   const offset = parseInt(req.query.offset) || 0;
   try {
-    const result = await query('SELECT * FROM applications WHERE freelancer_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3', [req.userId, limit, offset]);
+    const result = await query(
+      `SELECT a.*, j.posted_by_name as client_name, j.posted_by as client_id
+       FROM applications a LEFT JOIN jobs j ON j.id = a.job_id
+       WHERE a.freelancer_id = $1 ORDER BY a.created_at DESC LIMIT $2 OFFSET $3`,
+      [req.userId, limit, offset]
+    );
     const total = await query('SELECT COUNT(*) FROM applications WHERE freelancer_id = $1', [req.userId]);
     res.json({ applications: result.rows, total: parseInt(total.rows[0].count), limit, offset });
   } catch (err) { serverError(err, res); }
