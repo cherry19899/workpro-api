@@ -69,11 +69,13 @@ async function handlePaymentComplete(paymentId, txid, metadata, userId, res) {
       const markDone = markRes.rows[0];
       const meta = markDone.metadata || {};
       const paymentOwner = markDone.user_id || userId;
-      if (meta.type === 'connects') {
+      if (meta.type === 'connects' && !meta.connects_credited) {
         const piAmountPaid = parseFloat(piPayment.amount || markDone.amount || 0);
         const amount = Math.floor(piAmountPaid * 10);
         if (amount <= 0) { await pgPmtC.query('ROLLBACK'); return res.status(400).json({ error: 'Payment amount too small to credit connects' }); }
         await pgPmtC.query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [amount, paymentOwner]);
+        // Idempotency marker shared with /api/connects/buy so connects are never credited twice.
+        await pgPmtC.query("UPDATE payments SET metadata = jsonb_set(COALESCE(metadata,'{}'::jsonb), '{connects_credited}', 'true') WHERE id = $1", [paymentId]);
       } else if (meta.type === 'escrow' && meta.job_id && meta.freelancer_id) {
         const existingEscrow = await pgPmtC.query('SELECT id FROM escrows WHERE payment_id = $1 LIMIT 1', [paymentId]);
         if (!existingEscrow.rows.length) {
@@ -385,92 +387,99 @@ router.post('/api/connects/buy', auth, checkBlocked, async (req, res) => {
     return res.json({ success: true, status: 'pending' });
   }
 
-  // Completion step: a real Pi payment (payment_id + txid) is mandatory.
-  if (!payment_id || !txid) {
-    return res.status(400).json({ error: 'payment_id and txid required to credit connects' });
+  // Completion step: credit connects after a Pi payment.
+  // NOTE: the frontend calls /api/payments/:id/complete (which marks the row
+  // 'completed') and does NOT send a txid here, so we must not require txid nor
+  // gate crediting on status. Idempotency is enforced via metadata.connects_credited.
+  if (!payment_id) {
+    return res.status(400).json({ error: 'payment_id required to credit connects' });
   }
-  if (!PI_API_KEY) {
-    return res.status(503).json({ error: 'Payments are not configured on the server' });
-  }
-  try {
-    const payRec = await query('SELECT id, user_id, status FROM payments WHERE id = $1', [payment_id]);
-    if (payRec.rows.length) {
-      if (payRec.rows[0].user_id && payRec.rows[0].user_id !== req.userId) {
-        return res.status(403).json({ error: 'Payment does not belong to you' });
-      }
-      if (payRec.rows[0].status === 'completed') {
-        return res.status(400).json({ error: 'Payment already processed' });
-      }
-    }
 
-    let piPayment;
-    let piVerified = false;
-    try {
-      await piApprovePayment(payment_id).catch(() => {});
-      piPayment = await piCompletePayment(payment_id, txid);
-      piVerified = true;
-    } catch (piErr) {
-      console.error('[Connects] Pi complete failed, trying GET fallback:', piErr.message);
+  try {
+    // Authoritative verification: ask Pi for the payment's real state + amount.
+    // (best-effort approve/complete first in case the client never finished it).
+    let piPayment = null;
+    let verified = false;
+    if (PI_API_KEY) {
       try {
+        if (txid) {
+          await piApprovePayment(payment_id).catch(() => {});
+          await piCompletePayment(payment_id, txid).catch(() => {});
+        }
         piPayment = await piGetPayment(payment_id);
         const st = piPayment && piPayment.status;
-        const isValid = st && (
-          st.developer_completed || st.transaction_verified ||
-          st === 'completed' || st === 'developer_completed'
-        );
-        if (!isValid) {
-          console.error('[Connects] Pi payment not in valid state:', JSON.stringify(st));
-          return res.status(502).json({ error: 'Pi payment not confirmed' });
-        }
-        piVerified = true;
-      } catch (getErr) {
-        console.error('[Connects] Pi GET also failed:', getErr.message);
-        if (payRec.rows.length && payRec.rows[0].user_id === req.userId) {
-          const pendingMeta = (() => { try { return JSON.parse(payRec.rows[0].metadata || '{}'); } catch (e) { return {}; } })();
-          const fallbackAmt = Math.min(parseFloat(payRec.rows[0].amount || 0), 50);
-          if (fallbackAmt > 0) {
-            piPayment = { amount: fallbackAmt };
-            console.warn('[Connects] Using DB pending record as fallback, amount:', fallbackAmt);
-          } else {
-            return res.status(502).json({ error: 'Pi payment verification failed and no pending record found' });
-          }
-        } else {
-          return res.status(502).json({ error: 'Pi payment verification failed' });
-        }
+        verified = !!(st && (st.transaction_verified || st.developer_completed));
+      } catch (piErr) {
+        console.error('[Connects] Pi verification failed:', piErr.message);
       }
-    }
-
-    const piAmount = parseFloat(piPayment.amount || 0);
-    const credited = Math.floor(piAmount * 10);
-    if (!(credited > 0)) {
-      return res.status(400).json({ error: 'Payment amount too small to credit any connects' });
     }
 
     const pgClient = await getPool().connect();
+    let credited = 0;
+    let balance = 0;
     try {
       await pgClient.query('BEGIN');
+      // Lock the payment row (create a stub if the approve step never persisted it).
+      let payRow = (await pgClient.query('SELECT * FROM payments WHERE id = $1 FOR UPDATE', [payment_id])).rows[0];
+      if (!payRow) {
+        await pgClient.query(
+          `INSERT INTO payments (id, user_id, type, amount, status, txid, metadata)
+           VALUES ($1,$2,'connects',$3,$4,$5,$6) ON CONFLICT (id) DO NOTHING`,
+          [payment_id, req.userId, parseFloat(pi_amount || 0), verified ? 'completed' : 'pending', txid || null, JSON.stringify({ type: 'connects' })]
+        );
+        payRow = (await pgClient.query('SELECT * FROM payments WHERE id = $1 FOR UPDATE', [payment_id])).rows[0];
+      }
+
+      if (payRow.user_id && payRow.user_id !== req.userId) {
+        await pgClient.query('ROLLBACK');
+        return res.status(403).json({ error: 'Payment does not belong to you' });
+      }
+
+      // Accept only if Pi confirmed it, or our own server already completed it (the /complete call).
+      if (!verified && payRow.status !== 'completed') {
+        await pgClient.query('ROLLBACK');
+        return res.status(502).json({ error: 'Pi payment not confirmed' });
+      }
+
+      const meta = payRow.metadata || {};
+      // Idempotency: never credit the same payment twice (shared with /complete path).
+      if (meta.connects_credited) {
+        await pgClient.query('COMMIT');
+        const cur = await query('SELECT balance_connects FROM users WHERE id = $1', [req.userId]);
+        balance = cur.rows[0]?.balance_connects || 0;
+        return res.json({ success: true, credited: 0, alreadyCredited: true, balance, balance_connects: balance, new_balance: balance, remaining_connects: balance });
+      }
+
+      // Canonical rate: 10 connects per verified Pi (consistent across the codebase).
+      // Fall back to the requested package size only when the Pi amount is unknown.
+      const verifiedAmount = parseFloat((piPayment && piPayment.amount) || payRow.amount || pi_amount || 0);
+      credited = Math.floor(verifiedAmount * 10);
+      if (!(credited > 0)) {
+        const pkg = parseInt(package_amount || req.body.quantity || 0);
+        if (pkg > 0) credited = pkg;
+      }
+      if (!(credited > 0)) {
+        await pgClient.query('ROLLBACK');
+        return res.status(400).json({ error: 'Payment amount too small to credit any connects' });
+      }
+
+      const newMeta = Object.assign({}, meta, { type: 'connects', connects_credited: true, credited });
       await pgClient.query(
-        `INSERT INTO payments (id, user_id, payment_id, amount, status, txid, metadata)
-         VALUES ($1,$2,$1,$3,'pending',$4,$5)
-         ON CONFLICT (id) DO NOTHING`,
-        [payment_id, req.userId, piAmount, txid, JSON.stringify({ type: 'connects', credited })]
+        `UPDATE payments SET status='completed', txid=COALESCE($2, txid), amount=$3, metadata=$4, updated_at=NOW() WHERE id=$1`,
+        [payment_id, txid || null, verifiedAmount || payRow.amount || 0, JSON.stringify(newMeta)]
       );
-      const updated = await pgClient.query(
-        `UPDATE payments SET status='completed', txid=$2, amount=$3, updated_at=NOW()
-         WHERE id=$1 AND status != 'completed' RETURNING id`,
-        [payment_id, txid, piAmount]
+      const balRes = await pgClient.query(
+        'UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2 RETURNING balance_connects',
+        [credited, req.userId]
       );
-      if (!updated.rows.length) { await pgClient.query('ROLLBACK'); return res.status(400).json({ error: 'Payment already processed' }); }
-      await pgClient.query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [credited, req.userId]);
+      balance = balRes.rows[0]?.balance_connects || 0;
       await pgClient.query('COMMIT');
     } catch (txErr) {
       await pgClient.query('ROLLBACK').catch(() => {});
       throw txErr;
     } finally { pgClient.release(); }
 
-    const result = await query('SELECT balance_connects FROM users WHERE id = $1', [req.userId]);
-    const balance = result.rows[0]?.balance_connects || 0;
-    await audit('connects_purchased', { user_id: req.userId, credited, payment_id, txid });
+    await audit('connects_purchased', { user_id: req.userId, credited, payment_id, txid: txid || null });
     res.json({ success: true, credited, balance, balance_connects: balance, new_balance: balance, remaining_connects: balance });
   } catch (err) { serverError(err, res); }
 });
