@@ -149,8 +149,9 @@ async function handleGetEscrow(req, res) {
 
 // ─── Payments ──────────────────────────────────────────────
 
-router.post('/api/payments/:paymentId/approve', auth, async (req, res) => {
-  await handlePaymentApprove(req.params.paymentId, req.body.metadata, req.userId, res);
+router.post('/api/payments/:paymentId/approve', softAuth, async (req, res) => {
+  const userId = req.userId || req.body.user?.id || req.body.user_id;
+  await handlePaymentApprove(req.params.paymentId, req.body.metadata, userId, res);
 });
 
 router.post('/api/payments/:paymentId/complete', softAuth, async (req, res) => {
