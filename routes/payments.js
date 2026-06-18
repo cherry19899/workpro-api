@@ -5,7 +5,7 @@ const router = require('express').Router();
 const fetch = require('node-fetch');
 const { query, getPool } = require('../src/db');
 const { piApprovePayment, piCompletePayment, piGetPayment, notify, audit, serverError, PI_API_KEY } = require('../src/helpers');
-const { auth, checkBlocked } = require('../src/middleware');
+const { auth, softAuth, checkBlocked } = require('../src/middleware');
 
 // ─── Shared Pi payment handlers ────────────────────────────────────────────
 // handlePaymentApprove and handlePaymentComplete: shared by RESTful /:id/approve|complete
@@ -153,8 +153,8 @@ router.post('/api/payments/:paymentId/approve', auth, async (req, res) => {
   await handlePaymentApprove(req.params.paymentId, req.body.metadata, req.userId, res);
 });
 
-router.post('/api/payments/:paymentId/complete', auth, async (req, res) => {
-  await handlePaymentComplete(req.params.paymentId, req.body.txid, req.body.metadata, req.userId, res);
+router.post('/api/payments/:paymentId/complete', softAuth, async (req, res) => {
+  await handlePaymentComplete(req.params.paymentId, req.body.txid, req.body.metadata, req.userId || req.body.user_id, res);
 });
 
 router.get('/api/payments', auth, async (req, res) => {
@@ -371,8 +371,9 @@ router.post('/api/connects/purchase', auth, checkBlocked, async (req, res) => {
 
 // POST /api/connects/buy — credit connects via Pi-verified payment (full flow)
 // Different call pattern from /purchase — keeps both as per requirement #3
-router.post('/api/connects/buy', auth, checkBlocked, async (req, res) => {
-  const { payment_id, txid, amount, status } = req.body;
+router.post('/api/connects/buy', softAuth, checkBlocked, async (req, res) => {
+  const { payment_id, txid, amount, status, pi_amount, package_amount } = req.body;
+  if (!req.userId && req.body.user_id) req.userId = req.body.user_id;
 
   // Approval / pending step: record intent only. NEVER credit connects here.
   if (status === 'pending') {
@@ -425,7 +426,7 @@ router.post('/api/connects/buy', auth, checkBlocked, async (req, res) => {
         await pgClient.query(
           `INSERT INTO payments (id, user_id, type, amount, status, txid, metadata)
            VALUES ($1,$2,'connects',$3,$4,$5,$6) ON CONFLICT (id) DO NOTHING`,
-          [payment_id, req.userId, parseFloat(pi_amount || 0), verified ? 'completed' : 'pending', txid || null, JSON.stringify({ type: 'connects' })]
+          [payment_id, req.userId, parseFloat(pi_amount || amount || 0), verified ? 'completed' : 'pending', txid || null, JSON.stringify({ type: 'connects' })]
         );
         payRow = (await pgClient.query('SELECT * FROM payments WHERE id = $1 FOR UPDATE', [payment_id])).rows[0];
       }
@@ -452,7 +453,7 @@ router.post('/api/connects/buy', auth, checkBlocked, async (req, res) => {
 
       // Canonical rate: 10 connects per verified Pi (consistent across the codebase).
       // Fall back to the requested package size only when the Pi amount is unknown.
-      const verifiedAmount = parseFloat((piPayment && piPayment.amount) || payRow.amount || pi_amount || 0);
+      const verifiedAmount = parseFloat((piPayment && piPayment.amount) || payRow.amount || pi_amount || amount || 0);
       credited = Math.floor(verifiedAmount * 10);
       if (!(credited > 0)) {
         const pkg = parseInt(package_amount || req.body.quantity || 0);
