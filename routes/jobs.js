@@ -666,7 +666,8 @@ router.get('/api/applications/user/:userId', auth, async (req, res) => {
     const userId = req.userId;
     const result = await query(
       `SELECT a.*, j.title as job_title, j.budget, j.status as job_status,
-              u.username as client_username
+              COALESCE(u.username, j.posted_by_name) as client_username,
+              COALESCE(u.username, j.posted_by_name) as client_name
        FROM applications a
        JOIN jobs j ON a.job_id = j.id
        LEFT JOIN users u ON u.id = j.posted_by
