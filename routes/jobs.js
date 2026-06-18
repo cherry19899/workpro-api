@@ -626,8 +626,10 @@ router.get('/api/applications/my', auth, async (req, res) => {
   const offset = parseInt(req.query.offset) || 0;
   try {
     const result = await query(
-      `SELECT a.*, j.posted_by_name as client_name, j.posted_by as client_id
+      `SELECT a.*, j.posted_by_name as client_name, j.posted_by as client_id,
+              COALESCE(u.username, j.posted_by_name) as client_username
        FROM applications a LEFT JOIN jobs j ON j.id = a.job_id
+       LEFT JOIN users u ON u.id = j.posted_by
        WHERE a.freelancer_id = $1 ORDER BY a.created_at DESC LIMIT $2 OFFSET $3`,
       [req.userId, limit, offset]
     );
@@ -642,8 +644,10 @@ router.get('/api/applications/me', auth, async (req, res) => {
   const offset = parseInt(req.query.offset) || 0;
   try {
     const result = await query(
-      `SELECT a.*, j.posted_by_name as client_name, j.posted_by as client_id
+      `SELECT a.*, j.posted_by_name as client_name, j.posted_by as client_id,
+              COALESCE(u.username, j.posted_by_name) as client_username
        FROM applications a LEFT JOIN jobs j ON j.id = a.job_id
+       LEFT JOIN users u ON u.id = j.posted_by
        WHERE a.freelancer_id = $1 ORDER BY a.created_at DESC LIMIT $2 OFFSET $3`,
       [req.userId, limit, offset]
     );
