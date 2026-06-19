@@ -75,6 +75,10 @@ router.post('/api/me', authLimiter, async (req, res) => {
         return res.status(401).json({ error: 'Pi token verification failed. Please re-authenticate.' });
       }
     } else {
+      if (!process.env.SANDBOX_MODE) {
+        return res.status(401).json({ error: 'accessToken required' });
+      }
+      // SANDBOX_MODE only — skip Pi verification for local/test environments
       const existing = await query('SELECT id FROM users WHERE id = $1', [uid]);
       if (!existing.rows.length) {
         return res.status(401).json({ error: 'accessToken required for new account registration' });
@@ -165,6 +169,10 @@ router.post('/api/auth/login', async (req, res) => {
         return res.status(403).json({ error: 'Token does not match userId' });
       }
     } else {
+      if (!process.env.SANDBOX_MODE) {
+        return res.status(401).json({ error: 'accessToken required' });
+      }
+      // SANDBOX_MODE only — skip Pi verification for local/test environments
       const existing = await query('SELECT id FROM users WHERE id = $1', [userId]);
       if (!existing.rows.length) {
         return res.status(401).json({ error: 'accessToken required for new account registration' });
