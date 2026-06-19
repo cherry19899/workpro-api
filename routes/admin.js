@@ -315,4 +315,48 @@ router.get('/api/admin/verify', async (req, res) => {
   res.json({ valid: false });
 });
 
+// POST /api/admin/merge-users — merge duplicate user accounts (from_id → to_id)
+router.post('/api/admin/merge-users', adminAuth, async (req, res) => {
+  const { from_id, to_id } = req.body;
+  if (!from_id || !to_id) return res.status(400).json({ error: 'from_id and to_id required' });
+  if (from_id === to_id) return res.status(400).json({ error: 'Cannot merge user with itself' });
+  try {
+    const [fromRow, toRow] = await Promise.all([
+      query('SELECT * FROM users WHERE id = $1', [from_id]),
+      query('SELECT * FROM users WHERE id = $1', [to_id]),
+    ]);
+    if (!fromRow.rows.length) return res.status(404).json({ error: `User ${from_id} not found` });
+    if (!toRow.rows.length) return res.status(404).json({ error: `User ${to_id} not found` });
+    const from = fromRow.rows[0];
+    const to = toRow.rows[0];
+    const pgM = await getPool().connect();
+    try {
+      await pgM.query('BEGIN');
+      // Transfer connects and pi balance
+      await pgM.query(
+        'UPDATE users SET balance_connects = balance_connects + $1, balance_pi = COALESCE(balance_pi,0) + $2, total_jobs_posted = total_jobs_posted + $3, total_jobs_completed = total_jobs_completed + $4, updated_at = NOW() WHERE id = $5',
+        [from.balance_connects || 0, parseFloat(from.balance_pi || 0), from.total_jobs_posted || 0, from.total_jobs_completed || 0, to_id]
+      );
+      // Re-point all FK references from old to new
+      const tables = [
+        ['jobs', 'posted_by'], ['applications', 'freelancer_id'], ['applications', 'client_id'],
+        ['escrows', 'client_id'], ['escrows', 'freelancer_id'], ['payments', 'user_id'],
+        ['ratings', 'from_user_id'], ['ratings', 'to_user_id'], ['notifications', 'user_id'],
+        ['chat_rooms', 'client_id'], ['chat_rooms', 'freelancer_id'], ['chat_messages', 'sender_id'],
+      ];
+      for (const [tbl, col] of tables) {
+        await pgM.query(`UPDATE ${tbl} SET ${col} = $1 WHERE ${col} = $2`, [to_id, from_id]).catch(() => {});
+      }
+      // If from was admin, promote to
+      if (from.role === 'admin') {
+        await pgM.query("UPDATE users SET role = 'admin' WHERE id = $1", [to_id]);
+      }
+      await pgM.query('DELETE FROM users WHERE id = $1', [from_id]);
+      await pgM.query('COMMIT');
+    } catch (e) { await pgM.query('ROLLBACK').catch(() => {}); throw e; }
+    finally { pgM.release(); }
+    res.json({ success: true, merged: from_id, into: to_id });
+  } catch (err) { serverError(err, res); }
+});
+
 module.exports = router;
