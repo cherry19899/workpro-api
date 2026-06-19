@@ -7,6 +7,8 @@ const { query, getPool } = require('../src/db');
 const { piApprovePayment, piCompletePayment, piGetPayment, notify, audit, serverError, PI_API_KEY } = require('../src/helpers');
 const { auth, softAuth, checkBlocked } = require('../src/middleware');
 
+const PLATFORM_FEE = Math.min(Math.max(parseFloat(process.env.PLATFORM_FEE_PERCENT || '2') / 100, 0), 0.5);
+
 // ─── Shared Pi payment handlers ────────────────────────────────────────────
 // handlePaymentApprove and handlePaymentComplete: shared by RESTful /:id/approve|complete
 // and legacy flat /approve|complete routes.
@@ -114,7 +116,7 @@ async function handleEscrowRelease(req, res) {
     const escrow = result.rows[0];
     if (escrow.client_id !== req.userId) return res.status(403).json({ error: 'Not your escrow' });
     if (escrow.status !== 'funded') return res.status(400).json({ error: 'Escrow is not funded' });
-    const net = parseFloat((escrow.amount * 0.98).toFixed(8)); // 2% platform commission
+    const net = parseFloat((escrow.amount * (1 - PLATFORM_FEE)).toFixed(8)); // platform commission
     const pgClient3 = await getPool().connect();
     try {
       await pgClient3.query('BEGIN');
