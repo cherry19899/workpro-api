@@ -60,13 +60,27 @@ async function handlePaymentComplete(paymentId, txid, metadata, userId, res) {
     const pgPmtC = await getPool().connect();
     try {
       await pgPmtC.query('BEGIN');
-      const markRes = await pgPmtC.query(
+      let markRes = await pgPmtC.query(
         "UPDATE payments SET status='completed', txid=$1, updated_at=NOW() WHERE id=$2 AND status='approved' RETURNING *",
         [txid, paymentId]
       );
       if (!markRes.rows.length) {
-        await pgPmtC.query('ROLLBACK');
-        return res.json({ success: true, payment: piPayment });
+        // No approved row — check if already completed (idempotent) or never approved (approve step failed).
+        const existingRow = await pgPmtC.query('SELECT * FROM payments WHERE id = $1', [paymentId]);
+        if (existingRow.rows.length && existingRow.rows[0].status === 'completed') {
+          // Already completed by a previous call — idempotent success.
+          await pgPmtC.query('ROLLBACK');
+          return res.json({ success: true, payment: piPayment });
+        }
+        // Approve step was skipped (e.g. cold-start 502) — upsert as completed so connects can be credited.
+        await pgPmtC.query(
+          `INSERT INTO payments (id, user_id, type, amount, status, txid, metadata)
+           VALUES ($1,$2,'connects',$3,'completed',$4,$5)
+           ON CONFLICT (id) DO UPDATE SET status='completed', txid=EXCLUDED.txid, updated_at=NOW()`,
+          [paymentId, userId, parseFloat(piPayment.amount || 0), txid, JSON.stringify({ type: 'connects' })]
+        );
+        markRes = await pgPmtC.query('SELECT * FROM payments WHERE id = $1', [paymentId]);
+        if (!markRes.rows.length) { await pgPmtC.query('ROLLBACK'); return res.json({ success: true, payment: piPayment }); }
       }
       const markDone = markRes.rows[0];
       const meta = markDone.metadata || {};
