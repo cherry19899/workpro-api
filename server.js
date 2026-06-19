@@ -76,13 +76,15 @@ app.use(rateLimit({
 const {
   authLimiter,
   adminLimiter,
+  adminStrictLimiter,
   connectsLimiter,
   messageLimiter,
 } = require('./src/middleware');
 
 app.use('/api/auth', authLimiter);
 // authLimiter applied directly to POST /api/me (login) inside routes/auth.js
-app.use('/api/admin', adminLimiter);
+app.use('/api/admin', adminStrictLimiter); // IP-level DDoS guard (50/15min)
+app.use('/api/admin', adminLimiter);       // Functional limit (100/15min per IP)
 app.use('/api/connects/purchase', connectsLimiter);
 app.use('/api/connects/buy', connectsLimiter);
 app.use('/api/payments', connectsLimiter);
@@ -193,6 +195,41 @@ async function ensureNotificationsTable() {
   await run(`CREATE INDEX IF NOT EXISTS idx_chat_messages_room_id ON chat_messages(room_id)`, 'idx_chat_messages_room_id');
   await run(`CREATE INDEX IF NOT EXISTS idx_payments_user_id ON payments(user_id)`, 'idx_payments_user_id');
   await run(`CREATE INDEX IF NOT EXISTS idx_ratings_to_user_id ON ratings(to_user_id)`, 'idx_ratings_to_user_id');
+  // ─── Data integrity ───────────────────────────────────────────────
+  // Unique pair per (client, freelancer, job) prevents duplicate chat rooms.
+  // job_id can be NULL so we use a partial index trick: two separate indexes.
+  await run(
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_rooms_pair_with_job
+     ON chat_rooms(client_id, freelancer_id, job_id)
+     WHERE job_id IS NOT NULL`,
+    'idx_chat_rooms_pair_with_job'
+  );
+  await run(
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_rooms_pair_no_job
+     ON chat_rooms(client_id, freelancer_id)
+     WHERE job_id IS NULL`,
+    'idx_chat_rooms_pair_no_job'
+  );
+  // FK-style index on chat_messages.room_id for join performance
+  await run(
+    `CREATE INDEX IF NOT EXISTS idx_chat_messages_room_id2 ON chat_messages(room_id, created_at DESC)`,
+    'idx_chat_messages_room_id2'
+  );
+  // Foreign key: chat_messages.room_id → chat_rooms.id (NOT VALID = doesn't scan existing rows)
+  await run(
+    `DO $$ BEGIN
+       IF NOT EXISTS (
+         SELECT 1 FROM information_schema.table_constraints
+         WHERE constraint_name = 'fk_chat_messages_room_id'
+           AND table_name = 'chat_messages'
+       ) THEN
+         ALTER TABLE chat_messages
+           ADD CONSTRAINT fk_chat_messages_room_id
+           FOREIGN KEY (room_id) REFERENCES chat_rooms(id) ON DELETE CASCADE NOT VALID;
+       END IF;
+     END $$`,
+    'fk_chat_messages_room_id'
+  );
 }
 
 // ─── Start ──────────────────────────────────────────────

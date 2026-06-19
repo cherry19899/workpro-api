@@ -68,6 +68,15 @@ const jobPostLimiter = rateLimit({
   message: { error: 'Too many jobs posted, try again later' },
 });
 
+// Strict IP limiter for admin endpoints — 50 failed-or-brute-force attempts/15min
+// Note: legitimate automated admin scripts should use RATE_LIMIT_BYPASS_KEY instead
+const adminStrictLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, max: 50 * DEV_MULTIPLIER,
+  keyGenerator: (req) => req.ip || req.socket?.remoteAddress || 'unknown',
+  skip: skipIfBypassed,
+  message: { error: 'Too many requests to admin API' },
+});
+
 // ─── Auth middleware ──────────────────────────────────────────────
 async function auth(req, res, next) {
   const authHeader = req.headers['authorization'];
@@ -138,6 +147,7 @@ module.exports = {
   checkBlocked,
   authLimiter,
   adminLimiter,
+  adminStrictLimiter,
   connectsLimiter,
   messageLimiter,
   jobPostLimiter,

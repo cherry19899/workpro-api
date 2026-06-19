@@ -281,7 +281,14 @@ router.put('/api/jobs/:id', auth, checkBlocked, async (req, res) => {
       if (skills && String(skills).length > 500) return res.status(400).json({ error: 'Skills too long (max 500)' });
       fields.push(`skills=$${i++}`); vals.push(skills);
     }
-    if (deadline !== undefined) { fields.push(`deadline=$${i++}`); vals.push(deadline || null); }
+    if (deadline !== undefined) {
+      if (deadline) {
+        const dl = new Date(deadline);
+        if (isNaN(dl.getTime())) return res.status(400).json({ error: 'Invalid deadline date' });
+        if (dl < new Date()) return res.status(400).json({ error: 'Deadline must be in the future' });
+      }
+      fields.push(`deadline=$${i++}`); vals.push(deadline || null);
+    }
     if (images !== undefined) {
       if (Array.isArray(images) && images.length > 10) return res.status(400).json({ error: 'Too many images (max 10)' });
       fields.push(`images=$${i++}`); vals.push(serializeImages(images));
