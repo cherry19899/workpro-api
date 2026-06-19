@@ -15,38 +15,56 @@ const JWT_SECRET = process.env.JWT_SECRET || (() => {
 
 const ADMIN_API_KEY = process.env.ADMIN_API_KEY || 'admin-secret-key';
 
+// RATE_LIMIT_BYPASS_KEY — set this env var to skip rate limiting for automated
+// testing / CI. Callers pass it as x-rate-bypass header. Never expose in client code.
+const RATE_LIMIT_BYPASS_KEY = process.env.RATE_LIMIT_BYPASS_KEY || null;
+
+function skipIfBypassed(req) {
+  if (!RATE_LIMIT_BYPASS_KEY) return false;
+  const header = req.headers['x-rate-bypass'] || '';
+  return header.length === RATE_LIMIT_BYPASS_KEY.length &&
+    crypto.timingSafeEqual(Buffer.from(header), Buffer.from(RATE_LIMIT_BYPASS_KEY));
+}
+
+// In dev/sandbox mode all per-endpoint limits are relaxed 10×.
+const DEV_MULTIPLIER = process.env.SANDBOX_MODE ? 10 : 1;
+
 // ─── Rate limiters ──────────────────────────────────────────────
-// Stricter rate limits for sensitive endpoints (per IP)
 const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, max: 20,
+  windowMs: 15 * 60 * 1000, max: 20 * DEV_MULTIPLIER,
   keyGenerator: (req) => req.ip || req.socket?.remoteAddress || 'unknown',
+  skip: skipIfBypassed,
   message: { error: 'Too many auth attempts, try again later' },
 });
 
 const adminLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, max: 100,
+  windowMs: 15 * 60 * 1000, max: 100 * DEV_MULTIPLIER,
   keyGenerator: (req) => req.ip || req.socket?.remoteAddress || 'unknown',
+  skip: skipIfBypassed,
   message: { error: 'Too many admin requests' },
 });
 
 // Strict limiter for connects/payments to prevent abuse
 const connectsLimiter = rateLimit({
-  windowMs: 60 * 60 * 1000, max: 20,
+  windowMs: 60 * 60 * 1000, max: 20 * DEV_MULTIPLIER,
   // Key by IP, NOT x-user-id — the user header is client-controlled and trivially rotated to bypass the cap
   keyGenerator: (req) => req.ip || req.socket?.remoteAddress || 'unknown',
+  skip: skipIfBypassed,
   message: { error: 'Too many connect operations, try again later' },
 });
 
 // Strict limiter for chat message sending — 30 messages per minute per IP
 const messageLimiter = rateLimit({
-  windowMs: 60 * 1000, max: 30,
+  windowMs: 60 * 1000, max: 30 * DEV_MULTIPLIER,
   keyGenerator: (req) => req.ip || req.socket?.remoteAddress || 'unknown',
+  skip: skipIfBypassed,
   message: { error: 'Too many messages, slow down' },
 });
 
 const jobPostLimiter = rateLimit({
-  windowMs: 60 * 60 * 1000, max: 10,
+  windowMs: 60 * 60 * 1000, max: 10 * DEV_MULTIPLIER,
   keyGenerator: (req) => req.ip || req.socket?.remoteAddress || 'unknown',
+  skip: skipIfBypassed,
   message: { error: 'Too many jobs posted, try again later' },
 });
 

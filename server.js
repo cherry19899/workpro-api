@@ -53,10 +53,21 @@ app.use(cors({
 }));
 
 // Global rate limit (all endpoints except /api/health)
+const RATE_LIMIT_BYPASS_KEY = process.env.RATE_LIMIT_BYPASS_KEY || null;
+function _skipRateLimit(req) {
+  if (req.path === '/api/health') return true;
+  if (!RATE_LIMIT_BYPASS_KEY) return false;
+  const h = req.headers['x-rate-bypass'] || '';
+  try {
+    return h.length === RATE_LIMIT_BYPASS_KEY.length &&
+      require('crypto').timingSafeEqual(Buffer.from(h), Buffer.from(RATE_LIMIT_BYPASS_KEY));
+  } catch { return false; }
+}
+const GLOBAL_RATE_MAX = process.env.SANDBOX_MODE ? 5000 : 500;
 app.use(rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 500,
-  skip: (req) => req.path === '/api/health',
+  max: GLOBAL_RATE_MAX,
+  skip: _skipRateLimit,
 }));
 
 // Import route-specific limiters from middleware so we can apply them globally here

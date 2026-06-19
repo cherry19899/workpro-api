@@ -8,6 +8,8 @@ const { query, getPool } = require('../src/db');
 const { notify, audit, serverError } = require('../src/helpers');
 const { adminAuth, JWT_SECRET, ADMIN_API_KEY } = require('../src/middleware');
 
+const PLATFORM_FEE = Math.min(Math.max(parseFloat(process.env.PLATFORM_FEE_PERCENT || '2') / 100, 0), 0.5);
+
 // GET /api/admin/stats
 router.get('/api/admin/stats', adminAuth, async (req, res) => {
   try {
@@ -18,7 +20,7 @@ router.get('/api/admin/stats', adminAuth, async (req, res) => {
       query('SELECT COUNT(*) FROM escrows'),
       query("SELECT COUNT(*) FROM escrows WHERE status IN ('pending','funded')"),
       query('SELECT COUNT(*) FROM payments'),
-      query("SELECT COALESCE(SUM(amount*0.02),0) AS total FROM escrows WHERE status='released'"),
+      query(`SELECT COALESCE(SUM(amount*${PLATFORM_FEE}),0) AS total FROM escrows WHERE status='released'`),
       query('SELECT COUNT(*) FROM ratings'),
       query('SELECT COUNT(*) FROM chat_rooms'),
       query("SELECT COUNT(*) FROM escrows WHERE status='disputed'"),
@@ -231,7 +233,7 @@ router.post('/api/admin/escrows/:id/resolve', adminAuth, async (req, res) => {
       );
       if (!guard.rows.length) { await pgC.query('ROLLBACK'); return res.status(409).json({ error: 'Escrow no longer disputed' }); }
       if (action === 'release_to_freelancer') {
-        const net = parseFloat((escrow.amount * 0.98).toFixed(8));
+        const net = parseFloat((escrow.amount * (1 - PLATFORM_FEE)).toFixed(8));
         await pgC.query('UPDATE users SET balance_pi = COALESCE(balance_pi,0) + $1, total_jobs_completed = total_jobs_completed + 1, updated_at=NOW() WHERE id=$2', [net, escrow.freelancer_id]);
         await pgC.query("UPDATE jobs SET status='completed', updated_at=NOW() WHERE id=$1", [escrow.job_id]);
       } else {
@@ -252,15 +254,15 @@ router.post('/api/admin/escrows/:id/resolve', adminAuth, async (req, res) => {
 router.get('/api/admin/earnings', adminAuth, async (req, res) => {
   try {
     const [result, transactions, pending, recentPayments] = await Promise.all([
-      query("SELECT COALESCE(SUM(amount*0.02), 0) as total FROM escrows WHERE status = 'released'"),
+      query(`SELECT COALESCE(SUM(amount*${PLATFORM_FEE}), 0) as total FROM escrows WHERE status = 'released'`),
       query('SELECT COUNT(*) FROM payments'),
       query("SELECT COALESCE(SUM(amount), 0) as total FROM payments WHERE status = 'approved'"),
       query(`
         SELECT p.*,
           u.username AS client_name,
           p.amount AS job_amount,
-          CAST(ROUND(CAST(p.amount AS numeric) * 0.98, 4) AS float) AS freelancer_amount,
-          CAST(ROUND(CAST(p.amount AS numeric) * 0.02, 4) AS float) AS developer_fee
+          CAST(ROUND(CAST(p.amount AS numeric) * ${(1 - PLATFORM_FEE).toFixed(4)}, 4) AS float) AS freelancer_amount,
+          CAST(ROUND(CAST(p.amount AS numeric) * ${PLATFORM_FEE.toFixed(4)}, 4) AS float) AS developer_fee
         FROM payments p
         LEFT JOIN users u ON u.id = p.user_id
         ORDER BY p.created_at DESC LIMIT 50
