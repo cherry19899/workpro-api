@@ -364,6 +364,7 @@ router.post('/api/jobs/:id/apply', auth, checkBlocked, async (req, res) => {
       return res.status(400).json({ error: 'Not enough connects', required: cost, current: user?.balance_connects || 0 });
     }
     let appResult;
+    let lockedCost = cost;
     const pgClient = await getPool().connect();
     try {
       await pgClient.query('BEGIN');
@@ -373,7 +374,7 @@ router.post('/api/jobs/:id/apply', auth, checkBlocked, async (req, res) => {
         await pgClient.query('ROLLBACK');
         return res.status(400).json({ error: 'Job is not open' });
       }
-      const lockedCost = jobLock.rows[0].apply_cost || 1;
+      lockedCost = jobLock.rows[0].apply_cost || 1;
       const deductResult = await pgClient.query(
         'UPDATE users SET balance_connects = balance_connects - $1, updated_at = NOW() WHERE id = $2 AND balance_connects >= $1 RETURNING id',
         [lockedCost, req.userId]
