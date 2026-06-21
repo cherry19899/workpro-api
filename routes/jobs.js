@@ -5,6 +5,7 @@ const router = require('express').Router();
 const { query, getPool } = require('../src/db');
 const { notify, audit, serverError } = require('../src/helpers');
 const { auth, softAuth, checkBlocked, jobPostLimiter } = require('../src/middleware');
+const { processJobImages } = require('../src/github-images');
 
 // ─── Image helpers ──────────────────────────────────────────────
 function serializeImages(images) {
@@ -30,9 +31,16 @@ function parseImages(images) {
   return images;
 }
 
-function parseJobRow(job) {
+function parseJobRow(job, { stripBase64 = false } = {}) {
   if (!job) return job;
-  return { ...job, images: parseImages(job.images) };
+  let imgs = parseImages(job.images);
+  if (stripBase64 && Array.isArray(imgs)) {
+    // In list responses, drop base64 blobs — they haven't been migrated yet.
+    // Single-job GET still returns them (callers pass stripBase64:false).
+    imgs = imgs.map(i => (typeof i === 'string' && i.startsWith('data:')) ? null : i).filter(Boolean);
+    if (imgs.length === 0) imgs = null;
+  }
+  return { ...job, images: imgs };
 }
 
 // ─── Jobs ──────────────────────────────────────────────
@@ -80,7 +88,7 @@ router.get('/api/jobs', async (req, res) => {
     // Workaround: bundle v200 has inverted filter hiding 'open' jobs in Find Work feed.
     // Use posted_by_name as posted_by so bundle's own-job filter (posted_by !== username) works
     // correctly with case-sensitive Pi SDK username (e.g. 'Cherry19899' not 'pi_cherry19899').
-    const jobs = dataResult.rows.map(parseJobRow).map(function(j) {
+    const jobs = dataResult.rows.map(r => parseJobRow(r, { stripBase64: true })).map(function(j) {
       const normalized = Object.assign({}, j, {
         posted_by: j.posted_by_name || (j.posted_by ? j.posted_by.replace(/^pi_/, '') : j.posted_by),
       });
@@ -145,6 +153,17 @@ router.post('/api/jobs', auth, checkBlocked, jobPostLimiter, async (req, res) =>
       await pgClientPost.query('ROLLBACK').catch(() => {});
       throw txErr;
     } finally { pgClientPost.release(); }
+    // If any image is still base64 (GITHUB_TOKEN set), upload to GitHub Pages now
+    // that we have the job id for a stable filename.
+    if (Array.isArray(images) && images.some(i => typeof i === 'string' && i.startsWith('data:'))) {
+      const uploadedImgs = await processJobImages(images, newJob.id);
+      const anyUploaded = uploadedImgs.some((u, i) => u !== images[i]);
+      if (anyUploaded) {
+        await query('UPDATE jobs SET images = $1, updated_at = NOW() WHERE id = $2',
+          [serializeImages(uploadedImgs), newJob.id]).catch(() => {});
+        newJob.images = serializeImages(uploadedImgs);
+      }
+    }
     await audit('job_created', { job_id: newJob.id, user_id: req.userId, post_cost: POST_COST });
     res.json({ job: parseJobRow(newJob), success: true });
   } catch (err) { serverError(err, res); }
@@ -295,7 +314,11 @@ router.put('/api/jobs/:id', auth, checkBlocked, async (req, res) => {
     }
     if (images !== undefined) {
       if (Array.isArray(images) && images.length > 10) return res.status(400).json({ error: 'Too many images (max 10)' });
-      fields.push(`images=$${i++}`); vals.push(serializeImages(images));
+      // Upload any base64 to GitHub Pages before storing
+      const finalImgs = Array.isArray(images) && images.some(x => typeof x === 'string' && x.startsWith('data:'))
+        ? await processJobImages(images, req.params.id)
+        : images;
+      fields.push(`images=$${i++}`); vals.push(serializeImages(finalImgs));
     }
     if (!fields.length) return res.status(400).json({ error: 'Nothing to update' });
     fields.push(`updated_at=NOW()`);

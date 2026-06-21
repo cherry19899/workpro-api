@@ -156,6 +156,20 @@ router.get('/api/admin/jobs/all', adminAuth, async (req, res) => {
   } catch (err) { serverError(err, res); }
 });
 
+// PATCH /api/admin/jobs/:id/images — used by the image migration script to swap
+// base64 payloads for static file URLs without touching any other job fields.
+router.patch('/api/admin/jobs/:id/images', adminAuth, async (req, res) => {
+  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Job not found' });
+  const { images } = req.body;
+  if (!Array.isArray(images)) return res.status(400).json({ error: 'images must be an array' });
+  try {
+    const serialized = images.length > 0 ? JSON.stringify(images) : null;
+    const r = await query('UPDATE jobs SET images = $1, updated_at = NOW() WHERE id = $2 RETURNING id', [serialized, req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ error: 'Job not found' });
+    res.json({ success: true, id: req.params.id, images });
+  } catch (err) { serverError(err, res); }
+});
+
 // DELETE /api/admin/jobs/:id
 router.delete('/api/admin/jobs/:id', adminAuth, async (req, res) => {
   if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Job not found' });
