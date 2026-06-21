@@ -119,6 +119,13 @@ router.post('/api/me', authLimiter, async (req, res) => {
         if (r1.rowCount > 0 || r2.rowCount > 0) console.log(`[Migration] cherry19899→pi_cherry19899: jobs=${r1.rowCount} apps=${r2.rowCount}`);
       } catch (mErr) { console.error('[Migration] error:', mErr.message); }
     }
+    // Owner self-heal: any uid whose username is cherry19899 (any case) always gets admin.
+    // On Pi mainnet the real uid is pi_<uuid>, not pi_cherry19899, so a uid check alone never fires.
+    if ((uname && uname.toLowerCase() === 'cherry19899') ||
+        uid === 'pi_cherry19899' ||
+        uid === 'pi_a2b617f7-f510-4502-a046-805facedcc29') {
+      await query(`UPDATE users SET role = 'admin' WHERE id = $1 AND role != 'admin'`, [uid]).catch(() => {});
+    }
     await query(`UPDATE users SET total_jobs_posted = (SELECT COUNT(*) FROM jobs WHERE posted_by = $1), updated_at = NOW() WHERE id = $1`, [uid]).catch(() => {});
     const user = await query('SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, is_blocked, status, created_at FROM users WHERE id = $1', [uid]);
     const u = user.rows[0];
