@@ -262,7 +262,7 @@ router.post('/api/payments/incomplete', auth, async (req, res) => {
 router.post('/api/payments/approve', auth, async (req, res) => {
   const { payment_id, metadata } = req.body;
   if (!payment_id) return res.status(400).json({ error: 'payment_id required' });
-  await handlePaymentApprove(payment_id, metadata, req.userId, res);
+  await handlePaymentApprove(payment_id, metadata, req.userId, res, req.body.payments_enabled);
 });
 
 router.post('/api/payments/complete', auth, async (req, res) => {

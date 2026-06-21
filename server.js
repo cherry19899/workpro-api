@@ -301,8 +301,11 @@ initDb().then(async () => {
     console.log(`[WorkPro API] ${signal} received — graceful shutdown`);
     server.close(() => {
       console.log('[WorkPro API] HTTP server closed');
-      const { pool } = require('./src/db');
-      if (pool) pool.end(() => {
+      // Use getPool() — db.js exports `pool` by value at load time (null then),
+      // so destructuring `{ pool }` would always be null. getPool() returns the live pool.
+      const { getPool } = require('./src/db');
+      const livePool = getPool && getPool();
+      if (livePool) livePool.end(() => {
         console.log('[WorkPro API] DB pool closed');
         process.exit(0);
       });
