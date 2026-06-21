@@ -463,34 +463,46 @@ router.post('/api/admin/merge-users', adminAuth, async (req, res) => {
   } catch (err) { serverError(err, res); }
 });
 
-// GET /api/admin/twin-pairs — list all duplicate (pi_X, X) account pairs in DB
+// GET /api/admin/twin-pairs — list all duplicate account pairs sharing the same canonical uid
+// canonical uid = 'pi_' + regexp_replace(id, '^(pi_)+', '')
+// e.g.: cherry19899 → pi_cherry19899; pi_pi_X → pi_X
 router.get('/api/admin/twin-pairs', adminAuth, async (req, res) => {
   try {
-    // For every user whose id starts with "pi_", check whether the un-prefixed version exists.
     const result = await query(`
-      SELECT u1.id AS canonical_id, u1.username AS canonical_username,
-             u1.balance_connects AS canonical_connects, u1.bio AS canonical_bio,
-             u2.id AS twin_id, u2.username AS twin_username,
-             u2.balance_connects AS twin_connects, u2.bio AS twin_bio
-      FROM users u1
-      JOIN users u2 ON u2.id = SUBSTRING(u1.id FROM 4)  -- strip leading "pi_"
-      WHERE u1.id LIKE 'pi_%'
-      ORDER BY u1.id
+      WITH canonical AS (
+        SELECT id, username, balance_connects, bio,
+               'pi_' || regexp_replace(id, '^(pi_)+', '') AS cid
+        FROM users
+      )
+      SELECT c1.id AS canonical_id, c1.username AS canonical_username,
+             c1.balance_connects AS canonical_connects, c1.bio AS canonical_bio,
+             c2.id AS twin_id, c2.username AS twin_username,
+             c2.balance_connects AS twin_connects, c2.bio AS twin_bio
+      FROM canonical c1
+      JOIN canonical c2 ON c1.cid = c2.cid AND c1.id <> c2.id
+      WHERE c1.id = c1.cid   -- c1 IS the canonical form
+        AND c2.id <> c2.cid  -- c2 is NOT canonical
+      ORDER BY c1.id
     `);
     res.json({ pairs: result.rows, count: result.rows.length });
   } catch (err) { serverError(err, res); }
 });
 
-// POST /api/admin/auto-merge-twins — merge all (pi_X, X) duplicate pairs
-// Primary is always the pi_-prefixed form (canonical). Secondary (X) is deleted.
+// POST /api/admin/auto-merge-twins — merge all duplicate pairs into their canonical uid
+// Uses same canonical logic: 'pi_' + regexp_replace(id, '^(pi_)+', '')
 router.post('/api/admin/auto-merge-twins', adminAuth, async (req, res) => {
   try {
     const pairs = await query(`
-      SELECT u1.id AS canonical_id, u2.id AS twin_id
-      FROM users u1
-      JOIN users u2 ON u2.id = SUBSTRING(u1.id FROM 4)
-      WHERE u1.id LIKE 'pi_%'
-      ORDER BY u1.id
+      WITH canonical AS (
+        SELECT id, 'pi_' || regexp_replace(id, '^(pi_)+', '') AS cid
+        FROM users
+      )
+      SELECT c1.id AS canonical_id, c2.id AS twin_id
+      FROM canonical c1
+      JOIN canonical c2 ON c1.cid = c2.cid AND c1.id <> c2.id
+      WHERE c1.id = c1.cid
+        AND c2.id <> c2.cid
+      ORDER BY c1.id
     `);
     if (!pairs.rows.length) return res.json({ success: true, merged: 0, pairs: [] });
 
