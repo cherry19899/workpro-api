@@ -9,7 +9,7 @@ const PI_API_BASE = 'https://api.minepi.com';
 
 // ─── Pi Platform API ──────────────────────────────────────────────
 // userAccessToken: when provided (e.g. for /v2/me identity check), use user Bearer token instead of server Key
-async function piApiRequest(path, method = 'GET', body = null, userAccessToken = null) {
+async function piApiRequest(path, method = 'GET', body = null, userAccessToken = null, { retries = 3, baseDelay = 300 } = {}) {
   const opts = {
     method,
     headers: {
@@ -18,10 +18,24 @@ async function piApiRequest(path, method = 'GET', body = null, userAccessToken =
     },
   };
   if (body) opts.body = JSON.stringify(body);
-  const res = await fetch(`${PI_API_BASE}${path}`, opts);
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error_message || `Pi API error: ${res.status}`);
-  return data;
+  let lastErr;
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(`${PI_API_BASE}${path}`, opts);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error_message || `Pi API error: ${res.status}`);
+      return data;
+    } catch (err) {
+      lastErr = err;
+      const retryable = !err.message?.includes('Pi API error: 4'); // don't retry 4xx
+      if (attempt < retries && retryable) {
+        const delay = baseDelay * Math.pow(2, attempt - 1); // 300ms, 600ms, 1200ms
+        console.warn(`[Pi API] ${method} ${path} attempt ${attempt} failed (${err.message}), retrying in ${delay}ms`);
+        await new Promise(r => setTimeout(r, delay));
+      }
+    }
+  }
+  throw lastErr;
 }
 
 async function piApprovePayment(paymentId) {

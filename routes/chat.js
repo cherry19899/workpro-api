@@ -2,6 +2,7 @@
  * routes/chat.js — /api/chat/*, /api/push/*
  */
 const router = require('express').Router();
+const crypto = require('crypto');
 const { query } = require('../src/db');
 const { notify, serverError } = require('../src/helpers');
 const { auth, softAuth, checkBlocked, messageLimiter } = require('../src/middleware');
@@ -55,7 +56,7 @@ router.post('/api/chat/rooms', auth, checkBlocked, messageLimiter, async (req, r
       [job_id, cId, freelancer_id]
     );
     if (existing.rows.length) return res.json({ room: existing.rows[0] });
-    const roomId = 'room_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
+    const roomId = 'room_' + crypto.randomUUID();
     const result = await query(
       'INSERT INTO chat_rooms (id, client_id, freelancer_id, job_id) VALUES ($1, $2, $3, $4) RETURNING *',
       [roomId, cId, freelancer_id, job_id]
@@ -147,7 +148,7 @@ router.post('/api/chat/start', auth, checkBlocked, messageLimiter, async (req, r
           [req.userId, other_user_id]
         );
     if (existing.rows.length) return res.json({ conversation: existing.rows[0], id: existing.rows[0].id });
-    const roomId = 'room_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
+    const roomId = 'room_' + crypto.randomUUID();
     const result = await query('INSERT INTO chat_rooms (id, client_id, freelancer_id, job_id) VALUES ($1, $2, $3, $4) RETURNING *', [roomId, req.userId, other_user_id, jobId]);
     res.json({ conversation: result.rows[0], id: result.rows[0].id });
   } catch (err) { serverError(err, res); }
@@ -201,7 +202,7 @@ router.post('/api/chat/conversations', auth, checkBlocked, messageLimiter, async
     }
     const existing = await query('SELECT * FROM chat_rooms WHERE job_id = $1 AND ((client_id = $2 AND freelancer_id = $3) OR (client_id = $3 AND freelancer_id = $2))', [job_id, cId, fId]);
     if (existing.rows.length) return res.json({ conversation: existing.rows[0], room: existing.rows[0] });
-    const roomId = 'room_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
+    const roomId = 'room_' + crypto.randomUUID();
     const result = await query('INSERT INTO chat_rooms (id, client_id, freelancer_id, job_id) VALUES ($1, $2, $3, $4) RETURNING *', [roomId, cId, fId, job_id]);
     res.json({ conversation: result.rows[0], room: result.rows[0] });
   } catch (err) { serverError(err, res); }

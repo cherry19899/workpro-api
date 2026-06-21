@@ -367,13 +367,20 @@ router.post('/api/jobs/:id/apply', auth, checkBlocked, async (req, res) => {
     const pgClient = await getPool().connect();
     try {
       await pgClient.query('BEGIN');
+      // Re-check job status inside transaction (prevents race: job closed between outer check and INSERT)
+      const jobLock = await pgClient.query('SELECT status, apply_cost FROM jobs WHERE id = $1 FOR UPDATE', [req.params.id]);
+      if (!jobLock.rows.length || jobLock.rows[0].status !== 'open') {
+        await pgClient.query('ROLLBACK');
+        return res.status(400).json({ error: 'Job is not open' });
+      }
+      const lockedCost = jobLock.rows[0].apply_cost || 1;
       const deductResult = await pgClient.query(
         'UPDATE users SET balance_connects = balance_connects - $1, updated_at = NOW() WHERE id = $2 AND balance_connects >= $1 RETURNING id',
-        [cost, req.userId]
+        [lockedCost, req.userId]
       );
       if (!deductResult.rows.length) {
         await pgClient.query('ROLLBACK');
-        return res.status(400).json({ error: 'Not enough connects', required: cost });
+        return res.status(400).json({ error: 'Not enough connects', required: lockedCost });
       }
       const prevApp = await pgClient.query(
         `SELECT id FROM applications WHERE job_id=$1 AND freelancer_id=$2 AND status IN ('withdrawn','rejected','offer','declined') LIMIT 1`,
@@ -407,7 +414,7 @@ router.post('/api/jobs/:id/apply', auth, checkBlocked, async (req, res) => {
     await audit('job_applied', { job_id: req.params.id, user_id: req.userId });
     await notify(job.posted_by, 'application', `Новый отклик на задачу "${job.title}"`,
       `${user.username || 'Фрилансер'} откликнулся на вашу задачу`, parseInt(req.params.id), null);
-    const newBalance = (user.balance_connects || 0) - cost;
+    const newBalance = (user.balance_connects || 0) - lockedCost;
     res.json({ application: appResult.rows[0], success: true, remaining_connects: newBalance, new_balance: newBalance });
   } catch (err) { serverError(err, res); }
 });

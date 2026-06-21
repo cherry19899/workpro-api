@@ -315,7 +315,7 @@ router.get('/api/reviews/user/:userId', async (req, res) => {
 
 // GET /api/reviews — alias used by some frontend pages (?user_id=xxx)
 router.get('/api/reviews', async (req, res) => {
-  const userId = req.query.user_id || req.headers['x-user-id'];
+  const userId = req.query.user_id;
   if (!userId) return res.json({ reviews: [], ratings: [] });
   const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 50, 200));
   const offset = Math.max(0, parseInt(req.query.offset) || 0);

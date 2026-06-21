@@ -13,7 +13,12 @@ const PLATFORM_FEE = Math.min(Math.max(parseFloat(process.env.PLATFORM_FEE_PERCE
 // handlePaymentApprove and handlePaymentComplete: shared by RESTful /:id/approve|complete
 // and legacy flat /approve|complete routes.
 
-async function handlePaymentApprove(paymentId, metadata, userId, res) {
+async function handlePaymentApprove(paymentId, metadata, userId, res, paymentsEnabled) {
+  // payments_enabled is set by the Pi SDK on the frontend and passed through metadata.
+  // In sandbox/testnet it may be absent — block only on mainnet (when PI_API_KEY is production).
+  if (PI_API_KEY && paymentsEnabled === false) {
+    return res.status(403).json({ error: 'Pi payments not enabled for this account. Complete KYC on Pi App first.' });
+  }
   try {
     const ownerCheck = await query('SELECT user_id FROM payments WHERE id = $1', [paymentId]).catch(() => ({ rows: [] }));
     if (ownerCheck.rows.length && ownerCheck.rows[0].user_id && ownerCheck.rows[0].user_id !== userId) {
@@ -93,6 +98,14 @@ async function handlePaymentComplete(paymentId, txid, metadata, userId, res) {
       const payType = meta.type || (meta.job_id ? 'escrow' : 'connects');
       if (payType === 'connects' && !meta.connects_credited) {
         const piAmountPaid = parseFloat(piPayment.amount || markDone.amount || 0);
+        // Sanity check: Pi-confirmed amount must not be less than what was stored at approve time.
+        // Prevents a tampered approve step from overstating the amount.
+        const storedAmount = parseFloat(markDone.amount || 0);
+        if (PI_API_KEY && piPayment.amount && storedAmount > 0 && piAmountPaid < storedAmount - 0.001) {
+          await pgPmtC.query('ROLLBACK');
+          console.error(`[Payment] Amount mismatch: Pi returned ${piAmountPaid}, DB stored ${storedAmount}`);
+          return res.status(400).json({ error: 'Payment amount mismatch — contact support' });
+        }
         // Use package_amount if provided and pi-formula gives less (bonus packages like 50 for 4π)
         const formulaAmount = Math.floor(piAmountPaid * 10);
         const pkgAmount = parseInt(meta.quantity || meta.package_amount || 0);
@@ -179,7 +192,7 @@ async function handleGetEscrow(req, res) {
 // req.body.user_id fallback that let an attacker pass the ownership check by spoofing the id).
 // Frontend sends Authorization: Bearer on both payment flows (bundle _wpAuthHdr + index.html wrapper).
 router.post('/api/payments/:paymentId/approve', auth, async (req, res) => {
-  await handlePaymentApprove(req.params.paymentId, req.body.metadata, req.userId, res);
+  await handlePaymentApprove(req.params.paymentId, req.body.metadata, req.userId, res, req.body.payments_enabled);
 });
 
 router.post('/api/payments/:paymentId/complete', auth, async (req, res) => {
@@ -400,9 +413,8 @@ router.post('/api/connects/purchase', auth, checkBlocked, async (req, res) => {
 
 // POST /api/connects/buy — credit connects via Pi-verified payment (full flow)
 // Different call pattern from /purchase — keeps both as per requirement #3
-router.post('/api/connects/buy', softAuth, checkBlocked, async (req, res) => {
+router.post('/api/connects/buy', auth, checkBlocked, async (req, res) => {
   const { payment_id, txid, amount, status, pi_amount, package_amount } = req.body;
-  if (!req.userId && req.body.user_id) req.userId = req.body.user_id;
 
   // Approval / pending step: record intent only. NEVER credit connects here.
   if (status === 'pending') {

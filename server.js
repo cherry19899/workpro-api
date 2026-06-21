@@ -106,13 +106,27 @@ app.get('/.well-known/pi-network', (req, res) => {
 });
 
 app.get('/api/health', async (req, res) => {
+  const result = { status: 'ok', version: '3.2.0', timestamp: new Date().toISOString() };
   try {
     await query('SELECT 1');
-    res.json({ status: 'ok', version: '3.2.0', database: 'connected', timestamp: new Date().toISOString() });
+    result.database = 'connected';
   } catch (err) {
     console.error('[Health] DB check failed:', err.message);
-    res.status(500).json({ status: 'error', database: 'disconnected' });
+    result.status = 'degraded';
+    result.database = 'disconnected';
   }
+  const { PI_API_KEY: piKey } = require('./src/helpers');
+  result.pi_api = piKey ? 'configured' : 'missing';
+  // Lightweight Pi API reachability check (skip in sandbox to avoid slowing health ping)
+  if (piKey && process.env.SANDBOX_MODE !== 'true' && req.query.deep === '1') {
+    try {
+      const r = await fetch('https://api.minepi.com/v2/payments/health_check_nonexistent', {
+        headers: { Authorization: `Key ${piKey}` },
+      }).catch(() => null);
+      result.pi_api_reachable = r ? (r.status < 500 ? 'ok' : 'error') : 'unreachable';
+    } catch (_) { result.pi_api_reachable = 'unreachable'; }
+  }
+  res.status(result.status === 'ok' ? 200 : 500).json(result);
 });
 
 // ─── Route modules ──────────────────────────────────────────────
@@ -217,13 +231,12 @@ async function ensureNotificationsTable() {
     `CREATE INDEX IF NOT EXISTS idx_chat_messages_room_id2 ON chat_messages(room_id, created_at DESC)`,
     'idx_chat_messages_room_id2'
   );
-  // Foreign key: chat_messages.room_id → chat_rooms.id (NOT VALID = doesn't scan existing rows)
+  // Foreign key: chat_messages.room_id → chat_rooms.id
   await run(
     `DO $$ BEGIN
        IF NOT EXISTS (
          SELECT 1 FROM information_schema.table_constraints
-         WHERE constraint_name = 'fk_chat_messages_room_id'
-           AND table_name = 'chat_messages'
+         WHERE constraint_name = 'fk_chat_messages_room_id' AND table_name = 'chat_messages'
        ) THEN
          ALTER TABLE chat_messages
            ADD CONSTRAINT fk_chat_messages_room_id
@@ -231,6 +244,39 @@ async function ensureNotificationsTable() {
        END IF;
      END $$`,
     'fk_chat_messages_room_id'
+  );
+  // Foreign key: applications.job_id → jobs(id) ON DELETE CASCADE
+  await run(
+    `DO $$ BEGIN
+       IF NOT EXISTS (
+         SELECT 1 FROM information_schema.table_constraints
+         WHERE constraint_name = 'fk_applications_job_id' AND table_name = 'applications'
+       ) THEN
+         ALTER TABLE applications
+           ADD CONSTRAINT fk_applications_job_id
+           FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE NOT VALID;
+       END IF;
+     END $$`,
+    'fk_applications_job_id'
+  );
+  // Foreign key: escrows.job_id → jobs(id) ON DELETE CASCADE
+  await run(
+    `DO $$ BEGIN
+       IF NOT EXISTS (
+         SELECT 1 FROM information_schema.table_constraints
+         WHERE constraint_name = 'fk_escrows_job_id' AND table_name = 'escrows'
+       ) THEN
+         ALTER TABLE escrows
+           ADD CONSTRAINT fk_escrows_job_id
+           FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE NOT VALID;
+       END IF;
+     END $$`,
+    'fk_escrows_job_id'
+  );
+  // Backfill applications.updated_at for rows created before the column existed
+  await run(
+    `UPDATE applications SET updated_at = created_at WHERE updated_at IS NULL`,
+    'backfill applications.updated_at'
   );
 }
 
@@ -246,9 +292,27 @@ initDb().then(async () => {
   // Remove test clutter jobs (description='test', title contains 'test') — idempotent
   await query(`DELETE FROM applications WHERE job_id IN (SELECT id FROM jobs WHERE description = 'test' AND title ILIKE '%test%')`).catch(() => {});
   await query(`DELETE FROM jobs WHERE description = 'test' AND title ILIKE '%test%'`).catch(() => {});
-  app.listen(PORT, () => {
+  const server = app.listen(PORT, () => {
     console.log(`[WorkPro API] v3.2.0 on port ${PORT} (${NODE_ENV})`);
   });
+
+  // Graceful shutdown — Render sends SIGTERM before killing the process
+  const shutdown = (signal) => {
+    console.log(`[WorkPro API] ${signal} received — graceful shutdown`);
+    server.close(() => {
+      console.log('[WorkPro API] HTTP server closed');
+      const { pool } = require('./src/db');
+      if (pool) pool.end(() => {
+        console.log('[WorkPro API] DB pool closed');
+        process.exit(0);
+      });
+      else process.exit(0);
+    });
+    // Force-kill after 10s if connections don't drain
+    setTimeout(() => { console.error('[WorkPro API] Forced exit after timeout'); process.exit(1); }, 10000).unref();
+  };
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT',  () => shutdown('SIGINT'));
 }).catch(err => {
   console.error('[Server] Failed to start:', err);
   process.exit(1);
