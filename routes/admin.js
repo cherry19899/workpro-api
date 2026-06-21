@@ -315,6 +315,23 @@ router.get('/api/admin/verify', async (req, res) => {
   res.json({ valid: false });
 });
 
+// POST /api/admin/bootstrap-owner — one-time: grant admin to cherry19899 (any case, any uid).
+// Safe: only promotes, never demotes; does nothing if already admin; idempotent.
+router.post('/api/admin/bootstrap-owner', async (req, res) => {
+  try {
+    const result = await query(
+      `UPDATE users SET role = 'admin', updated_at = NOW()
+       WHERE LOWER(username) = 'cherry19899' AND role != 'admin'
+       RETURNING id, username, role`
+    );
+    if (result.rows.length === 0) {
+      const already = await query(`SELECT id, username, role FROM users WHERE LOWER(username) = 'cherry19899' LIMIT 3`);
+      return res.json({ message: 'Already admin or user not found', rows: already.rows });
+    }
+    res.json({ message: 'Owner promoted to admin', updated: result.rows });
+  } catch (err) { serverError(err, res); }
+});
+
 // POST /api/admin/merge-users — merge duplicate user accounts (from_id → to_id)
 router.post('/api/admin/merge-users', adminAuth, async (req, res) => {
   const { from_id, to_id } = req.body;
