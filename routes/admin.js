@@ -156,8 +156,8 @@ router.get('/api/admin/jobs/all', adminAuth, async (req, res) => {
   } catch (err) { serverError(err, res); }
 });
 
-// GET /api/debug/schema — \d users equivalent (column list + types)
-router.get('/api/debug/schema', adminAuth, async (req, res) => {
+// GET /api/admin/debug/schema — \d users equivalent (column list + types)
+router.get('/api/admin/debug/schema', adminAuth, async (req, res) => {
   try {
     const result = await query(`
       SELECT column_name, data_type, column_default, is_nullable
@@ -168,8 +168,8 @@ router.get('/api/debug/schema', adminAuth, async (req, res) => {
   } catch (err) { serverError(err, res); }
 });
 
-// GET /api/debug/connects/:userId — raw DB data for diagnosing connects balance issues
-router.get('/api/debug/connects/:userId', adminAuth, async (req, res) => {
+// GET /api/admin/debug/connects/:userId — raw DB data for diagnosing connects balance issues
+router.get('/api/admin/debug/connects/:userId', adminAuth, async (req, res) => {
   const userId = req.params.userId;
   try {
     const [userRow, payments, audit] = await Promise.all([
