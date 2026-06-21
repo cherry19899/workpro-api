@@ -376,10 +376,11 @@ router.post('/api/admin/merge-users', adminAuth, async (req, res) => {
       };
       // Re-point straightforward FK references first
       const tables = [
-        ['jobs', 'posted_by'], ['applications', 'freelancer_id'], ['applications', 'client_id'],
+        ['jobs', 'posted_by'], ['jobs', 'hired_freelancer_id'],
+        ['applications', 'freelancer_id'], ['applications', 'client_id'],
         ['escrows', 'client_id'], ['escrows', 'freelancer_id'], ['payments', 'user_id'],
         ['ratings', 'from_user_id'], ['ratings', 'to_user_id'], ['notifications', 'user_id'],
-        ['chat_messages', 'sender_id'],
+        ['chat_messages', 'sender_id'], ['portfolio_items', 'user_id'],
       ];
       for (const [tbl, col] of tables) {
         await safeUpdate(tbl, col);
@@ -426,6 +427,30 @@ router.post('/api/admin/merge-users', adminAuth, async (req, res) => {
       // Sweep any leftover rooms/messages still pointing at from_id
       await safeUpdate('chat_rooms', 'client_id');
       await safeUpdate('chat_rooms', 'freelancer_id');
+      // Merge portfolio (one row per user — keep primary's, fill blanks from secondary's)
+      await pgM.query('SAVEPOINT sp');
+      try {
+        const fromPortfolio = await pgM.query('SELECT * FROM portfolios WHERE user_id = $1', [from_id]);
+        if (fromPortfolio.rows.length) {
+          const fp = fromPortfolio.rows[0];
+          await pgM.query(
+            `INSERT INTO portfolios (user_id, headline, summary, experience_years, website, github, linkedin)
+             VALUES ($1,$2,$3,$4,$5,$6,$7)
+             ON CONFLICT (user_id) DO UPDATE SET
+               headline       = COALESCE(NULLIF(portfolios.headline,''), EXCLUDED.headline),
+               summary        = COALESCE(NULLIF(portfolios.summary,''), EXCLUDED.summary),
+               experience_years = CASE WHEN portfolios.experience_years = 0 THEN EXCLUDED.experience_years ELSE portfolios.experience_years END,
+               website        = COALESCE(NULLIF(portfolios.website,''), EXCLUDED.website),
+               github         = COALESCE(NULLIF(portfolios.github,''), EXCLUDED.github),
+               linkedin       = COALESCE(NULLIF(portfolios.linkedin,''), EXCLUDED.linkedin),
+               updated_at     = NOW()`,
+            [to_id, fp.headline||'', fp.summary||'', fp.experience_years||0, fp.website||'', fp.github||'', fp.linkedin||'']
+          );
+          await pgM.query('DELETE FROM portfolios WHERE user_id = $1', [from_id]);
+        }
+        await pgM.query('RELEASE SAVEPOINT sp');
+      } catch { await pgM.query('ROLLBACK TO SAVEPOINT sp'); }
+
       // If from was admin, promote to
       if (from.role === 'admin') {
         await pgM.query("UPDATE users SET role = 'admin' WHERE id = $1", [to_id]);
@@ -435,6 +460,129 @@ router.post('/api/admin/merge-users', adminAuth, async (req, res) => {
     } catch (e) { await pgM.query('ROLLBACK').catch(() => {}); throw e; }
     finally { pgM.release(); }
     res.json({ success: true, merged: from_id, into: to_id });
+  } catch (err) { serverError(err, res); }
+});
+
+// GET /api/admin/twin-pairs — list all duplicate (pi_X, X) account pairs in DB
+router.get('/api/admin/twin-pairs', adminAuth, async (req, res) => {
+  try {
+    // For every user whose id starts with "pi_", check whether the un-prefixed version exists.
+    const result = await query(`
+      SELECT u1.id AS canonical_id, u1.username AS canonical_username,
+             u1.balance_connects AS canonical_connects, u1.bio AS canonical_bio,
+             u2.id AS twin_id, u2.username AS twin_username,
+             u2.balance_connects AS twin_connects, u2.bio AS twin_bio
+      FROM users u1
+      JOIN users u2 ON u2.id = SUBSTRING(u1.id FROM 4)  -- strip leading "pi_"
+      WHERE u1.id LIKE 'pi_%'
+      ORDER BY u1.id
+    `);
+    res.json({ pairs: result.rows, count: result.rows.length });
+  } catch (err) { serverError(err, res); }
+});
+
+// POST /api/admin/auto-merge-twins — merge all (pi_X, X) duplicate pairs
+// Primary is always the pi_-prefixed form (canonical). Secondary (X) is deleted.
+router.post('/api/admin/auto-merge-twins', adminAuth, async (req, res) => {
+  try {
+    const pairs = await query(`
+      SELECT u1.id AS canonical_id, u2.id AS twin_id
+      FROM users u1
+      JOIN users u2 ON u2.id = SUBSTRING(u1.id FROM 4)
+      WHERE u1.id LIKE 'pi_%'
+      ORDER BY u1.id
+    `);
+    if (!pairs.rows.length) return res.json({ success: true, merged: 0, pairs: [] });
+
+    const results = [];
+    for (const { canonical_id, twin_id } of pairs.rows) {
+      try {
+        const [fromRow, toRow] = await Promise.all([
+          query('SELECT * FROM users WHERE id = $1', [twin_id]),
+          query('SELECT * FROM users WHERE id = $1', [canonical_id]),
+        ]);
+        if (!fromRow.rows.length || !toRow.rows.length) {
+          results.push({ canonical_id, twin_id, status: 'skipped_not_found' });
+          continue;
+        }
+        const from = fromRow.rows[0];
+        const pgM = await getPool().connect();
+        try {
+          await pgM.query('BEGIN');
+          await pgM.query(
+            `UPDATE users SET
+               balance_connects     = balance_connects + $1,
+               balance_pi           = COALESCE(balance_pi,0) + $2,
+               total_jobs_posted    = total_jobs_posted + $3,
+               total_jobs_completed = total_jobs_completed + $4,
+               bio     = COALESCE(NULLIF(bio,''), $5),
+               skills  = COALESCE(NULLIF(skills,''), $6),
+               avatar  = COALESCE(NULLIF(avatar,''), $7),
+               rating  = CASE WHEN rating = 0 THEN $8 ELSE rating END,
+               kyc_verified = (kyc_verified OR $9),
+               updated_at = NOW()
+             WHERE id = $10`,
+            [from.balance_connects||0, parseFloat(from.balance_pi||0),
+             from.total_jobs_posted||0, from.total_jobs_completed||0,
+             from.bio||'', from.skills||'', from.avatar||'',
+             parseFloat(from.rating||0), from.kyc_verified||false, canonical_id]
+          );
+          const safeUpd = async (tbl, col) => {
+            await pgM.query('SAVEPOINT sp');
+            try {
+              await pgM.query(`UPDATE ${tbl} SET ${col} = $1 WHERE ${col} = $2`, [canonical_id, twin_id]);
+              await pgM.query('RELEASE SAVEPOINT sp');
+            } catch { await pgM.query('ROLLBACK TO SAVEPOINT sp'); }
+          };
+          const fkCols = [
+            ['jobs', 'posted_by'], ['jobs', 'hired_freelancer_id'],
+            ['applications', 'freelancer_id'], ['applications', 'client_id'],
+            ['escrows', 'client_id'], ['escrows', 'freelancer_id'],
+            ['payments', 'user_id'], ['ratings', 'from_user_id'], ['ratings', 'to_user_id'],
+            ['notifications', 'user_id'], ['chat_messages', 'sender_id'],
+            ['chat_rooms', 'client_id'], ['chat_rooms', 'freelancer_id'],
+            ['portfolio_items', 'user_id'],
+          ];
+          for (const [tbl, col] of fkCols) await safeUpd(tbl, col);
+
+          // Portfolio merge
+          await pgM.query('SAVEPOINT sp');
+          try {
+            const fp = await pgM.query('SELECT * FROM portfolios WHERE user_id = $1', [twin_id]);
+            if (fp.rows.length) {
+              const p = fp.rows[0];
+              await pgM.query(
+                `INSERT INTO portfolios (user_id, headline, summary, experience_years, website, github, linkedin)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7)
+                 ON CONFLICT (user_id) DO UPDATE SET
+                   headline=COALESCE(NULLIF(portfolios.headline,''),EXCLUDED.headline),
+                   summary=COALESCE(NULLIF(portfolios.summary,''),EXCLUDED.summary),
+                   experience_years=CASE WHEN portfolios.experience_years=0 THEN EXCLUDED.experience_years ELSE portfolios.experience_years END,
+                   website=COALESCE(NULLIF(portfolios.website,''),EXCLUDED.website),
+                   github=COALESCE(NULLIF(portfolios.github,''),EXCLUDED.github),
+                   linkedin=COALESCE(NULLIF(portfolios.linkedin,''),EXCLUDED.linkedin),
+                   updated_at=NOW()`,
+                [canonical_id, p.headline||'', p.summary||'', p.experience_years||0, p.website||'', p.github||'', p.linkedin||'']
+              );
+              await pgM.query('DELETE FROM portfolios WHERE user_id=$1', [twin_id]);
+            }
+            await pgM.query('RELEASE SAVEPOINT sp');
+          } catch { await pgM.query('ROLLBACK TO SAVEPOINT sp'); }
+
+          if (from.role === 'admin') await pgM.query("UPDATE users SET role='admin' WHERE id=$1", [canonical_id]);
+          await pgM.query('DELETE FROM users WHERE id = $1', [twin_id]);
+          await pgM.query('COMMIT');
+          results.push({ canonical_id, twin_id, status: 'merged', connects_moved: from.balance_connects||0 });
+        } catch (e) {
+          await pgM.query('ROLLBACK').catch(() => {});
+          results.push({ canonical_id, twin_id, status: 'error', error: e.message });
+        } finally { pgM.release(); }
+      } catch (e) {
+        results.push({ canonical_id, twin_id: twin_id||'?', status: 'error', error: e.message });
+      }
+    }
+    await audit('auto_merge_twins', { results });
+    res.json({ success: true, merged: results.filter(r => r.status === 'merged').length, pairs: results });
   } catch (err) { serverError(err, res); }
 });
 

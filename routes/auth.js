@@ -3,9 +3,114 @@
  */
 const router = require('express').Router();
 const jwt = require('jsonwebtoken');
-const { query } = require('../src/db');
+const { query, getPool } = require('../src/db');
 const { piApiRequest, audit, serverError } = require('../src/helpers');
 const { auth, softAuth, checkBlocked, authLimiter, JWT_SECRET } = require('../src/middleware');
+
+// ─── UID normalisation ────────────────────────────────────────────────────────
+// Pi gives UIDs like "abc123" or (rarely) "pi_abc123".
+// The frontend historically prepended "pi_", creating "pi_abc123" or "pi_pi_abc123".
+// Canonical form: exactly one "pi_" prefix.
+function canonicalUid(uid) {
+  if (!uid) return uid;
+  return 'pi_' + uid.replace(/^(pi_)+/, '');
+}
+
+// At login: if the incoming uid is non-canonical, auto-merge the non-canonical
+// DB record (if any) into the canonical one, then proceed as canonical.
+// Returns the canonical uid to use for the session.
+async function normalizeLoginUid(incomingUid) {
+  const canonical = canonicalUid(incomingUid);
+  if (incomingUid === canonical) return canonical; // already clean
+
+  // Check whether both forms exist in the DB.
+  const [fromRow, toRow] = await Promise.all([
+    query('SELECT * FROM users WHERE id = $1', [incomingUid]),
+    query('SELECT * FROM users WHERE id = $1', [canonical]),
+  ]);
+  const fromExists = fromRow.rows.length > 0;
+  const toExists   = toRow.rows.length > 0;
+
+  if (!fromExists) return canonical; // nothing to migrate
+
+  if (!toExists) {
+    // Non-canonical exists, canonical doesn't — just rename the record.
+    await query('UPDATE users SET id = $1, updated_at = NOW() WHERE id = $2', [canonical, incomingUid]);
+    // Repoint all FK columns in one shot (best-effort; any failure is logged, not fatal)
+    const fkCols = [
+      ['jobs', 'posted_by'], ['jobs', 'hired_freelancer_id'],
+      ['applications', 'freelancer_id'], ['applications', 'client_id'],
+      ['escrows', 'client_id'], ['escrows', 'freelancer_id'],
+      ['payments', 'user_id'], ['ratings', 'from_user_id'], ['ratings', 'to_user_id'],
+      ['notifications', 'user_id'], ['chat_messages', 'sender_id'],
+      ['chat_rooms', 'client_id'], ['chat_rooms', 'freelancer_id'],
+      ['portfolios', 'user_id'], ['portfolio_items', 'user_id'],
+    ];
+    for (const [tbl, col] of fkCols) {
+      await query(`UPDATE ${tbl} SET ${col} = $1 WHERE ${col} = $2`, [canonical, incomingUid]).catch(() => {});
+    }
+    console.log(`[UID-norm] renamed ${incomingUid} → ${canonical}`);
+    return canonical;
+  }
+
+  // Both exist — full transactional merge: non-canonical (from) → canonical (to).
+  const from = fromRow.rows[0];
+  const to   = toRow.rows[0];
+  const pgM = await getPool().connect();
+  try {
+    await pgM.query('BEGIN');
+
+    // Merge balances and counters into canonical
+    await pgM.query(
+      `UPDATE users SET
+         balance_connects    = balance_connects + $1,
+         balance_pi          = COALESCE(balance_pi,0) + $2,
+         total_jobs_posted   = total_jobs_posted + $3,
+         total_jobs_completed= total_jobs_completed + $4,
+         bio     = COALESCE(NULLIF(bio,''), $5),
+         skills  = COALESCE(NULLIF(skills,''), $6),
+         avatar  = COALESCE(NULLIF(avatar,''), $7),
+         rating  = CASE WHEN rating = 0 THEN $8 ELSE rating END,
+         kyc_verified = (kyc_verified OR $9),
+         updated_at = NOW()
+       WHERE id = $10`,
+      [from.balance_connects||0, parseFloat(from.balance_pi||0),
+       from.total_jobs_posted||0, from.total_jobs_completed||0,
+       from.bio||'', from.skills||'', from.avatar||'',
+       parseFloat(from.rating||0), from.kyc_verified||false, canonical]
+    );
+
+    const safeUpd = async (tbl, col) => {
+      await pgM.query('SAVEPOINT sp');
+      try {
+        await pgM.query(`UPDATE ${tbl} SET ${col} = $1 WHERE ${col} = $2`, [canonical, incomingUid]);
+        await pgM.query('RELEASE SAVEPOINT sp');
+      } catch { await pgM.query('ROLLBACK TO SAVEPOINT sp'); }
+    };
+
+    const fkCols = [
+      ['jobs', 'posted_by'], ['jobs', 'hired_freelancer_id'],
+      ['applications', 'freelancer_id'], ['applications', 'client_id'],
+      ['escrows', 'client_id'], ['escrows', 'freelancer_id'],
+      ['payments', 'user_id'], ['ratings', 'from_user_id'], ['ratings', 'to_user_id'],
+      ['notifications', 'user_id'], ['chat_messages', 'sender_id'],
+      ['chat_rooms', 'client_id'], ['chat_rooms', 'freelancer_id'],
+      ['portfolios', 'user_id'], ['portfolio_items', 'user_id'],
+    ];
+    for (const [tbl, col] of fkCols) await safeUpd(tbl, col);
+
+    if (from.role === 'admin') await pgM.query("UPDATE users SET role='admin' WHERE id=$1", [canonical]);
+    await pgM.query('DELETE FROM users WHERE id = $1', [incomingUid]);
+    await pgM.query('COMMIT');
+    console.log(`[UID-norm] merged ${incomingUid} → ${canonical} (connects+${from.balance_connects||0})`);
+  } catch (e) {
+    await pgM.query('ROLLBACK').catch(() => {});
+    console.error('[UID-norm] merge error:', e.message);
+    // Fall back to canonical even if merge failed — canonical account still works
+  } finally { pgM.release(); }
+
+  return canonical;
+}
 
 // ─── Level helper (used by GET /api/me) ──────────────────────────────────────
 function computeLevel(completedJobs, rating) {
@@ -66,8 +171,8 @@ router.get('/api/me', auth, async (req, res) => {
 
 // POST /api/me — alias login endpoint used by Auth.js + bundle registration
 router.post('/api/me', authLimiter, async (req, res) => {
-  const { uid, username, accessToken } = req.body;
-  if (!uid) return res.status(400).json({ error: 'uid required' });
+  const { uid: rawUid, username, accessToken } = req.body;
+  if (!rawUid) return res.status(400).json({ error: 'uid required' });
   if (username && username.length > 50) return res.status(400).json({ error: 'Username too long (max 50)' });
   try {
     // SANDBOX_MODE (Pi Testnet): skip all Pi verification — Testnet accessTokens do not
@@ -79,8 +184,9 @@ router.post('/api/me', authLimiter, async (req, res) => {
           const piUser = await piApiRequest('/v2/me', 'GET', null, accessToken);
           const piUid = piUser && (piUser.uid || piUser.username);
           if (!piUid) return res.status(403).json({ error: 'Pi identity verification failed: no uid returned' });
-          const normalizedPiUid = piUid.startsWith('pi_') ? piUid : 'pi_' + piUid;
-          if (normalizedPiUid !== uid && piUid !== uid) {
+          const verifiedCanonical = canonicalUid(piUid);
+          const incomingCanonical = canonicalUid(rawUid);
+          if (verifiedCanonical !== incomingCanonical) {
             return res.status(403).json({ error: 'Token does not match uid' });
           }
         } catch (e) {
@@ -90,7 +196,11 @@ router.post('/api/me', authLimiter, async (req, res) => {
         return res.status(401).json({ error: 'accessToken required' });
       }
     }
+
+    // Normalise to canonical uid — auto-merges any non-canonical twin into canonical.
+    const uid = await normalizeLoginUid(rawUid);
     const uname = username || uid.replace(/^pi_/, '') || uid;
+
     if (accessToken) {
       await query(
         `INSERT INTO users (id, username, role, balance_connects, created_at, updated_at)
@@ -106,27 +216,7 @@ router.post('/api/me', authLimiter, async (req, res) => {
         [uid, uname]
       );
     }
-    // Migrate legacy 'cherry19899' records to 'pi_cherry19899' (idempotent, runs every login)
-    if (uid === 'pi_cherry19899') {
-      try {
-        await query(`UPDATE users SET role = 'admin' WHERE id = 'pi_cherry19899' AND role != 'admin'`).catch(() => {});
-        const r1 = await query(`UPDATE jobs SET posted_by = 'pi_cherry19899' WHERE posted_by = 'cherry19899'`);
-        const r2 = await query(`UPDATE applications SET freelancer_id = 'pi_cherry19899' WHERE freelancer_id = 'cherry19899'`);
-        await query(`UPDATE escrows SET client_id = 'pi_cherry19899' WHERE client_id = 'cherry19899'`);
-        await query(`UPDATE escrows SET freelancer_id = 'pi_cherry19899' WHERE freelancer_id = 'cherry19899'`);
-        const legacyUser = await query(`SELECT balance_connects, bio, skills FROM users WHERE id = 'cherry19899'`);
-        if (legacyUser.rows.length > 0) {
-          const old = legacyUser.rows[0];
-          await query(`UPDATE users SET balance_connects = GREATEST(balance_connects, $1), bio = COALESCE(NULLIF(bio,''), $2), skills = COALESCE(NULLIF(skills,''), $3) WHERE id = 'pi_cherry19899'`,
-            [old.balance_connects || 0, old.bio || '', old.skills || '']);
-          await query(`DELETE FROM users WHERE id = 'cherry19899'`);
-        }
-        await query(`UPDATE notifications SET user_id = 'pi_cherry19899' WHERE user_id = 'cherry19899'`);
-        if (r1.rowCount > 0 || r2.rowCount > 0) console.log(`[Migration] cherry19899→pi_cherry19899: jobs=${r1.rowCount} apps=${r2.rowCount}`);
-      } catch (mErr) { console.error('[Migration] error:', mErr.message); }
-    }
     // Owner self-heal: any uid whose username is cherry19899 (any case) always gets admin.
-    // On Pi mainnet the real uid is pi_<uuid>, not pi_cherry19899, so a uid check alone never fires.
     if ((uname && uname.toLowerCase() === 'cherry19899') ||
         uid === 'pi_cherry19899' ||
         uid === 'pi_a2b617f7-f510-4502-a046-805facedcc29') {
@@ -164,8 +254,8 @@ router.post('/api/auth/refresh', async (req, res) => {
 
 // POST /api/auth/login
 router.post('/api/auth/login', async (req, res) => {
-  const { userId, username, accessToken } = req.body;
-  if (!userId) return res.status(400).json({ error: 'userId required' });
+  const { userId: rawUserId, username, accessToken } = req.body;
+  if (!rawUserId) return res.status(400).json({ error: 'userId required' });
   if (username && username.length > 50) return res.status(400).json({ error: 'Username too long (max 50)' });
   try {
     let piUser = null;
@@ -177,8 +267,7 @@ router.post('/api/auth/login', async (req, res) => {
       }
       const piUid = piUser && (piUser.uid || piUser.username);
       if (!piUid) return res.status(403).json({ error: 'Pi identity verification failed: no uid returned' });
-      const normalizedPiUid = piUid.startsWith('pi_') ? piUid : 'pi_' + piUid;
-      if (normalizedPiUid !== userId && piUid !== userId) {
+      if (canonicalUid(piUid) !== canonicalUid(rawUserId)) {
         return res.status(403).json({ error: 'Token does not match userId' });
       }
     } else {
@@ -186,12 +275,14 @@ router.post('/api/auth/login', async (req, res) => {
         return res.status(401).json({ error: 'accessToken required' });
       }
       // SANDBOX_MODE only — skip Pi verification for local/test environments
-      const existing = await query('SELECT id FROM users WHERE id = $1', [userId]);
+      const existing = await query('SELECT id FROM users WHERE id IN ($1, $2)', [rawUserId, canonicalUid(rawUserId)]);
       if (!existing.rows.length) {
         return res.status(401).json({ error: 'accessToken required for new account registration' });
       }
     }
-    const uid = userId;
+
+    // Normalise to canonical uid — auto-merges any non-canonical twin.
+    const uid = await normalizeLoginUid(rawUserId);
     const uname = (piUser && piUser.username) || username || uid;
     const paymentsEnabled = piUser ? piUser.payments_enabled === true : false;
     const existing = await query('SELECT id, username, role FROM users WHERE id = $1', [uid]);
