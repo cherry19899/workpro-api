@@ -137,7 +137,10 @@ router.get('/api/users/:id/portfolio', async (req, res) => {
 // POST + PUT /api/users/:id/availability
 async function handleAvailability(req, res) {
   const { available, availability } = req.body;
-  if (req.params.id !== req.userId) return res.status(403).json({ error: 'Forbidden' });
+  // Always operate on the authenticated user (from the JWT). Never trust the
+  // client-supplied :id for a self-mutation — the stored user object can desync
+  // from the JWT after account migrations (e.g. cherry19899 -> pi_cherry19899),
+  // which previously caused a spurious 403 "Forbidden" -> "Failed to update".
   const ALLOWED_AVAILABILITY = ['available', 'busy', 'away', 'unavailable'];
   let newStatus;
   if (availability !== undefined) {
@@ -146,7 +149,7 @@ async function handleAvailability(req, res) {
   } else {
     newStatus = available ? 'available' : 'unavailable';
   }
-  const targetId = req.params.id;
+  const targetId = req.userId;
   try {
     await query(`UPDATE users SET availability = $1, updated_at = NOW() WHERE id = $2`, [newStatus, targetId]);
     const result = await query(
