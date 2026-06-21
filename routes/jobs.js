@@ -54,6 +54,10 @@ router.get('/api/jobs', async (req, res) => {
     else { conditions.push(`status = 'open'`); }
     if (category && category !== 'all' && category !== 'All') { conditions.push(`LOWER(category) = LOWER($${idx++})`); params.push(category); }
     if (ownerFilter) { conditions.push(`posted_by = $${idx++}`); params.push(ownerFilter); }
+    else {
+      // Hide jobs posted by blocked accounts — they can't post new ones, existing ones shouldn't be visible either.
+      conditions.push(`posted_by NOT IN (SELECT id FROM users WHERE is_blocked = true)`);
+    }
     if (search) { conditions.push(`(title ILIKE $${idx} OR description ILIKE $${idx})`); params.push(`%${search}%`); idx++; }
     if (min_budget) { conditions.push(`budget >= $${idx++}`); params.push(parseFloat(min_budget)); }
     if (max_budget) { conditions.push(`budget <= $${idx++}`); params.push(parseFloat(max_budget)); }
