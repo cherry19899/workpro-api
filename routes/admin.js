@@ -156,6 +156,18 @@ router.get('/api/admin/jobs/all', adminAuth, async (req, res) => {
   } catch (err) { serverError(err, res); }
 });
 
+// GET /api/debug/schema — \d users equivalent (column list + types)
+router.get('/api/debug/schema', adminAuth, async (req, res) => {
+  try {
+    const result = await query(`
+      SELECT column_name, data_type, column_default, is_nullable
+      FROM information_schema.columns
+      WHERE table_name = 'users' AND table_schema = 'public'
+      ORDER BY ordinal_position`);
+    res.json({ table: 'users', columns: result.rows });
+  } catch (err) { serverError(err, res); }
+});
+
 // GET /api/debug/connects/:userId — raw DB data for diagnosing connects balance issues
 router.get('/api/debug/connects/:userId', adminAuth, async (req, res) => {
   const userId = req.params.userId;
