@@ -70,26 +70,24 @@ router.post('/api/me', authLimiter, async (req, res) => {
   if (!uid) return res.status(400).json({ error: 'uid required' });
   if (username && username.length > 50) return res.status(400).json({ error: 'Username too long (max 50)' });
   try {
-    if (accessToken) {
-      try {
-        const piUser = await piApiRequest('/v2/me', 'GET', null, accessToken);
-        const piUid = piUser && (piUser.uid || piUser.username);
-        if (!piUid) return res.status(403).json({ error: 'Pi identity verification failed: no uid returned' });
-        const normalizedPiUid = piUid.startsWith('pi_') ? piUid : 'pi_' + piUid;
-        if (normalizedPiUid !== uid && piUid !== uid) {
-          return res.status(403).json({ error: 'Token does not match uid' });
+    // SANDBOX_MODE (Pi Testnet): skip all Pi verification — Testnet accessTokens do not
+    // verify against the Mainnet /v2/me endpoint, so we trust the client identity here.
+    // Turn SANDBOX_MODE OFF when going to Mainnet to re-enable strict accessToken checks.
+    if (!process.env.SANDBOX_MODE) {
+      if (accessToken) {
+        try {
+          const piUser = await piApiRequest('/v2/me', 'GET', null, accessToken);
+          const piUid = piUser && (piUser.uid || piUser.username);
+          if (!piUid) return res.status(403).json({ error: 'Pi identity verification failed: no uid returned' });
+          const normalizedPiUid = piUid.startsWith('pi_') ? piUid : 'pi_' + piUid;
+          if (normalizedPiUid !== uid && piUid !== uid) {
+            return res.status(403).json({ error: 'Token does not match uid' });
+          }
+        } catch (e) {
+          return res.status(401).json({ error: 'Pi token verification failed. Please re-authenticate.' });
         }
-      } catch (e) {
-        return res.status(401).json({ error: 'Pi token verification failed. Please re-authenticate.' });
-      }
-    } else {
-      if (!process.env.SANDBOX_MODE) {
+      } else {
         return res.status(401).json({ error: 'accessToken required' });
-      }
-      // SANDBOX_MODE only — skip Pi verification for local/test environments
-      const existing = await query('SELECT id FROM users WHERE id = $1', [uid]);
-      if (!existing.rows.length) {
-        return res.status(401).json({ error: 'accessToken required for new account registration' });
       }
     }
     const uname = username || uid.replace(/^pi_/, '') || uid;
