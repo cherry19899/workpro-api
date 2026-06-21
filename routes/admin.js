@@ -156,6 +156,26 @@ router.get('/api/admin/jobs/all', adminAuth, async (req, res) => {
   } catch (err) { serverError(err, res); }
 });
 
+// GET /api/debug/connects/:userId — raw DB data for diagnosing connects balance issues
+router.get('/api/debug/connects/:userId', adminAuth, async (req, res) => {
+  const userId = req.params.userId;
+  try {
+    const [userRow, payments, audit] = await Promise.all([
+      query('SELECT id, username, balance_connects, updated_at FROM users WHERE id = $1', [userId]),
+      query(`SELECT id, status, amount, type, metadata, txid, created_at, updated_at
+             FROM payments WHERE user_id = $1 ORDER BY created_at DESC LIMIT 20`, [userId]),
+      query(`SELECT action, data, created_at FROM audit_logs
+             WHERE data::text ILIKE $1 ORDER BY created_at DESC LIMIT 20`, [`%${userId}%`]),
+    ]);
+    if (!userRow.rows.length) return res.status(404).json({ error: 'User not found' });
+    res.json({
+      user: userRow.rows[0],
+      payments: payments.rows,
+      audit_logs: audit.rows,
+    });
+  } catch (err) { serverError(err, res); }
+});
+
 // PATCH /api/admin/jobs/:id/images — used by the image migration script to swap
 // base64 payloads for static file URLs without touching any other job fields.
 router.patch('/api/admin/jobs/:id/images', adminAuth, async (req, res) => {
