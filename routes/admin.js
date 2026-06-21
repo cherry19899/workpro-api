@@ -6,7 +6,7 @@ const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const { query, getPool } = require('../src/db');
 const { notify, audit, serverError } = require('../src/helpers');
-const { adminAuth, JWT_SECRET, ADMIN_API_KEY } = require('../src/middleware');
+const { adminAuth, twinId, JWT_SECRET, ADMIN_API_KEY } = require('../src/middleware');
 
 const PLATFORM_FEE = Math.min(Math.max(parseFloat(process.env.PLATFORM_FEE_PERCENT || '2') / 100, 0), 0.5);
 
@@ -74,11 +74,17 @@ router.get('/api/admin/users', adminAuth, async (req, res) => {
 // POST /api/admin/users/:id/block
 router.post('/api/admin/users/:id/block', adminAuth, async (req, res) => {
   try {
-    const target = await query('SELECT username FROM users WHERE id = $1', [req.params.id]);
-    if (['cherry19899', 'pi_cherry19899'].includes(req.params.id) || target.rows[0]?.username === 'cherry19899') {
+    const twin = twinId(req.params.id);
+    // Guard the owner under either id form (with/without pi_ prefix).
+    const target = await query('SELECT username FROM users WHERE id IN ($1, $2)', [req.params.id, twin]);
+    const isOwner = ['cherry19899', 'pi_cherry19899'].includes(req.params.id) ||
+      target.rows.some(r => r.username === 'cherry19899');
+    if (isOwner) {
       return res.status(403).json({ error: 'Cannot block owner' });
     }
-    await query('UPDATE users SET is_blocked = true, status = $1, updated_at = NOW() WHERE id = $2', ['blocked', req.params.id]);
+    // Block both duplicate-account twins so the block can't be bypassed by logging
+    // in as the unblocked twin (same person, "pi_" prefix mismatch).
+    await query('UPDATE users SET is_blocked = true, status = $1, updated_at = NOW() WHERE id IN ($2, $3)', ['blocked', req.params.id, twin]);
     await audit('user_blocked', { user_id: req.params.id });
     res.json({ success: true });
   } catch (err) { serverError(err, res); }
@@ -87,7 +93,8 @@ router.post('/api/admin/users/:id/block', adminAuth, async (req, res) => {
 // POST /api/admin/users/:id/unblock
 router.post('/api/admin/users/:id/unblock', adminAuth, async (req, res) => {
   try {
-    await query('UPDATE users SET is_blocked = false, status = $1, updated_at = NOW() WHERE id = $2', ['active', req.params.id]);
+    const twin = twinId(req.params.id);
+    await query('UPDATE users SET is_blocked = false, status = $1, updated_at = NOW() WHERE id IN ($2, $3)', ['active', req.params.id, twin]);
     await audit('user_unblocked', { user_id: req.params.id });
     res.json({ success: true });
   } catch (err) { serverError(err, res); }

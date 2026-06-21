@@ -145,10 +145,23 @@ async function adminAuth(req, res, next) {
   return res.status(403).json({ error: 'Admin access required' });
 }
 
+// Returns the duplicate-account "twin" id for a uid. The frontend builds ids as
+// "pi_" + uid, but some Pi uids already start with "pi_", so the same person can
+// end up with both `X` and `pi_X` records. A block on one must apply to the other,
+// otherwise the blocked user simply logs in as the unblocked twin and continues.
+function twinId(id) {
+  if (!id) return id;
+  return id.startsWith('pi_') ? id.slice(3) : 'pi_' + id;
+}
+
 async function checkBlocked(req, res, next) {
   try {
-    const result = await query('SELECT is_blocked FROM users WHERE id = $1', [req.userId]);
-    if (result.rows[0]?.is_blocked) {
+    const id = req.userId;
+    const result = await query(
+      'SELECT 1 FROM users WHERE id IN ($1, $2) AND is_blocked = true LIMIT 1',
+      [id, twinId(id)]
+    );
+    if (result.rows.length) {
       return res.status(403).json({ error: 'Account blocked' });
     }
     next();
@@ -160,6 +173,7 @@ module.exports = {
   softAuth,
   adminAuth,
   checkBlocked,
+  twinId,
   authLimiter,
   adminLimiter,
   adminStrictLimiter,
