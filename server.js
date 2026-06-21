@@ -63,10 +63,12 @@ function _skipRateLimit(req) {
       require('crypto').timingSafeEqual(Buffer.from(h), Buffer.from(RATE_LIMIT_BYPASS_KEY));
   } catch { return false; }
 }
-const GLOBAL_RATE_MAX = process.env.SANDBOX_MODE ? 5000 : 500;
+// Method-aware global limit: read-heavy GETs capped tighter than mutations.
+// SANDBOX_MODE relaxes 10× for automated testing.
+const _rateMult = process.env.SANDBOX_MODE ? 10 : 1;
 app.use(rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: GLOBAL_RATE_MAX,
+  max: (req) => (req.method === 'GET' ? 100 : 500) * _rateMult,
   skip: _skipRateLimit,
 }));
 

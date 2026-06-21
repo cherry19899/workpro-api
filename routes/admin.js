@@ -48,8 +48,8 @@ router.get('/api/admin/stats', adminAuth, async (req, res) => {
 
 // GET /api/admin/users
 router.get('/api/admin/users', adminAuth, async (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit) || 500, 2000);
-  const offset = parseInt(req.query.offset) || 0;
+  const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 500, 2000));
+  const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
     const search = req.query.search || '';
     if (search.length > 200) return res.status(400).json({ error: 'Search query too long (max 200 chars)' });
@@ -129,8 +129,8 @@ router.post('/api/admin/users/:id/grant-connects', adminAuth, async (req, res) =
 
 // GET /api/admin/jobs
 router.get('/api/admin/jobs', adminAuth, async (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit) || 100, 500);
-  const offset = parseInt(req.query.offset) || 0;
+  const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 100, 500));
+  const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
     const result = await query('SELECT * FROM jobs ORDER BY created_at DESC LIMIT $1 OFFSET $2', [limit, offset]);
     const total = await query('SELECT COUNT(*) FROM jobs');
@@ -141,8 +141,8 @@ router.get('/api/admin/jobs', adminAuth, async (req, res) => {
 // GET /api/admin/jobs/all
 router.get('/api/admin/jobs/all', adminAuth, async (req, res) => {
   try {
-    const limit = Math.min(parseInt(req.query.limit) || 200, 1000);
-    const offset = parseInt(req.query.offset) || 0;
+    const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 200, 1000));
+    const offset = Math.max(0, parseInt(req.query.offset) || 0);
     const result = await query('SELECT j.*, u.username as posted_by_name FROM jobs j LEFT JOIN users u ON u.id = j.posted_by ORDER BY j.created_at DESC LIMIT $1 OFFSET $2', [limit, offset]);
     const total = await query('SELECT COUNT(*) FROM jobs');
     res.json({ jobs: result.rows, total: parseInt(total.rows[0].count), limit, offset });
@@ -193,8 +193,8 @@ router.delete('/api/admin/jobs/:id', adminAuth, async (req, res) => {
 // GET /api/admin/escrows
 router.get('/api/admin/escrows', adminAuth, async (req, res) => {
   try {
-    const limit = Math.min(parseInt(req.query.limit) || 100, 500);
-    const offset = parseInt(req.query.offset) || 0;
+    const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 100, 500));
+    const offset = Math.max(0, parseInt(req.query.offset) || 0);
     const result = await query(`
       SELECT e.*,
         uc.username AS client_name,
@@ -288,8 +288,8 @@ router.get('/api/admin/earnings', adminAuth, async (req, res) => {
 
 // GET /api/admin/audit-logs
 router.get('/api/admin/audit-logs', adminAuth, async (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit) || 200, 1000);
-  const offset = parseInt(req.query.offset) || 0;
+  const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 200, 1000));
+  const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
     const result = await query('SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT $1 OFFSET $2', [limit, offset]);
     const total = await query('SELECT COUNT(*) FROM audit_logs');

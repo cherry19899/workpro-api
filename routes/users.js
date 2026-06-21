@@ -20,8 +20,8 @@ function computeLevel(completedJobs, rating) {
 // GET /api/users — list users
 router.get('/api/users', softAuth, async (req, res) => {
   try {
-    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
-    const offset = parseInt(req.query.offset) || 0;
+    const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 50, 200));
+    const offset = Math.max(0, parseInt(req.query.offset) || 0);
     const result = await query(
       "SELECT id, username, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, created_at FROM users WHERE status != 'deleted' ORDER BY created_at DESC LIMIT $1 OFFSET $2",
       [limit, offset]
@@ -96,8 +96,8 @@ router.post('/api/users/:id', auth, checkBlocked, async (req, res) => {
 
 // GET /api/users/:id/ratings
 router.get('/api/users/:id/ratings', async (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
-  const offset = parseInt(req.query.offset) || 0;
+  const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 50, 200));
+  const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
     const result = await query('SELECT * FROM ratings WHERE to_user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3', [req.params.id, limit, offset]);
     const totalRes = await query('SELECT COUNT(*), AVG(rating) FROM ratings WHERE to_user_id = $1', [req.params.id]);
@@ -301,8 +301,8 @@ router.get('/api/reviews/stats/:userId', async (req, res) => {
 
 // GET /api/reviews/user/:userId
 router.get('/api/reviews/user/:userId', async (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
-  const offset = parseInt(req.query.offset) || 0;
+  const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 50, 200));
+  const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
     const result = await query('SELECT r.*, u.username as from_username FROM ratings r LEFT JOIN users u ON u.id = r.from_user_id WHERE r.to_user_id = $1 ORDER BY r.created_at DESC LIMIT $2 OFFSET $3', [req.params.userId, limit, offset]);
     const total = await query('SELECT COUNT(*) FROM ratings WHERE to_user_id = $1', [req.params.userId]);
@@ -314,8 +314,8 @@ router.get('/api/reviews/user/:userId', async (req, res) => {
 router.get('/api/reviews', async (req, res) => {
   const userId = req.query.user_id || req.headers['x-user-id'];
   if (!userId) return res.json({ reviews: [], ratings: [] });
-  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
-  const offset = parseInt(req.query.offset) || 0;
+  const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 50, 200));
+  const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
     const result = await query('SELECT r.*, u.username as from_username FROM ratings r LEFT JOIN users u ON u.id = r.from_user_id WHERE r.to_user_id = $1 ORDER BY r.created_at DESC LIMIT $2 OFFSET $3', [userId, limit, offset]);
     const total = await query('SELECT COUNT(*) FROM ratings WHERE to_user_id = $1', [userId]);
@@ -336,8 +336,8 @@ router.get('/api/reviews/:id', async (req, res) => {
       if (!result.rows.length) return res.status(404).json({ error: 'Review not found' });
       res.json({ review: result.rows[0] });
     } else {
-      const limit2 = Math.min(parseInt(req.query.limit) || 50, 200);
-      const offset2 = parseInt(req.query.offset) || 0;
+      const limit2 = Math.max(1, Math.min(parseInt(req.query.limit) || 50, 200));
+      const offset2 = Math.max(0, parseInt(req.query.offset) || 0);
       const result = await query(
         'SELECT r.*, u.username as from_username FROM ratings r LEFT JOIN users u ON u.id = r.from_user_id WHERE r.to_user_id = $1 ORDER BY r.created_at DESC LIMIT $2 OFFSET $3',
         [id, limit2, offset2]

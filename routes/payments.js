@@ -152,8 +152,8 @@ async function handleEscrowRelease(req, res) {
 
 // ─── Escrow GET handler (shared by /api/escrow and /api/escrows) ──────────────
 async function handleGetEscrow(req, res) {
-  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
-  const offset = parseInt(req.query.offset) || 0;
+  const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 50, 200));
+  const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
     const [result, totalRes] = await Promise.all([
       query('SELECT * FROM escrows WHERE client_id = $1 OR freelancer_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3', [req.userId, limit, offset]),
@@ -165,18 +165,20 @@ async function handleGetEscrow(req, res) {
 
 // ─── Payments ──────────────────────────────────────────────
 
-router.post('/api/payments/:paymentId/approve', softAuth, async (req, res) => {
-  const userId = req.userId || req.body.user?.id || req.body.user_id;
-  await handlePaymentApprove(req.params.paymentId, req.body.metadata, userId, res);
+// approve/complete now require a verified JWT (was softAuth with a client-controlled
+// req.body.user_id fallback that let an attacker pass the ownership check by spoofing the id).
+// Frontend sends Authorization: Bearer on both payment flows (bundle _wpAuthHdr + index.html wrapper).
+router.post('/api/payments/:paymentId/approve', auth, async (req, res) => {
+  await handlePaymentApprove(req.params.paymentId, req.body.metadata, req.userId, res);
 });
 
-router.post('/api/payments/:paymentId/complete', softAuth, async (req, res) => {
-  await handlePaymentComplete(req.params.paymentId, req.body.txid, req.body.metadata, req.userId || req.body.user_id, res);
+router.post('/api/payments/:paymentId/complete', auth, async (req, res) => {
+  await handlePaymentComplete(req.params.paymentId, req.body.txid, req.body.metadata, req.userId, res);
 });
 
 router.get('/api/payments', auth, async (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
-  const offset = parseInt(req.query.offset) || 0;
+  const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 50, 200));
+  const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
     const result = await query('SELECT * FROM payments WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3', [req.userId, limit, offset]);
     const total = await query('SELECT COUNT(*) FROM payments WHERE user_id = $1', [req.userId]);
@@ -511,8 +513,8 @@ router.get('/api/escrows', auth, handleGetEscrow);
 router.get(['/api/escrow/:id', '/api/escrows/:id'], auth, async (req, res) => {
   const id = req.params.id;
   if (id === 'me') {
-    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
-    const offset = parseInt(req.query.offset) || 0;
+    const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 50, 200));
+    const offset = Math.max(0, parseInt(req.query.offset) || 0);
     try {
       const result = await query('SELECT * FROM escrows WHERE client_id = $1 OR freelancer_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3', [req.userId, limit, offset]);
       return res.json({ escrows: result.rows, limit, offset });
@@ -578,7 +580,7 @@ router.post(['/api/escrow', '/api/escrows'], auth, checkBlocked, async (req, res
 router.post('/api/escrow/:id/release', auth, checkBlocked, handleEscrowRelease);
 router.post('/api/escrows/:id/release', auth, checkBlocked, handleEscrowRelease);
 
-router.post('/api/escrows/:id/cancel', auth, checkBlocked, async (req, res) => {
+router.post(['/api/escrows/:id/cancel', '/api/escrow/:id/cancel'], auth, checkBlocked, async (req, res) => {
   if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Escrow not found' });
   try {
     const result = await query('SELECT * FROM escrows WHERE id = $1', [req.params.id]);
@@ -724,8 +726,8 @@ router.get('/api/escrows/:id/room', auth, async (req, res) => {
 
 // GET /api/escrows/user/:userId
 router.get('/api/escrows/user/:userId', auth, async (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
-  const offset = parseInt(req.query.offset) || 0;
+  const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 50, 200));
+  const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
     const paramUserId = req.params.userId === 'cherry19899' ? 'pi_cherry19899' : req.params.userId;
     if (paramUserId !== req.userId) return res.status(403).json({ error: 'Forbidden' });
@@ -795,8 +797,8 @@ router.post('/api/offers', auth, checkBlocked, async (req, res) => {
 });
 
 router.get('/api/offers', auth, async (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
-  const offset = parseInt(req.query.offset) || 0;
+  const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 50, 200));
+  const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
     const result = await query(
       `SELECT a.*, j.title as job_title, j.budget, j.status as job_status,

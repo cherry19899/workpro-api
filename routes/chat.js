@@ -8,8 +8,8 @@ const { auth, softAuth, checkBlocked, messageLimiter } = require('../src/middlew
 
 // GET /api/chat/rooms
 router.get('/api/chat/rooms', auth, async (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
-  const offset = parseInt(req.query.offset) || 0;
+  const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 50, 200));
+  const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
     const [result, totalRes] = await Promise.all([
       query(
@@ -83,8 +83,8 @@ router.get('/api/chat/rooms/:id', auth, async (req, res) => {
 
 // GET /api/chat/rooms/:id/messages
 router.get('/api/chat/rooms/:id/messages', auth, async (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit) || 100, 200);
-  const offset = parseInt(req.query.offset) || 0;
+  const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 100, 200));
+  const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
     const room = await query('SELECT * FROM chat_rooms WHERE id = $1 AND (client_id = $2 OR freelancer_id = $2)', [req.params.id, req.userId]);
     if (!room.rows.length) return res.status(403).json({ error: 'Forbidden' });
@@ -155,8 +155,8 @@ router.post('/api/chat/start', auth, checkBlocked, messageLimiter, async (req, r
 
 // GET /api/chat/conversations — alias for rooms
 router.get('/api/chat/conversations', auth, async (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
-  const offset = parseInt(req.query.offset) || 0;
+  const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 50, 200));
+  const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
     const [result, totalRes] = await Promise.all([
       query(
@@ -209,8 +209,8 @@ router.post('/api/chat/conversations', auth, checkBlocked, messageLimiter, async
 
 // GET /api/chat/conversations/:id/messages
 router.get('/api/chat/conversations/:id/messages', auth, async (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit) || 100, 200);
-  const offset = parseInt(req.query.offset) || 0;
+  const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 100, 200));
+  const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
     const room = await query('SELECT * FROM chat_rooms WHERE id = $1 AND (client_id = $2 OR freelancer_id = $2)', [req.params.id, req.userId]);
     if (!room.rows.length) return res.status(403).json({ error: 'Forbidden' });
@@ -331,8 +331,8 @@ router.post('/api/chat/:roomId/messages', auth, messageLimiter, checkBlocked, as
 
 // GET /api/chat/:roomId/messages — alias
 router.get('/api/chat/:roomId/messages', auth, async (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit) || 100, 200);
-  const offset = parseInt(req.query.offset) || 0;
+  const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 100, 200));
+  const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
     const roomCheck = await query(
       'SELECT id FROM chat_rooms WHERE id = $1 AND (client_id = $2 OR freelancer_id = $2)',

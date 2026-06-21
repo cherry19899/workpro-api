@@ -43,7 +43,7 @@ router.get('/api/jobs', async (req, res) => {
   if (search && search.length > 200) return res.status(400).json({ error: 'Search query too long (max 200 chars)' });
   if (min_budget !== undefined && isNaN(parseFloat(min_budget))) return res.status(400).json({ error: 'Invalid min_budget' });
   if (max_budget !== undefined && isNaN(parseFloat(max_budget))) return res.status(400).json({ error: 'Invalid max_budget' });
-  const limit = Math.min(parseInt(req.query.limit) || 20, 200);
+  const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 20, 200));
   const page = Math.max(parseInt(req.query.page) || 1, 1);
   const ownerFilter = posted_by || client_uid;
   try {
@@ -148,8 +148,8 @@ router.post('/api/jobs', auth, checkBlocked, jobPostLimiter, async (req, res) =>
 
 // GET /api/jobs/user/:userId — jobs posted by a specific user (MUST be before /:id)
 router.get('/api/jobs/user/:userId', async (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
-  const offset = parseInt(req.query.offset) || 0;
+  const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 50, 200));
+  const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
     const userId = req.params.userId;
     const [result, totalRes] = await Promise.all([
@@ -165,8 +165,8 @@ router.get('/api/jobs/user/:userId', async (req, res) => {
 
 // GET /api/jobs/as-freelancer — jobs where current user is the hired freelancer
 router.get('/api/jobs/as-freelancer', auth, async (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
-  const offset = parseInt(req.query.offset) || 0;
+  const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 50, 200));
+  const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
     const [result, totalRes] = await Promise.all([
       query(`SELECT j.*, u.username as client_username FROM jobs j LEFT JOIN users u ON u.id = j.posted_by WHERE j.hired_freelancer_id = $1 ORDER BY j.updated_at DESC LIMIT $2 OFFSET $3`, [req.userId, limit, offset]),
@@ -178,8 +178,8 @@ router.get('/api/jobs/as-freelancer', auth, async (req, res) => {
 
 // GET /api/jobs/my — client's own posted jobs (must be before /:id)
 router.get('/api/jobs/my', auth, async (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
-  const offset = parseInt(req.query.offset) || 0;
+  const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 50, 200));
+  const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
     const [result, totalRes] = await Promise.all([
       query('SELECT j.*, u.username as client_username FROM jobs j LEFT JOIN users u ON u.id = j.posted_by WHERE j.posted_by = $1 ORDER BY j.created_at DESC LIMIT $2 OFFSET $3', [req.userId, limit, offset]),
@@ -536,8 +536,8 @@ router.delete('/api/jobs/:id', auth, checkBlocked, async (req, res) => {
 // GET /api/jobs/:id/applications
 router.get('/api/jobs/:id/applications', auth, async (req, res) => {
   if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Job not found' });
-  const limit = Math.min(parseInt(req.query.limit) || 100, 500);
-  const offset = parseInt(req.query.offset) || 0;
+  const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 100, 500));
+  const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
     const jobResult = await query('SELECT posted_by FROM jobs WHERE id = $1', [req.params.id]);
     if (!jobResult.rows.length) return res.status(404).json({ error: 'Job not found' });
@@ -554,8 +554,8 @@ router.get('/api/jobs/:id/applications', auth, async (req, res) => {
 
 // GET /api/applications — my applications as freelancer
 router.get('/api/applications', auth, async (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
-  const offset = parseInt(req.query.offset) || 0;
+  const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 50, 200));
+  const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
     const result = await query(
       `SELECT a.*, j.posted_by_name as client_name, j.posted_by as client_id
@@ -629,8 +629,8 @@ router.post('/api/applications', auth, checkBlocked, async (req, res) => {
 
 // GET /api/applications/my
 router.get('/api/applications/my', auth, async (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
-  const offset = parseInt(req.query.offset) || 0;
+  const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 50, 200));
+  const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
     const result = await query(
       `SELECT a.*, j.posted_by_name as client_name, j.posted_by as client_id,
@@ -647,8 +647,8 @@ router.get('/api/applications/my', auth, async (req, res) => {
 
 // GET /api/applications/me
 router.get('/api/applications/me', auth, async (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
-  const offset = parseInt(req.query.offset) || 0;
+  const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 50, 200));
+  const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
     const result = await query(
       `SELECT a.*, j.posted_by_name as client_name, j.posted_by as client_id,
@@ -665,8 +665,8 @@ router.get('/api/applications/me', auth, async (req, res) => {
 
 // GET /api/applications/user/:userId
 router.get('/api/applications/user/:userId', auth, async (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
-  const offset = parseInt(req.query.offset) || 0;
+  const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 50, 200));
+  const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
     const paramUserId = req.params.userId === 'cherry19899' ? 'pi_cherry19899' : req.params.userId;
     if (paramUserId !== req.userId) return res.status(403).json({ error: 'Forbidden' });
@@ -688,8 +688,8 @@ router.get('/api/applications/user/:userId', auth, async (req, res) => {
 
 // GET /api/applications/job/:jobId
 router.get('/api/applications/job/:jobId', auth, async (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
-  const offset = parseInt(req.query.offset) || 0;
+  const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 50, 200));
+  const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
     const jobResult = await query('SELECT posted_by FROM jobs WHERE id = $1', [req.params.jobId]);
     if (!jobResult.rows.length) return res.status(404).json({ error: 'Job not found' });
