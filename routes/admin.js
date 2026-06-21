@@ -168,6 +168,25 @@ router.get('/api/admin/debug/schema', adminAuth, async (req, res) => {
   } catch (err) { serverError(err, res); }
 });
 
+// GET /api/admin/debug/integrity — verify mainnet-prep migrations actually applied
+router.get('/api/admin/debug/integrity', adminAuth, async (req, res) => {
+  try {
+    const [fks, nullUpd, roomIds] = await Promise.all([
+      query(`SELECT constraint_name, table_name FROM information_schema.table_constraints
+             WHERE constraint_type = 'FOREIGN KEY' AND table_schema = 'public'
+               AND constraint_name IN ('fk_applications_job_id','fk_escrows_job_id','fk_chat_messages_room_id')
+             ORDER BY constraint_name`),
+      query(`SELECT COUNT(*)::int AS n FROM applications WHERE updated_at IS NULL`),
+      query(`SELECT COUNT(*)::int AS legacy FROM chat_rooms WHERE id LIKE 'room_%' AND id NOT SIMILAR TO 'room_[0-9a-f-]{36}'`),
+    ]);
+    res.json({
+      foreign_keys: fks.rows,
+      applications_null_updated_at: nullUpd.rows[0].n,
+      legacy_format_room_ids: roomIds.rows[0].legacy,
+    });
+  } catch (err) { serverError(err, res); }
+});
+
 // GET /api/admin/debug/connects/:userId — raw DB data for diagnosing connects balance issues
 router.get('/api/admin/debug/connects/:userId', adminAuth, async (req, res) => {
   const userId = req.params.userId;
