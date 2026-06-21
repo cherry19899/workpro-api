@@ -337,16 +337,71 @@ router.post('/api/admin/merge-users', adminAuth, async (req, res) => {
         'UPDATE users SET balance_connects = balance_connects + $1, balance_pi = COALESCE(balance_pi,0) + $2, total_jobs_posted = total_jobs_posted + $3, total_jobs_completed = total_jobs_completed + $4, updated_at = NOW() WHERE id = $5',
         [from.balance_connects || 0, parseFloat(from.balance_pi || 0), from.total_jobs_posted || 0, from.total_jobs_completed || 0, to_id]
       );
-      // Re-point all FK references from old to new
+      // Safe per-statement update: a SAVEPOINT lets us swallow a failure
+      // (e.g. unique-index violation) without aborting the whole transaction.
+      // A plain .catch() does NOT do this — once any statement errors, Postgres
+      // marks the tx aborted and every later query + COMMIT fails.
+      const safeUpdate = async (tbl, col) => {
+        await pgM.query('SAVEPOINT sp');
+        try {
+          await pgM.query(`UPDATE ${tbl} SET ${col} = $1 WHERE ${col} = $2`, [to_id, from_id]);
+          await pgM.query('RELEASE SAVEPOINT sp');
+        } catch (e) {
+          await pgM.query('ROLLBACK TO SAVEPOINT sp');
+        }
+      };
+      // Re-point straightforward FK references first
       const tables = [
         ['jobs', 'posted_by'], ['applications', 'freelancer_id'], ['applications', 'client_id'],
         ['escrows', 'client_id'], ['escrows', 'freelancer_id'], ['payments', 'user_id'],
         ['ratings', 'from_user_id'], ['ratings', 'to_user_id'], ['notifications', 'user_id'],
-        ['chat_rooms', 'client_id'], ['chat_rooms', 'freelancer_id'], ['chat_messages', 'sender_id'],
+        ['chat_messages', 'sender_id'],
       ];
       for (const [tbl, col] of tables) {
-        await pgM.query(`UPDATE ${tbl} SET ${col} = $1 WHERE ${col} = $2`, [to_id, from_id]).catch(() => {});
+        await safeUpdate(tbl, col);
       }
+      // chat_rooms needs collision-aware merge: the partial unique indexes on
+      // (client_id, freelancer_id, job_id) mean renaming from_id → to_id can
+      // duplicate an existing room. For each from_id room, if a matching to_id
+      // room already exists, move its messages there and drop the dup; otherwise
+      // just re-point the column.
+      const mergeRoomsForCol = async (col, otherCol) => {
+        const rooms = await pgM.query(
+          `SELECT id, client_id, freelancer_id, job_id FROM chat_rooms WHERE ${col} = $1`,
+          [from_id]
+        );
+        for (const room of rooms.rows) {
+          const newClient = col === 'client_id' ? to_id : room.client_id;
+          const newFreelancer = col === 'freelancer_id' ? to_id : room.freelancer_id;
+          // Find an existing surviving room with the same identity tuple
+          const survivor = await pgM.query(
+            `SELECT id FROM chat_rooms
+             WHERE client_id = $1 AND freelancer_id = $2
+               AND ((job_id IS NULL AND $3::int IS NULL) OR job_id = $3)
+               AND id <> $4
+             LIMIT 1`,
+            [newClient, newFreelancer, room.job_id, room.id]
+          );
+          await pgM.query('SAVEPOINT sp');
+          try {
+            if (survivor.rows.length) {
+              const keepId = survivor.rows[0].id;
+              await pgM.query('UPDATE chat_messages SET room_id = $1 WHERE room_id = $2', [keepId, room.id]);
+              await pgM.query('DELETE FROM chat_rooms WHERE id = $1', [room.id]);
+            } else {
+              await pgM.query(`UPDATE chat_rooms SET ${col} = $1 WHERE id = $2`, [to_id, room.id]);
+            }
+            await pgM.query('RELEASE SAVEPOINT sp');
+          } catch (e) {
+            await pgM.query('ROLLBACK TO SAVEPOINT sp');
+          }
+        }
+      };
+      await mergeRoomsForCol('client_id', 'freelancer_id');
+      await mergeRoomsForCol('freelancer_id', 'client_id');
+      // Sweep any leftover rooms/messages still pointing at from_id
+      await safeUpdate('chat_rooms', 'client_id');
+      await safeUpdate('chat_rooms', 'freelancer_id');
       // If from was admin, promote to
       if (from.role === 'admin') {
         await pgM.query("UPDATE users SET role = 'admin' WHERE id = $1", [to_id]);
