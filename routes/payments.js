@@ -9,6 +9,22 @@ const { auth, softAuth, checkBlocked } = require('../src/middleware');
 
 const PLATFORM_FEE = Math.min(Math.max(parseFloat(process.env.PLATFORM_FEE_PERCENT || '2') / 100, 0), 0.5);
 
+// Server-side package catalog — mirrors frontend packages. Never trust client-supplied quantity.
+const CONNECT_PACKAGES = [
+  { connects: 10,  price: 1 },
+  { connects: 50,  price: 4 },
+  { connects: 100, price: 7 },
+];
+
+// Resolve connects to credit for a given Pi amount.
+// Package bonus is granted only when the Pi amount matches a known package price (±5%).
+// Client-supplied package_amount / quantity are intentionally ignored.
+function resolveConnects(piAmount) {
+  const formula = Math.floor(piAmount * 10);
+  const pkg = CONNECT_PACKAGES.find(p => Math.abs(p.price - piAmount) / p.price < 0.05);
+  return Math.max(formula, pkg ? pkg.connects : 0);
+}
+
 // ─── Shared Pi payment handlers ────────────────────────────────────────────
 // handlePaymentApprove and handlePaymentComplete: shared by RESTful /:id/approve|complete
 // and legacy flat /approve|complete routes.
@@ -106,10 +122,7 @@ async function handlePaymentComplete(paymentId, txid, metadata, userId, res) {
           console.error(`[Payment] Amount mismatch: Pi returned ${piAmountPaid}, DB stored ${storedAmount}`);
           return res.status(400).json({ error: 'Payment amount mismatch — contact support' });
         }
-        // Use package_amount if provided and pi-formula gives less (bonus packages like 50 for 4π)
-        const formulaAmount = Math.floor(piAmountPaid * 10);
-        const pkgAmount = parseInt(meta.quantity || meta.package_amount || 0);
-        const amount = pkgAmount > formulaAmount ? pkgAmount : formulaAmount;
+        const amount = resolveConnects(piAmountPaid);
         if (amount <= 0) { await pgPmtC.query('ROLLBACK'); return res.status(400).json({ error: 'Payment amount too small to credit connects' }); }
         await pgPmtC.query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [amount, paymentOwner]);
         await pgPmtC.query("UPDATE payments SET metadata = jsonb_set(COALESCE(metadata,'{}'::jsonb), '{connects_credited}', 'true') WHERE id = $1", [paymentId]);
@@ -494,13 +507,8 @@ router.post('/api/connects/buy', auth, checkBlocked, async (req, res) => {
         return res.json({ success: true, credited: 0, alreadyCredited: true, balance, balance_connects: balance, new_balance: balance, remaining_connects: balance });
       }
 
-      // Credit connects: use package_amount from frontend when it's larger than the Pi formula
-      // (bonus packages: e.g. 50 connects for 4π = more than 4*10=40 by formula).
-      // Base rate: 10 connects per 1 Pi.
       const verifiedAmount = parseFloat((piPayment && piPayment.amount) || payRow.amount || pi_amount || amount || 0);
-      const formulaCredited = Math.floor(verifiedAmount * 10);
-      const pkgCredited = parseInt(package_amount || req.body.quantity || payRow.metadata?.quantity || 0);
-      credited = pkgCredited > formulaCredited ? pkgCredited : formulaCredited;
+      credited = resolveConnects(verifiedAmount);
       if (!(credited > 0)) {
         await pgClient.query('ROLLBACK');
         return res.status(400).json({ error: 'Payment amount too small to credit any connects' });
