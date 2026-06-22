@@ -57,7 +57,11 @@ async function piApiRequest(path, method = 'GET', body = null, userAccessToken =
     try {
       const res = await fetch(`${PI_API_BASE}${path}`, opts);
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error_message || `Pi API error: ${res.status}`);
+      if (!res.ok) {
+        console.error(`[Pi API] ${method} ${path} → HTTP ${res.status}:`, JSON.stringify(data));
+        throw new Error(data.error_message || data.message || `Pi API error: ${res.status}`);
+      }
+      console.log(`[Pi API] ${method} ${path} → ${res.status} OK`);
       return data;
     } catch (err) {
       lastErr = err;
