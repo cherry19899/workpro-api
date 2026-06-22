@@ -497,9 +497,10 @@ router.post('/api/connects/buy', auth, checkBlocked, async (req, res) => {
         return res.status(403).json({ error: 'Payment does not belong to you' });
       }
 
-      // Accept if Pi confirmed it, server already completed it, OR payment is approved
-      // (approved = Pi blockchain confirmed but our /complete step may have failed to reach Pi API).
+      // Accept if Pi confirmed it, server already completed it, OR payment is approved.
+      // In SANDBOX_MODE also accept 'pending' — Pi sandbox doesn't issue real txids.
       const acceptableStatuses = ['completed', 'approved'];
+      if (process.env.SANDBOX_MODE) acceptableStatuses.push('pending');
       if (!verified && !acceptableStatuses.includes(payRow.status)) {
         await pgClient.query('ROLLBACK');
         return res.status(502).json({ error: 'Pi payment not confirmed' });
