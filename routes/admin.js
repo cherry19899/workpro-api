@@ -13,41 +13,6 @@ let _statsCache = null;
 let _statsCacheTs = 0;
 const STATS_TTL = 5 * 60 * 1000;
 
-// TEMP DIAGNOSTIC (no auth, counts only — no PII). Remove after debugging.
-router.get('/api/admin/_selftest', async (req, res) => {
-  const out = { ok: true, steps: {} };
-  const timed = async (name, fn) => {
-    const t = Date.now();
-    try { const r = await fn(); out.steps[name] = { ms: Date.now() - t, value: r }; }
-    catch (e) { out.ok = false; out.steps[name] = { ms: Date.now() - t, error: e.message }; }
-  };
-  await timed('db_now', async () => (await query('SELECT 1 AS x')).rows[0].x);
-  await timed('users', async () => parseInt((await query('SELECT COUNT(*) FROM users')).rows[0].count));
-  await timed('jobs', async () => parseInt((await query('SELECT COUNT(*) FROM jobs')).rows[0].count));
-  await timed('escrows', async () => parseInt((await query('SELECT COUNT(*) FROM escrows')).rows[0].count));
-  await timed('payments', async () => parseInt((await query('SELECT COUNT(*) FROM payments')).rows[0].count));
-  await timed('ratings', async () => parseInt((await query('SELECT COUNT(*) FROM ratings')).rows[0].count));
-  await timed('chat_rooms', async () => parseInt((await query('SELECT COUNT(*) FROM chat_rooms')).rows[0].count));
-  await timed('platform_fee', async () => await getPlatformFee());
-  await timed('computeStats', async () => await computeStats());
-  // Pi API key validity check — GET a non-existent payment.
-  // Valid key → 404 (not found). Invalid key → 401/403. No key → reported.
-  await timed('pi_api_key', async () => {
-    const k = process.env.PI_API_KEY;
-    if (!k) return { configured: false };
-    const r = await fetch('https://api.minepi.com/v2/payments/_selftest_nonexistent', {
-      method: 'GET', headers: { 'Authorization': `Key ${k}`, 'Content-Type': 'application/json' },
-    });
-    let bodyMsg = '';
-    try { const j = await r.json(); bodyMsg = j.error_message || j.error || ''; } catch (_) {}
-    return { configured: true, key_len: k.length, http: r.status,
-      verdict: r.status === 404 ? 'KEY_VALID (404 not found expected)' :
-               (r.status === 401 || r.status === 403) ? 'KEY_INVALID/REJECTED' : 'unexpected',
-      msg: bodyMsg };
-  });
-  res.json(out);
-});
-
 // Computes the full stats object directly from the DB (no cache).
 async function computeStats() {
   const fee = await getPlatformFee();
