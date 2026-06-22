@@ -216,6 +216,13 @@ router.post('/api/me', authLimiter, async (req, res) => {
         [uid, uname]
       );
     }
+    // SANDBOX: top up connects to 10 if balance is 0 so testing is never blocked
+    if (process.env.SANDBOX_MODE) {
+      await query(
+        `UPDATE users SET balance_connects = 10, updated_at = NOW() WHERE id = $1 AND balance_connects < 1`,
+        [uid]
+      ).catch(() => {});
+    }
     // Owner self-heal: any uid whose username is cherry19899 (any case) always gets admin.
     if ((uname && uname.toLowerCase() === 'cherry19899') ||
         uid === 'pi_cherry19899' ||

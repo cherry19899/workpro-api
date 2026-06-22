@@ -170,7 +170,7 @@ router.post('/api/jobs', auth, checkBlocked, jobPostLimiter, async (req, res) =>
   if (String(description).length > 5000) return res.status(400).json({ error: 'Description too long (max 5000 chars)' });
   if (images && Array.isArray(images) && images.length > 10) return res.status(400).json({ error: 'Too many images (max 10)' });
   if (skills && String(skills).length > 500) return res.status(400).json({ error: 'Skills too long (max 500)' });
-  const VALID_CATEGORIES = ['development','design','writing','marketing','data','support','other'];
+  const VALID_CATEGORIES = ['development','design','writing','marketing','data','support','translation','va','other'];
   if (category && !VALID_CATEGORIES.includes(category.toLowerCase())) {
     return res.status(400).json({ error: `Invalid category. Valid: ${VALID_CATEGORIES.join(', ')}` });
   }
