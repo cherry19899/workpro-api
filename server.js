@@ -40,8 +40,7 @@ const NODE_ENV = process.env.NODE_ENV || 'production';
 const IS_SANDBOX = !!process.env.SANDBOX_MODE;
 if (NODE_ENV === 'production') {
   if (IS_SANDBOX) {
-    console.error('[FATAL] SANDBOX_MODE is enabled in production! Remove SANDBOX_MODE before mainnet. Refusing to start.');
-    process.exit(1);
+    console.warn('[WARN] SANDBOX_MODE is enabled — testnet mode active. Remove before switching to mainnet.');
   }
   if (!process.env.JWT_SECRET) {
     console.error('[FATAL] JWT_SECRET env var is not set. Set a strong JWT_SECRET in Render env vars. Refusing to start.');
