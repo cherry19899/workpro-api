@@ -228,6 +228,9 @@ router.post('/api/me', authLimiter, async (req, res) => {
     if (u && u.status === 'deleted') {
       return res.status(403).json({ error: 'Account has been deleted' });
     }
+    if (u && u.is_blocked) {
+      return res.status(403).json({ error: 'Account is blocked' });
+    }
     await audit('user_login', { user_id: uid });
     const token = jwt.sign({ id: uid, username: uname }, JWT_SECRET, { expiresIn: '30d' });
     res.json({ ...u, uid: u.id, is_admin: u.role === 'admin', token });

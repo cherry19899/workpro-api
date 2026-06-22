@@ -248,11 +248,12 @@ router.post('/api/payments/incomplete', auth, async (req, res) => {
         if (markDone.rows.length) {
           const meta = markDone.rows[0].metadata || {};
           const paymentOwner = markDone.rows[0].user_id || req.userId;
-          if (meta.type === 'connects') {
+          if (meta.type === 'connects' && !meta.connects_credited) {
             const piAmountPaid = parseFloat(piPayment.amount || markDone.rows[0].amount || 0);
             const amount = resolveConnects(piAmountPaid);
             if (amount > 0) {
               await pgInc.query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [amount, paymentOwner]);
+              await pgInc.query(`UPDATE payments SET metadata = metadata || '{"connects_credited":true}' WHERE id = $1`, [paymentId]);
             }
           } else if (meta.type === 'escrow' && meta.job_id && meta.freelancer_id) {
             const existingEscrow = await pgInc.query('SELECT id FROM escrows WHERE payment_id = $1 LIMIT 1', [paymentId]);
@@ -348,11 +349,12 @@ router.post('/api/payments/:paymentId/resolve-complete', auth, async (req, res) 
       if (markDoneRC.rows.length) {
         const meta = markDoneRC.rows[0].metadata || {};
         const paymentOwner = markDoneRC.rows[0].user_id || req.userId;
-        if (meta.type === 'connects') {
+        if (meta.type === 'connects' && !meta.connects_credited) {
           const piAmountPaid = parseFloat(markDoneRC.rows[0].amount || 0);
           const amount = resolveConnects(piAmountPaid);
           if (amount > 0) {
             await pgRC.query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [amount, paymentOwner]);
+            await pgRC.query(`UPDATE payments SET metadata = metadata || '{"connects_credited":true}' WHERE id = $1`, [paymentId]);
           }
         } else if (meta.type === 'escrow' && meta.job_id && meta.freelancer_id) {
           const existingEscrowForPayment = await pgRC.query('SELECT id FROM escrows WHERE payment_id = $1 LIMIT 1', [paymentId]);

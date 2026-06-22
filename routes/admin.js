@@ -394,7 +394,7 @@ router.get('/api/admin/verify', async (req, res) => {
 
 // POST /api/admin/bootstrap-owner — one-time: grant admin to cherry19899 (any case, any uid).
 // Safe: only promotes, never demotes; does nothing if already admin; idempotent.
-router.post('/api/admin/bootstrap-owner', async (req, res) => {
+router.post('/api/admin/bootstrap-owner', adminAuth, async (req, res) => {
   try {
     const result = await query(
       `UPDATE users SET role = 'admin', updated_at = NOW()
