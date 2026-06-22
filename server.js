@@ -39,6 +39,9 @@ const ADMIN_API_KEY = process.env.ADMIN_API_KEY || 'admin-secret-key';
 if (ADMIN_API_KEY === 'admin-secret-key') {
   console.warn('[SECURITY] ADMIN_API_KEY is the default value — set a strong ADMIN_API_KEY env var, otherwise the admin panel is publicly accessible.');
 }
+if (process.env.SANDBOX_MODE && NODE_ENV === 'production') {
+  console.error('[SECURITY] WARNING: SANDBOX_MODE is enabled in production! Pi verification is disabled. Remove SANDBOX_MODE env var before mainnet launch.');
+}
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://cherry19899.github.io';
 
 // ─── Core middleware ──────────────────────────────────────────────

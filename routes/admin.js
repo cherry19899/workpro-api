@@ -8,7 +8,7 @@ const { query, getPool } = require('../src/db');
 const { notify, audit, serverError } = require('../src/helpers');
 const { adminAuth, twinId, JWT_SECRET, ADMIN_API_KEY } = require('../src/middleware');
 
-const PLATFORM_FEE = Math.min(Math.max(parseFloat(process.env.PLATFORM_FEE_PERCENT || '2') / 100, 0), 0.5);
+const PLATFORM_FEE = Math.min(Math.max(parseFloat(process.env.PLATFORM_FEE_PERCENT || '2') / 100, 0), 0.1);
 
 // GET /api/admin/stats
 router.get('/api/admin/stats', adminAuth, async (req, res) => {

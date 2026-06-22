@@ -2,12 +2,13 @@
  * routes/payments.js — /api/payments/*, /api/connects/*, /api/escrows/*, /api/escrow/*, /api/offers/*
  */
 const router = require('express').Router();
+const crypto = require('crypto');
 const fetch = require('node-fetch');
 const { query, getPool } = require('../src/db');
 const { piApprovePayment, piCompletePayment, piGetPayment, notify, audit, serverError, PI_API_KEY } = require('../src/helpers');
 const { auth, softAuth, checkBlocked } = require('../src/middleware');
 
-const PLATFORM_FEE = Math.min(Math.max(parseFloat(process.env.PLATFORM_FEE_PERCENT || '2') / 100, 0), 0.5);
+const PLATFORM_FEE = Math.min(Math.max(parseFloat(process.env.PLATFORM_FEE_PERCENT || '2') / 100, 0), 0.1);
 
 // Server-side package catalog — mirrors frontend packages. Never trust client-supplied quantity.
 const CONNECT_PACKAGES = [
@@ -132,13 +133,20 @@ async function handlePaymentComplete(paymentId, txid, metadata, userId, res) {
         const existingEscrow = await pgPmtC.query('SELECT id FROM escrows WHERE payment_id = $1 LIMIT 1', [paymentId]);
         if (!existingEscrow.rows.length) {
           const [jobCheck, freelancerCheck] = await Promise.all([
-            pgPmtC.query('SELECT id FROM jobs WHERE id = $1 LIMIT 1', [meta.job_id]),
+            pgPmtC.query('SELECT id, budget FROM jobs WHERE id = $1 LIMIT 1', [meta.job_id]),
             pgPmtC.query('SELECT id FROM users WHERE id = $1 LIMIT 1', [meta.freelancer_id]),
           ]);
           if (jobCheck.rows.length && freelancerCheck.rows.length) {
+            const escrowAmount = parseFloat(piPayment.amount || markDone.amount || 0);
+            const jobBudget = parseFloat(jobCheck.rows[0].budget || 0);
+            if (jobBudget > 0 && escrowAmount > jobBudget * 1.01) {
+              await pgPmtC.query('ROLLBACK');
+              console.error(`[Payment] Escrow amount ${escrowAmount} exceeds job budget ${jobBudget}`);
+              return res.status(400).json({ error: 'Payment amount exceeds job budget' });
+            }
             await pgPmtC.query(
               'INSERT INTO escrows (job_id, client_id, freelancer_id, amount, payment_id, status) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (payment_id) DO NOTHING',
-              [meta.job_id, paymentOwner, meta.freelancer_id, parseFloat(piPayment.amount || markDone.amount || 0), paymentId, 'funded']
+              [meta.job_id, paymentOwner, meta.freelancer_id, escrowAmount, paymentId, 'funded']
             );
           }
         }
@@ -601,7 +609,7 @@ router.post(['/api/escrow', '/api/escrows'], auth, checkBlocked, async (req, res
     const existRmEsc = await query('SELECT id FROM chat_rooms WHERE job_id=$1 AND client_id=$2 AND freelancer_id=$3',
       [job_id, req.userId, freelancer_id]).catch(() => ({ rows: [] }));
     if (!existRmEsc.rows.length) {
-      const rmId = 'room_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
+      const rmId = 'room_' + crypto.randomUUID();
       await query('INSERT INTO chat_rooms (id, client_id, freelancer_id, job_id) VALUES ($1,$2,$3,$4)',
         [rmId, req.userId, freelancer_id, job_id]).catch(() => {});
     }
@@ -748,7 +756,7 @@ router.get('/api/escrows/:id/room', auth, async (req, res) => {
     if (roomResult.rows.length) {
       return res.json({ room: roomResult.rows[0], room_id: roomResult.rows[0].id });
     }
-    const roomId = `room_${escrow.client_id}-${escrow.freelancer_id}-${Date.now()}`;
+    const roomId = 'room_' + crypto.randomUUID();
     const newRoom = await query(
       'INSERT INTO chat_rooms (id, client_id, freelancer_id, job_id) VALUES ($1, $2, $3, $4) RETURNING *',
       [roomId, escrow.client_id, escrow.freelancer_id, escrow.job_id]
@@ -912,7 +920,7 @@ router.post('/api/offers/:id/accept', auth, checkBlocked, async (req, res) => {
     const existRmOffer = await query('SELECT id FROM chat_rooms WHERE job_id=$1 AND client_id=$2 AND freelancer_id=$3',
       [offer.job_id, offer.posted_by, req.userId]).catch(() => ({ rows: [] }));
     if (!existRmOffer.rows.length) {
-      const rmId = 'room_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
+      const rmId = 'room_' + crypto.randomUUID();
       await query('INSERT INTO chat_rooms (id, client_id, freelancer_id, job_id) VALUES ($1,$2,$3,$4)',
         [rmId, offer.posted_by, req.userId, offer.job_id]).catch(() => {});
     }

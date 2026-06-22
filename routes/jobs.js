@@ -2,6 +2,7 @@
  * routes/jobs.js — /api/jobs/*, /api/applications/*
  */
 const router = require('express').Router();
+const crypto = require('crypto');
 const { query, getPool } = require('../src/db');
 const { notify, audit, serverError } = require('../src/helpers');
 const { auth, softAuth, checkBlocked, jobPostLimiter } = require('../src/middleware');
@@ -375,6 +376,8 @@ router.post('/api/jobs/:id/apply', auth, checkBlocked, async (req, res) => {
         return res.status(400).json({ error: 'Job is not open' });
       }
       lockedCost = jobLock.rows[0].apply_cost || 1;
+      // Lock user row to prevent concurrent double-spend of connects
+      await pgClient.query('SELECT balance_connects FROM users WHERE id = $1 FOR UPDATE', [req.userId]);
       const deductResult = await pgClient.query(
         'UPDATE users SET balance_connects = balance_connects - $1, updated_at = NOW() WHERE id = $2 AND balance_connects >= $1 RETURNING id',
         [lockedCost, req.userId]
@@ -435,8 +438,8 @@ router.post('/api/jobs/:id/hire', auth, checkBlocked, async (req, res) => {
     if (!pmtRec.rows.length) return res.status(402).json({ error: 'Payment not found — complete Pi payment first' });
     if (pmtRec.rows[0].user_id !== req.userId) return res.status(403).json({ error: 'Payment does not belong to you' });
     if (pmtRec.rows[0].status !== 'completed') return res.status(402).json({ error: 'Payment not yet completed' });
-    const appResult = await query('SELECT * FROM applications WHERE id = $1 AND job_id = $2', [application_id, req.params.id]);
-    if (!appResult.rows.length) return res.status(404).json({ error: 'Application not found' });
+    const appResult = await query('SELECT * FROM applications WHERE id = $1 AND job_id = $2 AND status = $3', [application_id, req.params.id, 'pending']);
+    if (!appResult.rows.length) return res.status(404).json({ error: 'Application not found or not in pending status' });
     const app = appResult.rows[0];
     if (app.freelancer_id !== freelancer_id) return res.status(400).json({ error: 'freelancer_id does not match application' });
     const freelancerRes = await query('SELECT username FROM users WHERE id = $1', [freelancer_id]);
@@ -478,7 +481,7 @@ router.post('/api/jobs/:id/hire', auth, checkBlocked, async (req, res) => {
     if (existingRoom.rows.length) {
       roomId = existingRoom.rows[0].id;
     } else {
-      roomId = 'room_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
+      roomId = 'room_' + crypto.randomUUID();
       await query('INSERT INTO chat_rooms (id, client_id, freelancer_id, job_id) VALUES ($1, $2, $3, $4)', [roomId, req.userId, freelancer_id, req.params.id]);
     }
     await audit('job_hired', { job_id: req.params.id, freelancer_id, application_id, payment_id });
@@ -795,7 +798,7 @@ router.patch('/api/applications/:id', auth, checkBlocked, async (req, res) => {
       const existRmPatch = await query('SELECT id FROM chat_rooms WHERE job_id=$1 AND client_id=$2 AND freelancer_id=$3',
         [app_.job_id, req.userId, app_.freelancer_id]).catch(() => ({ rows: [] }));
       if (!existRmPatch.rows.length) {
-        const rmId = 'room_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
+        const rmId = 'room_' + crypto.randomUUID();
         await query('INSERT INTO chat_rooms (id, client_id, freelancer_id, job_id) VALUES ($1,$2,$3,$4)',
           [rmId, req.userId, app_.freelancer_id, app_.job_id]).catch(() => {});
       }
@@ -870,7 +873,7 @@ router.post('/api/applications/:id/accept', auth, checkBlocked, async (req, res)
         [app_.job_id, req.userId, freelancerId]
       ).catch(() => ({ rows: [] }));
       if (!existingRoom.rows.length) {
-        const newRoomId = 'room_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
+        const newRoomId = 'room_' + crypto.randomUUID();
         await query('INSERT INTO chat_rooms (id, client_id, freelancer_id, job_id) VALUES ($1,$2,$3,$4)',
           [newRoomId, req.userId, freelancerId, app_.job_id]).catch(() => {});
       }
@@ -988,7 +991,7 @@ router.put('/api/applications/:id/status', auth, checkBlocked, async (req, res) 
       const existRm = await query('SELECT id FROM chat_rooms WHERE job_id=$1 AND client_id=$2 AND freelancer_id=$3',
         [app_.job_id, req.userId, app_.freelancer_id]).catch(() => ({ rows: [] }));
       if (!existRm.rows.length) {
-        const rmId = 'room_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
+        const rmId = 'room_' + crypto.randomUUID();
         await query('INSERT INTO chat_rooms (id, client_id, freelancer_id, job_id) VALUES ($1,$2,$3,$4)',
           [rmId, req.userId, app_.freelancer_id, app_.job_id]).catch(() => {});
       }
@@ -1069,7 +1072,7 @@ router.post('/api/applications/:id/hire', auth, checkBlocked, async (req, res) =
     const existRmHire = await query('SELECT id FROM chat_rooms WHERE job_id=$1 AND client_id=$2 AND freelancer_id=$3',
       [app_.job_id, req.userId, freelancerId]).catch(() => ({ rows: [] }));
     if (!existRmHire.rows.length) {
-      const rmIdHire = 'room_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
+      const rmIdHire = 'room_' + crypto.randomUUID();
       await query('INSERT INTO chat_rooms (id, client_id, freelancer_id, job_id) VALUES ($1,$2,$3,$4)',
         [rmIdHire, req.userId, freelancerId, app_.job_id]).catch(() => {});
     }
