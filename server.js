@@ -451,6 +451,10 @@ initDb().then(async () => {
   // Remove test clutter jobs (description='test', title contains 'test') — idempotent
   await query(`DELETE FROM applications WHERE job_id IN (SELECT id FROM jobs WHERE description = 'test' AND title ILIKE '%test%')`).catch(() => {});
   await query(`DELETE FROM jobs WHERE description = 'test' AND title ILIKE '%test%'`).catch(() => {});
+  // Pre-warm admin stats cache so the first admin load shows data instantly
+  // (avoids empty Statistics tab during Render free-tier cold start).
+  const _adminRouter = require('./routes/admin');
+  if (_adminRouter.warmStats) _adminRouter.warmStats().catch(() => {});
   // ─── Socket.io setup ──────────────────────────────────────────────
   const { JWT_SECRET: _jwtSecret } = require('./src/middleware');
   const FRONTEND_ORIGIN = process.env.FRONTEND_URL || 'https://cherry19899.github.io';

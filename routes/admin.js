@@ -13,49 +13,64 @@ let _statsCache = null;
 let _statsCacheTs = 0;
 const STATS_TTL = 5 * 60 * 1000;
 
+// Computes the full stats object directly from the DB (no cache).
+async function computeStats() {
+  const fee = await getPlatformFee();
+  const [users, jobs, applications, escrows, activeEscrows, payments, escrowRevBase, ratings, chats, disputes] = await Promise.all([
+    query('SELECT COUNT(*) FROM users'),
+    query('SELECT COUNT(*) FROM jobs'),
+    query('SELECT COUNT(*) FROM applications'),
+    query('SELECT COUNT(*) FROM escrows'),
+    query("SELECT COUNT(*) FROM escrows WHERE status IN ('pending','funded')"),
+    query('SELECT COUNT(*) FROM payments'),
+    query("SELECT COALESCE(SUM(amount),0) AS total FROM escrows WHERE status='released'"),
+    query('SELECT COUNT(*) FROM ratings'),
+    query('SELECT COUNT(*) FROM chat_rooms'),
+    query("SELECT COUNT(*) FROM escrows WHERE status='disputed'"),
+  ]);
+  const u = parseInt(users.rows[0].count);
+  const j = parseInt(jobs.rows[0].count);
+  const a = parseInt(applications.rows[0].count);
+  const e = parseInt(escrows.rows[0].count);
+  const ae = parseInt(activeEscrows.rows[0].count);
+  const rev = parseFloat(escrowRevBase.rows[0].total) * fee;
+  return {
+    total_users: u, users: u,
+    total_jobs: j, jobs: j,
+    total_applications: a, applications: a,
+    total_escrows: e, escrows: e,
+    active_escrows: ae,
+    total_revenue: rev,
+    payments: parseInt(payments.rows[0].count),
+    ratings: parseInt(ratings.rows[0].count),
+    chats: parseInt(chats.rows[0].count),
+    pending_moderation: parseInt(disputes.rows[0].count),
+  };
+}
+
+// Pre-warm the stats cache at server startup so the very first admin load is
+// instant (no cold-start timeout → no empty Statistics tab on Render free tier).
+async function warmStats() {
+  try {
+    const data = await computeStats();
+    _statsCache = data;
+    _statsCacheTs = Date.now();
+    console.log('[admin/stats] cache warmed on startup');
+  } catch (err) {
+    console.error('[admin/stats] warm failed:', err.message);
+  }
+}
+
 // GET /api/admin/stats
 router.get('/api/admin/stats', adminAuth, async (req, res) => {
   const now = Date.now();
   if (_statsCache && (now - _statsCacheTs) < STATS_TTL) {
     return res.json({ ..._statsCache, cached: true });
   }
-  // 3-second timeout fallback — return stale/empty rather than error
-  const timeout = new Promise(resolve => setTimeout(() => resolve(null), 3000));
-  const work = (async () => {
-    try {
-      const fee = await getPlatformFee();
-      const [users, jobs, applications, escrows, activeEscrows, payments, escrowRevBase, ratings, chats, disputes] = await Promise.all([
-        query('SELECT COUNT(*) FROM users'),
-        query('SELECT COUNT(*) FROM jobs'),
-        query('SELECT COUNT(*) FROM applications'),
-        query('SELECT COUNT(*) FROM escrows'),
-        query("SELECT COUNT(*) FROM escrows WHERE status IN ('pending','funded')"),
-        query('SELECT COUNT(*) FROM payments'),
-        query("SELECT COALESCE(SUM(amount),0) AS total FROM escrows WHERE status='released'"),
-        query('SELECT COUNT(*) FROM ratings'),
-        query('SELECT COUNT(*) FROM chat_rooms'),
-        query("SELECT COUNT(*) FROM escrows WHERE status='disputed'"),
-      ]);
-      const u = parseInt(users.rows[0].count);
-      const j = parseInt(jobs.rows[0].count);
-      const a = parseInt(applications.rows[0].count);
-      const e = parseInt(escrows.rows[0].count);
-      const ae = parseInt(activeEscrows.rows[0].count);
-      const rev = parseFloat(escrowRevBase.rows[0].total) * fee;
-      return {
-        total_users: u, users: u,
-        total_jobs: j, jobs: j,
-        total_applications: a, applications: a,
-        total_escrows: e, escrows: e,
-        active_escrows: ae,
-        total_revenue: rev,
-        payments: parseInt(payments.rows[0].count),
-        ratings: parseInt(ratings.rows[0].count),
-        chats: parseInt(chats.rows[0].count),
-        pending_moderation: parseInt(disputes.rows[0].count),
-      };
-    } catch (err) { console.error('[admin/stats]', err.message); return null; }
-  })();
+  // 8-second timeout fallback — return stale/empty rather than error.
+  // Raised from 3s: cold Render DB COUNT queries can exceed 3s on first hit.
+  const timeout = new Promise(resolve => setTimeout(() => resolve(null), 8000));
+  const work = computeStats().catch(err => { console.error('[admin/stats]', err.message); return null; });
   const data = await Promise.race([work, timeout]);
   if (data) {
     _statsCache = data;
@@ -883,4 +898,5 @@ router.post('/api/admin/rate-limits/unblock', adminAuth, async (req, res) => {
   res.json({ success: true, was_blocked: had });
 });
 
+router.warmStats = warmStats;
 module.exports = router;
