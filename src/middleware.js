@@ -29,19 +29,35 @@ function skipIfBypassed(req) {
 // In dev/sandbox mode all per-endpoint limits are relaxed 10×.
 const DEV_MULTIPLIER = process.env.SANDBOX_MODE ? 10 : 1;
 
+// ─── Rate-limit block tracker ──────────────────────────────────────────────
+// In-memory map: ip → { endpoint, count, firstHit, lastHit }
+const _rlBlocks = new Map();
+
+function _rlHandler(endpoint) {
+  return (req, res) => {
+    const ip = req.ip || req.socket?.remoteAddress || 'unknown';
+    const entry = _rlBlocks.get(ip) || { endpoint, count: 0, firstHit: Date.now(), lastHit: 0 };
+    entry.count += 1;
+    entry.lastHit = Date.now();
+    entry.endpoint = endpoint; // update to most recent endpoint blocked
+    _rlBlocks.set(ip, entry);
+    res.status(429).json({ error: `Too many requests (${endpoint})` });
+  };
+}
+
 // ─── Rate limiters ──────────────────────────────────────────────
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, max: 20 * DEV_MULTIPLIER,
   keyGenerator: (req) => req.ip || req.socket?.remoteAddress || 'unknown',
   skip: skipIfBypassed,
-  message: { error: 'Too many auth attempts, try again later' },
+  handler: _rlHandler('auth'),
 });
 
 const adminLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, max: 100 * DEV_MULTIPLIER,
   keyGenerator: (req) => req.ip || req.socket?.remoteAddress || 'unknown',
   skip: skipIfBypassed,
-  message: { error: 'Too many admin requests' },
+  handler: _rlHandler('admin'),
 });
 
 // Strict limiter for connects/payments to prevent abuse
@@ -50,7 +66,7 @@ const connectsLimiter = rateLimit({
   // Key by IP, NOT x-user-id — the user header is client-controlled and trivially rotated to bypass the cap
   keyGenerator: (req) => req.ip || req.socket?.remoteAddress || 'unknown',
   skip: skipIfBypassed,
-  message: { error: 'Too many connect operations, try again later' },
+  handler: _rlHandler('connects'),
 });
 
 // Strict limiter for chat message sending — 30 messages per minute per IP
@@ -58,14 +74,14 @@ const messageLimiter = rateLimit({
   windowMs: 60 * 1000, max: 30 * DEV_MULTIPLIER,
   keyGenerator: (req) => req.ip || req.socket?.remoteAddress || 'unknown',
   skip: skipIfBypassed,
-  message: { error: 'Too many messages, slow down' },
+  handler: _rlHandler('messages'),
 });
 
 const jobPostLimiter = rateLimit({
   windowMs: 60 * 60 * 1000, max: 10 * DEV_MULTIPLIER,
   keyGenerator: (req) => req.ip || req.socket?.remoteAddress || 'unknown',
   skip: skipIfBypassed,
-  message: { error: 'Too many jobs posted, try again later' },
+  handler: _rlHandler('job_post'),
 });
 
 // Strict IP limiter for admin endpoints — 50 failed-or-brute-force attempts/15min
@@ -74,7 +90,7 @@ const adminStrictLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, max: 50 * DEV_MULTIPLIER,
   keyGenerator: (req) => req.ip || req.socket?.remoteAddress || 'unknown',
   skip: skipIfBypassed,
-  message: { error: 'Too many requests to admin API' },
+  handler: _rlHandler('admin_strict'),
 });
 
 // ─── Auth middleware ──────────────────────────────────────────────
@@ -182,4 +198,5 @@ module.exports = {
   jobPostLimiter,
   JWT_SECRET,
   ADMIN_API_KEY,
+  _rlBlocks,
 };

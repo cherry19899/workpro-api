@@ -100,7 +100,82 @@ app.use('/api/chat/conversations', (req, res, next) => { if (req.method === 'POS
 
 // ─── Static endpoints ──────────────────────────────────────────────
 app.get('/', (req, res) => {
-  res.json({ name: 'WorkPro API', version: '3.2.0', status: 'ok' });
+  res.json({ name: 'WorkPro API', version: '3.2.0', status: 'ok', docs: '/api/docs' });
+});
+
+// GET /api/docs — Swagger UI (CDN-hosted, no npm package needed)
+app.get('/api/docs', (req, res) => {
+  res.setHeader('Content-Type', 'text/html');
+  res.send(`<!DOCTYPE html>
+<html>
+<head><title>WorkPro API Docs</title>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css"/>
+</head>
+<body>
+<div id="swagger-ui"></div>
+<script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+<script>
+SwaggerUIBundle({
+  url: '/api/openapi.json',
+  dom_id: '#swagger-ui',
+  presets: [SwaggerUIBundle.presets.apis, SwaggerUIBundle.SwaggerUIStandalonePreset],
+  layout: 'BaseLayout',
+  deepLinking: true,
+});
+</script>
+</body>
+</html>`);
+});
+
+// GET /api/openapi.json — OpenAPI 3.0 spec
+app.get('/api/openapi.json', (req, res) => {
+  const base = process.env.API_BASE_URL || 'https://workpro-api.onrender.com';
+  res.json({
+    openapi: '3.0.3',
+    info: { title: 'WorkPro API', version: '3.2.0', description: 'Pi Network freelance marketplace API' },
+    servers: [{ url: base }],
+    components: {
+      securitySchemes: {
+        BearerAuth: { type: 'http', scheme: 'bearer', bearerFormat: 'JWT' },
+        AdminKey: { type: 'apiKey', in: 'header', name: 'x-admin-key' },
+      },
+    },
+    security: [{ BearerAuth: [] }],
+    paths: {
+      '/api/health': { get: { tags: ['System'], summary: 'Health check', security: [], responses: { '200': { description: 'OK' } } } },
+      '/api/me': { post: { tags: ['Auth'], summary: 'Login / register', security: [], requestBody: { content: { 'application/json': { schema: { type: 'object', properties: { uid: { type: 'string' }, username: { type: 'string' }, accessToken: { type: 'string' } }, required: ['uid', 'username'] } } } }, responses: { '200': { description: 'JWT token' } } } },
+      '/api/jobs': {
+        get: { tags: ['Jobs'], summary: 'List open jobs (cursor or page)', parameters: [ { name: 'cursor', in: 'query', schema: { type: 'string' } }, { name: 'page', in: 'query', schema: { type: 'integer' } }, { name: 'limit', in: 'query', schema: { type: 'integer' } }, { name: 'search', in: 'query', schema: { type: 'string' } }, { name: 'category', in: 'query', schema: { type: 'string' } }, { name: 'sort', in: 'query', schema: { type: 'string', enum: ['newest','oldest','budget_asc','budget_desc','popular'] } } ], security: [], responses: { '200': { description: 'Jobs list' } } },
+        post: { tags: ['Jobs'], summary: 'Create job', responses: { '201': { description: 'Created' } } },
+      },
+      '/api/jobs/search/autocomplete': { get: { tags: ['Jobs'], summary: 'Title autocomplete', parameters: [{ name: 'q', in: 'query', required: true, schema: { type: 'string' } }], security: [], responses: { '200': { description: 'Suggestions' } } } },
+      '/api/jobs/{id}': {
+        get: { tags: ['Jobs'], summary: 'Get job detail', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }], security: [], responses: { '200': { description: 'Job' } } },
+        put: { tags: ['Jobs'], summary: 'Update job', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }], responses: { '200': { description: 'Updated' } } },
+        delete: { tags: ['Jobs'], summary: 'Delete job', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }], responses: { '204': { description: 'Deleted' } } },
+      },
+      '/api/jobs/{id}/apply': { post: { tags: ['Jobs'], summary: 'Apply to job (costs connects)', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }], responses: { '200': { description: 'Applied' }, '409': { description: 'Already applied' } } } },
+      '/api/jobs/{id}/hire': { post: { tags: ['Jobs'], summary: 'Hire a freelancer', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }], responses: { '200': { description: 'Hired' } } } },
+      '/api/connects/balance': { get: { tags: ['Connects'], summary: 'Get connects balance', responses: { '200': { description: 'Balance' } } } },
+      '/api/connects/buy': { post: { tags: ['Connects'], summary: 'Buy connects via Pi payment', responses: { '200': { description: 'Credited' } } } },
+      '/api/payments/approve': { post: { tags: ['Payments'], summary: 'Approve Pi payment', responses: { '200': { description: 'Approved' } } } },
+      '/api/payments/complete': { post: { tags: ['Payments'], summary: 'Complete Pi payment', responses: { '200': { description: 'Completed' } } } },
+      '/api/escrow/{id}/release': { post: { tags: ['Escrow'], summary: 'Release escrow to freelancer', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }], responses: { '200': { description: 'Released' } } } },
+      '/api/chat/conversations': { get: { tags: ['Chat'], summary: 'List conversations', responses: { '200': { description: 'Conversations' } } } },
+      '/api/notifications': { get: { tags: ['Notifications'], summary: 'Get notifications', responses: { '200': { description: 'Notifications' } } } },
+      '/api/users/{id}': { get: { tags: ['Users'], summary: 'Get user profile', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }], security: [], responses: { '200': { description: 'User' } } } },
+      '/api/admin/stats': { get: { tags: ['Admin'], summary: 'Platform stats', security: [{ AdminKey: [] }], responses: { '200': { description: 'Stats' } } } },
+      '/api/admin/analytics': { get: { tags: ['Admin'], summary: 'Analytics dashboard', security: [{ AdminKey: [] }], responses: { '200': { description: 'Analytics' } } } },
+      '/api/admin/settings': {
+        get: { tags: ['Admin'], summary: 'Get platform settings', security: [{ AdminKey: [] }], responses: { '200': { description: 'Settings' } } },
+        patch: { tags: ['Admin'], summary: 'Update platform setting', security: [{ AdminKey: [] }], requestBody: { content: { 'application/json': { schema: { type: 'object', properties: { key: { type: 'string' }, value: { type: 'number' } }, required: ['key','value'] } } } }, responses: { '200': { description: 'Updated' } } },
+      },
+      '/api/admin/rate-limits': { get: { tags: ['Admin'], summary: 'List rate-limited IPs', security: [{ AdminKey: [] }], responses: { '200': { description: 'Blocked IPs' } } } },
+      '/api/admin/rate-limits/unblock': { post: { tags: ['Admin'], summary: 'Unblock an IP', security: [{ AdminKey: [] }], requestBody: { content: { 'application/json': { schema: { type: 'object', properties: { ip: { type: 'string' } }, required: ['ip'] } } } }, responses: { '200': { description: 'Unblocked' } } } },
+    },
+  });
 });
 
 // Pi Network calls this to verify backend ownership
@@ -108,27 +183,50 @@ app.get('/.well-known/pi-network', (req, res) => {
   res.json({ app: 'workpro', backend: true, version: '3.2.0' });
 });
 
+const _serverStartTime = Date.now();
+let _lastError = null; // set by the global error handler
+
 app.get('/api/health', async (req, res) => {
-  const result = { status: 'ok', version: '3.2.0', timestamp: new Date().toISOString() };
+  const result = {
+    status: 'ok',
+    version: '3.2.0',
+    timestamp: new Date().toISOString(),
+    uptime_seconds: Math.floor((Date.now() - _serverStartTime) / 1000),
+    memory_mb: parseFloat((process.memoryUsage().rss / 1024 / 1024).toFixed(1)),
+  };
+
+  // DB latency
+  const dbStart = Date.now();
   try {
+    const pool = require('./src/db').getPool();
+    result.db_connections = { total: pool.totalCount, idle: pool.idleCount, waiting: pool.waitingCount };
     await query('SELECT 1');
+    result.db_latency_ms = Date.now() - dbStart;
     result.database = 'connected';
   } catch (err) {
     console.error('[Health] DB check failed:', err.message);
     result.status = 'degraded';
     result.database = 'disconnected';
+    result.db_latency_ms = null;
   }
+
   const { PI_API_KEY: piKey } = require('./src/helpers');
   result.pi_api = piKey ? 'configured' : 'missing';
-  // Lightweight Pi API reachability check (skip in sandbox to avoid slowing health ping)
+
+  // Pi API latency (only on deep=1 to avoid slowing every ping)
   if (piKey && process.env.SANDBOX_MODE !== 'true' && req.query.deep === '1') {
+    const piStart = Date.now();
     try {
       const r = await fetch('https://api.minepi.com/v2/payments/health_check_nonexistent', {
         headers: { Authorization: `Key ${piKey}` },
       }).catch(() => null);
       result.pi_api_reachable = r ? (r.status < 500 ? 'ok' : 'error') : 'unreachable';
-    } catch (_) { result.pi_api_reachable = 'unreachable'; }
+      result.pi_api_latency_ms = Date.now() - piStart;
+    } catch (_) { result.pi_api_reachable = 'unreachable'; result.pi_api_latency_ms = null; }
   }
+
+  if (_lastError) result.last_error = _lastError;
+
   res.status(result.status === 'ok' ? 200 : 500).json(result);
 });
 
@@ -151,6 +249,7 @@ app.use((req, res) => {
 
 app.use((err, req, res, next) => {
   console.error('[Error]', err);
+  _lastError = { message: err.message, path: req.path, time: new Date().toISOString() };
   res.status(500).json({ error: 'Internal server error' });
 });
 

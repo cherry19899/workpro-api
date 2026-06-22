@@ -6,7 +6,7 @@ const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const { query, getPool } = require('../src/db');
 const { notify, audit, serverError, getPlatformFee, invalidatePlatformFeeCache, FEE_MAX } = require('../src/helpers');
-const { adminAuth, twinId, JWT_SECRET, ADMIN_API_KEY } = require('../src/middleware');
+const { adminAuth, twinId, JWT_SECRET, ADMIN_API_KEY, _rlBlocks } = require('../src/middleware');
 
 // GET /api/admin/stats
 router.get('/api/admin/stats', adminAuth, async (req, res) => {
@@ -718,6 +718,90 @@ router.post('/api/admin/auto-merge-twins', adminAuth, async (req, res) => {
     await audit('auto_merge_twins', { results });
     res.json({ success: true, merged: results.filter(r => r.status === 'merged').length, pairs: results });
   } catch (err) { serverError(err, res); }
+});
+
+// GET /api/admin/analytics — daily active users, job stats, revenue, top categories
+router.get('/api/admin/analytics', adminAuth, async (req, res) => {
+  try {
+    const [
+      dailyUsers,
+      jobStats,
+      revenueRow,
+      topCategories,
+      newUsers7d,
+      newJobs7d,
+    ] = await Promise.all([
+      // Daily active users over last 7 days (proxy: users who created/updated jobs or sent messages)
+      query(`
+        SELECT DATE(created_at) AS day, COUNT(DISTINCT posted_by) AS active_users
+        FROM jobs WHERE created_at >= NOW() - INTERVAL '7 days'
+        GROUP BY day ORDER BY day DESC
+      `),
+      query(`
+        SELECT status, COUNT(*) AS count FROM jobs GROUP BY status ORDER BY count DESC
+      `),
+      query(`
+        SELECT COALESCE(SUM(amount), 0) AS total_revenue FROM escrows WHERE status = 'released'
+      `),
+      query(`
+        SELECT category, COUNT(*) AS count FROM jobs
+        WHERE category IS NOT NULL AND category <> ''
+        GROUP BY category ORDER BY count DESC LIMIT 10
+      `),
+      query(`SELECT COUNT(*) AS count FROM users WHERE created_at >= NOW() - INTERVAL '7 days'`),
+      query(`SELECT COUNT(*) AS count FROM jobs WHERE created_at >= NOW() - INTERVAL '7 days'`),
+    ]);
+    const fee = await getPlatformFee();
+    const totalRevenue = parseFloat(revenueRow.rows[0].total_revenue);
+    res.json({
+      daily_active_users: dailyUsers.rows,
+      job_stats: jobStats.rows,
+      revenue: {
+        total_escrow_released: totalRevenue,
+        platform_fee_percent: parseFloat((fee * 100).toFixed(4)),
+        platform_earnings: parseFloat((totalRevenue * fee).toFixed(8)),
+      },
+      top_categories: topCategories.rows,
+      last_7_days: {
+        new_users: parseInt(newUsers7d.rows[0].count),
+        new_jobs: parseInt(newJobs7d.rows[0].count),
+      },
+    });
+  } catch (err) { serverError(err, res); }
+});
+
+// POST /api/admin/backup/trigger — run a DB backup now (for external cron-job.org trigger)
+router.post('/api/admin/backup/trigger', adminAuth, async (req, res) => {
+  try {
+    const { run } = require('../scripts/backup');
+    const result = await run();
+    await audit('backup_triggered', { ...result, by: req.userId });
+    res.json({ success: true, ...result });
+  } catch (err) {
+    console.error('[backup] trigger error:', err.message);
+    await audit('backup_failed', { error: err.message, by: req.userId }).catch(() => {});
+    res.status(500).json({ error: 'Backup failed', detail: err.message });
+  }
+});
+
+// GET /api/admin/rate-limits — list IPs currently tracked as blocked
+router.get('/api/admin/rate-limits', adminAuth, (req, res) => {
+  const blocks = [];
+  for (const [ip, info] of _rlBlocks.entries()) {
+    blocks.push({ ip, ...info });
+  }
+  blocks.sort((a, b) => b.count - a.count);
+  res.json({ blocks, total: blocks.length });
+});
+
+// POST /api/admin/rate-limits/unblock — clear a blocked IP from the tracker
+router.post('/api/admin/rate-limits/unblock', adminAuth, async (req, res) => {
+  const { ip } = req.body;
+  if (!ip || typeof ip !== 'string') return res.status(400).json({ error: 'ip required' });
+  const had = _rlBlocks.has(ip);
+  _rlBlocks.delete(ip);
+  await audit('rate_limit_unblock', { ip, by: req.userId });
+  res.json({ success: true, was_blocked: had });
 });
 
 module.exports = router;

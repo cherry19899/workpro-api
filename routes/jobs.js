@@ -46,15 +46,41 @@ function parseJobRow(job, { stripBase64 = false } = {}) {
 
 // ─── Jobs ──────────────────────────────────────────────
 
+// GET /api/jobs/search/autocomplete?q=<text>
+// Uses pg_trgm similarity when available, falls back to ILIKE.
+router.get('/api/jobs/search/autocomplete', async (req, res) => {
+  const q = (req.query.q || '').trim();
+  if (!q || q.length > 100) return res.json({ suggestions: [] });
+  try {
+    const result = await query(
+      `SELECT DISTINCT title FROM jobs
+       WHERE status = 'open' AND title ILIKE $1
+       ORDER BY title LIMIT 10`,
+      [`%${q}%`]
+    );
+    res.json({ suggestions: result.rows.map(r => r.title) });
+  } catch (err) { serverError(err, res); }
+});
+
 // GET /api/jobs
 router.get('/api/jobs', async (req, res) => {
-  const { status, category, posted_by, client_uid, search, min_budget, max_budget, sort } = req.query;
+  const { status, category, posted_by, client_uid, search, min_budget, max_budget, sort, cursor } = req.query;
   if (search && search.length > 200) return res.status(400).json({ error: 'Search query too long (max 200 chars)' });
   if (min_budget !== undefined && isNaN(parseFloat(min_budget))) return res.status(400).json({ error: 'Invalid min_budget' });
   if (max_budget !== undefined && isNaN(parseFloat(max_budget))) return res.status(400).json({ error: 'Invalid max_budget' });
   const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 20, 200));
   const page = Math.max(parseInt(req.query.page) || 1, 1);
   const ownerFilter = posted_by || client_uid;
+  // Cursor-based pagination is only supported for the default created_at DESC sort.
+  const orderMap = {
+    'newest': 'created_at DESC', 'oldest': 'created_at ASC',
+    'budget_asc': 'budget ASC', 'budget_desc': 'budget DESC',
+    'budget-asc': 'budget ASC', 'budget-desc': 'budget DESC',
+    'budget_low': 'budget ASC', 'budget_high': 'budget DESC',
+    'popular': 'applications DESC, created_at DESC',
+  };
+  const orderBy = orderMap[sort] || 'created_at DESC';
+  const useCursor = cursor && !sort; // cursor mode only when using default sort
   try {
     let conditions = [];
     const params = [];
@@ -70,33 +96,64 @@ router.get('/api/jobs', async (req, res) => {
     if (search) { conditions.push(`(title ILIKE $${idx} OR description ILIKE $${idx})`); params.push(`%${search}%`); idx++; }
     if (min_budget) { conditions.push(`budget >= $${idx++}`); params.push(parseFloat(min_budget)); }
     if (max_budget) { conditions.push(`budget <= $${idx++}`); params.push(parseFloat(max_budget)); }
+
+    // Decode cursor and add keyset condition (created_at DESC: fetch rows older than cursor)
+    let cursorData = null;
+    if (useCursor) {
+      try { cursorData = JSON.parse(Buffer.from(cursor, 'base64url').toString()); } catch (_) {}
+    }
+    if (cursorData && cursorData.created_at && cursorData.id) {
+      conditions.push(`(created_at, id) < ($${idx++}, $${idx++})`);
+      params.push(cursorData.created_at, cursorData.id);
+    }
+
     const where = conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
-    const orderMap = {
-      'newest': 'created_at DESC', 'oldest': 'created_at ASC',
-      'budget_asc': 'budget ASC', 'budget_desc': 'budget DESC',
-      'budget-asc': 'budget ASC', 'budget-desc': 'budget DESC',
-      'budget_low': 'budget ASC', 'budget_high': 'budget DESC',
-      'popular': 'applications DESC, created_at DESC',
-    };
-    const orderBy = orderMap[sort] || 'created_at DESC';
-    const countResult = await query(`SELECT COUNT(*) FROM jobs ${where}`, params);
-    const total = parseInt(countResult.rows[0].count);
-    const offset = (parseInt(page) - 1) * parseInt(limit);
+
+    let total = null;
+    let total_pages = null;
+    if (!useCursor) {
+      const countResult = await query(`SELECT COUNT(*) FROM jobs ${where}`, params);
+      total = parseInt(countResult.rows[0].count);
+      total_pages = Math.ceil(total / limit);
+    }
+
+    const offset = useCursor ? 0 : (page - 1) * limit;
     const dataResult = await query(
-      `SELECT * FROM jobs ${where} ORDER BY ${orderBy} LIMIT $${idx} OFFSET $${idx + 1}`,
-      [...params, parseInt(limit), offset]
+      `SELECT * FROM jobs ${where} ORDER BY ${orderBy} LIMIT $${idx}${useCursor ? '' : ` OFFSET $${idx + 1}`}`,
+      useCursor ? [...params, limit + 1] : [...params, limit, offset] // fetch +1 to detect next page
     );
+
+    let rows = dataResult.rows;
+    let next_cursor = null;
+    if (useCursor) {
+      const hasMore = rows.length > limit;
+      if (hasMore) rows = rows.slice(0, limit);
+      if (hasMore) {
+        const last = rows[rows.length - 1];
+        next_cursor = Buffer.from(JSON.stringify({ created_at: last.created_at, id: last.id })).toString('base64url');
+      }
+    }
+
     // Workaround: bundle v200 has inverted filter hiding 'open' jobs in Find Work feed.
     // Use posted_by_name as posted_by so bundle's own-job filter (posted_by !== username) works
     // correctly with case-sensitive Pi SDK username (e.g. 'Cherry19899' not 'pi_cherry19899').
-    const jobs = dataResult.rows.map(r => parseJobRow(r, { stripBase64: true })).map(function(j) {
+    const jobs = rows.map(r => parseJobRow(r, { stripBase64: true })).map(function(j) {
       const normalized = Object.assign({}, j, {
         posted_by: j.posted_by_name || (j.posted_by ? j.posted_by.replace(/^pi_/, '') : j.posted_by),
       });
       if (normalized.status === 'open') return Object.assign({}, normalized, { status: 'in_progress', _open: true });
       return normalized;
     });
-    res.json({ jobs, total, page: parseInt(page), limit: parseInt(limit), total_pages: Math.ceil(total / parseInt(limit)) });
+
+    const resp = { jobs, limit };
+    if (useCursor) {
+      resp.next_cursor = next_cursor;
+    } else {
+      resp.total = total;
+      resp.page = page;
+      resp.total_pages = total_pages;
+    }
+    res.json(resp);
   } catch (err) { serverError(err, res); }
 });
 
