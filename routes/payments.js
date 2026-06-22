@@ -251,7 +251,7 @@ router.post('/api/payments/incomplete', auth, async (req, res) => {
           const paymentOwner = markDone.rows[0].user_id || req.userId;
           if (meta.type === 'connects') {
             const piAmountPaid = parseFloat(piPayment.amount || markDone.rows[0].amount || 0);
-            const amount = Math.floor(piAmountPaid * 10);
+            const amount = resolveConnects(piAmountPaid);
             if (amount > 0) {
               await pgInc.query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [amount, paymentOwner]);
             }
@@ -351,7 +351,7 @@ router.post('/api/payments/:paymentId/resolve-complete', auth, async (req, res) 
         const paymentOwner = markDoneRC.rows[0].user_id || req.userId;
         if (meta.type === 'connects') {
           const piAmountPaid = parseFloat(markDoneRC.rows[0].amount || 0);
-          const amount = Math.floor(piAmountPaid * 10);
+          const amount = resolveConnects(piAmountPaid);
           if (amount > 0) {
             await pgRC.query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [amount, paymentOwner]);
           }

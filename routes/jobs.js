@@ -448,6 +448,18 @@ router.post('/api/jobs/:id/hire', auth, checkBlocked, async (req, res) => {
     let roomId, escrowRow;
     try {
       await pgClientJ.query('BEGIN');
+      // Lock job row first to prevent concurrent hire races (two requests both reading status='open')
+      const jobLockJ = await pgClientJ.query('SELECT status FROM jobs WHERE id = $1 FOR UPDATE', [req.params.id]);
+      if (!jobLockJ.rows.length || jobLockJ.rows[0].status !== 'open') {
+        await pgClientJ.query('ROLLBACK');
+        return res.status(400).json({ error: 'Job is not open' });
+      }
+      // Re-verify application is still pending inside the transaction
+      const appLockJ = await pgClientJ.query('SELECT id FROM applications WHERE id = $1 AND status = $2 FOR UPDATE', [application_id, 'pending']);
+      if (!appLockJ.rows.length) {
+        await pgClientJ.query('ROLLBACK');
+        return res.status(409).json({ error: 'Application is no longer pending — it may have already been accepted' });
+      }
       const existingEsc = await pgClientJ.query("SELECT * FROM escrows WHERE job_id = $1 AND status = ANY($2) FOR UPDATE", [req.params.id, ['pending', 'funded']]);
       const payUsed = await pgClientJ.query('SELECT id FROM escrows WHERE payment_id = $1 LIMIT 1', [payment_id]);
       if (payUsed.rows.length && (!existingEsc.rows.length || existingEsc.rows[0].payment_id !== payment_id)) {
