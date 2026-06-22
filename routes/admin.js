@@ -229,18 +229,18 @@ router.get('/api/admin/debug/integrity', adminAuth, async (req, res) => {
 router.get('/api/admin/debug/connects/:userId', adminAuth, async (req, res) => {
   const userId = req.params.userId;
   try {
-    const [userRow, payments, audit] = await Promise.all([
-      query('SELECT id, username, balance_connects, updated_at FROM users WHERE id = $1', [userId]),
+    const [userRow, payments, auditRows] = await Promise.all([
+      query('SELECT id, username, balance_connects, balance_pi, role, status, updated_at FROM users WHERE id = $1', [userId]),
       query(`SELECT id, status, amount, type, metadata, txid, created_at, updated_at
              FROM payments WHERE user_id = $1 ORDER BY created_at DESC LIMIT 20`, [userId]),
-      query(`SELECT action, data, created_at FROM audit_logs
+      query(`SELECT id, action, data, created_at FROM audit_logs
              WHERE data::text ILIKE $1 ORDER BY created_at DESC LIMIT 20`, [`%${userId}%`]),
     ]);
     if (!userRow.rows.length) return res.status(404).json({ error: 'User not found' });
     res.json({
       user: userRow.rows[0],
       payments: payments.rows,
-      audit_logs: audit.rows,
+      audit_logs: auditRows.rows,
     });
   } catch (err) { serverError(err, res); }
 });
@@ -408,8 +408,10 @@ router.get('/api/admin/audit-logs', adminAuth, async (req, res) => {
   const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 200, 1000));
   const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
-    const result = await query('SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT $1 OFFSET $2', [limit, offset]);
-    const total = await query('SELECT COUNT(*) FROM audit_logs');
+    const [result, total] = await Promise.all([
+      query('SELECT id, action, data, created_at FROM audit_logs ORDER BY created_at DESC LIMIT $1 OFFSET $2', [limit, offset]),
+      query('SELECT COUNT(*) FROM audit_logs'),
+    ]);
     res.json({ logs: result.rows, total: parseInt(total.rows[0].count), limit, offset });
   } catch (err) { serverError(err, res); }
 });
