@@ -31,7 +31,7 @@ function resolveConnects(piAmount) {
 async function handlePaymentApprove(paymentId, metadata, userId, res, paymentsEnabled) {
   // payments_enabled is set by the Pi SDK on the frontend and passed through metadata.
   // In sandbox/testnet it may be absent — block only on mainnet (when PI_API_KEY is production).
-  if (PI_API_KEY && paymentsEnabled === false) {
+  if (PI_API_KEY && paymentsEnabled === false && !process.env.SANDBOX_MODE) {
     return res.status(403).json({ error: 'Pi payments not enabled for this account. Complete KYC on Pi App first.' });
   }
   try {
