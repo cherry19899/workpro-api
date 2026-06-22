@@ -90,7 +90,7 @@ router.get('/api/admin/users', adminAuth, async (req, res) => {
   const safeFields = 'id, username, role, rating, total_jobs_posted, total_jobs_completed, balance_connects, balance_pi, is_blocked, status, created_at, updated_at';
   try {
     const search = (req.query.search || '').slice(0, 200);
-    const timeout = new Promise(resolve => setTimeout(() => resolve(null), 3000));
+    const timeout = new Promise(resolve => setTimeout(() => resolve(null), 12000));
     const work = (async () => {
       let sql, params = [];
       if (search) {
@@ -182,7 +182,7 @@ router.get('/api/admin/jobs', adminAuth, async (req, res) => {
   const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 100, 500));
   const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
-    const timeout = new Promise(resolve => setTimeout(() => resolve(null), 3000));
+    const timeout = new Promise(resolve => setTimeout(() => resolve(null), 12000));
     const work = Promise.all([
       query(`SELECT ${JOB_LIST_FIELDS} FROM jobs j LEFT JOIN users u ON u.id = j.posted_by ORDER BY j.created_at DESC LIMIT $1 OFFSET $2`, [limit, offset]),
       query('SELECT COUNT(*) FROM jobs'),
@@ -198,7 +198,7 @@ router.get('/api/admin/jobs/all', adminAuth, async (req, res) => {
   const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 200, 500));
   const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
-    const timeout = new Promise(resolve => setTimeout(() => resolve(null), 3000));
+    const timeout = new Promise(resolve => setTimeout(() => resolve(null), 12000));
     const work = Promise.all([
       query(`SELECT ${JOB_LIST_FIELDS} FROM jobs j LEFT JOIN users u ON u.id = j.posted_by ORDER BY j.created_at DESC LIMIT $1 OFFSET $2`, [limit, offset]),
       query('SELECT COUNT(*) FROM jobs'),
@@ -378,7 +378,7 @@ router.post('/api/admin/escrows/:id/resolve', adminAuth, async (req, res) => {
 
 // GET /api/admin/earnings
 router.get('/api/admin/earnings', adminAuth, async (req, res) => {
-  const timeout = new Promise(resolve => setTimeout(() => resolve(null), 3000));
+  const timeout = new Promise(resolve => setTimeout(() => resolve(null), 12000));
   const work = (async () => {
     try {
       const fee = await getPlatformFee();
@@ -817,7 +817,7 @@ router.get('/api/admin/analytics', adminAuth, async (req, res) => {
   if (_analyticsCache && (now - _analyticsCacheTs) < ANALYTICS_TTL) {
     return res.json({ ..._analyticsCache, cached: true });
   }
-  const timeout = new Promise(resolve => setTimeout(() => resolve(null), 3000));
+  const timeout = new Promise(resolve => setTimeout(() => resolve(null), 12000));
   const work = (async () => {
     try {
       const fee = await getPlatformFee();
