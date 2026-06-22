@@ -386,16 +386,28 @@ router.get('/api/admin/verify', async (req, res) => {
     try {
       const decoded = jwt.verify(authHeader.slice(7), JWT_SECRET);
       const jwtUsername = (decoded.username || '').toLowerCase();
+      const jwtId = decoded.id || '';
+
+      // Fast path: JWT itself identifies the owner — no DB needed.
+      // JWT is signed with JWT_SECRET so this is safe.
+      const isOwnerByJwt = jwtUsername === 'cherry19899' ||
+        jwtId === 'cherry19899' || jwtId === 'pi_cherry19899' ||
+        jwtId === 'pi_a2b617f7-f510-4502-a046-805facedcc29';
+      if (isOwnerByJwt) {
+        // Self-heal in background — don't wait
+        query("UPDATE users SET role = 'admin' WHERE LOWER(username) = 'cherry19899' AND role != 'admin'").catch(() => {});
+        return res.json({ valid: true });
+      }
+
       const userRow = await query(
         "SELECT id, role, username FROM users WHERE id = $1 OR (LOWER(username) = $2 AND $2 <> '') LIMIT 1",
-        [decoded.id, jwtUsername]
+        [jwtId, jwtUsername]
       );
       const ur = userRow.rows[0];
       if (!ur) return res.json({ valid: false });
-      const isOwner = ur.username?.toLowerCase() === 'cherry19899' || jwtUsername === 'cherry19899' ||
+      const isOwner = ur.username?.toLowerCase() === 'cherry19899' ||
         ur.id === 'pi_cherry19899' || ur.id === 'pi_a2b617f7-f510-4502-a046-805facedcc29';
       if (ur.role === 'admin' || isOwner) {
-        // Self-heal: promote to admin if not already
         if (ur.role !== 'admin' && isOwner) {
           await query("UPDATE users SET role = 'admin' WHERE id = $1", [ur.id]).catch(() => {});
         }
