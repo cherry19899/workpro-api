@@ -294,6 +294,8 @@ async function ensureNotificationsTable() {
     created_at TIMESTAMPTZ DEFAULT NOW()
   )`, 'notifications table');
   await run(`CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, is_read, created_at DESC)`, 'idx_notifications_user');
+  await run(`CREATE INDEX IF NOT EXISTS idx_users_username_lower ON users(LOWER(username))`, 'idx_users_username_lower');
+  await run(`CREATE INDEX IF NOT EXISTS idx_users_id_lower ON users(LOWER(id))`, 'idx_users_id_lower');
   await run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_chat_read_at TIMESTAMPTZ`, 'users.last_chat_read_at');
   // Critical: must run before any UPDATE that references updated_at
   await run(`ALTER TABLE applications ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`, 'applications.updated_at');

@@ -62,8 +62,9 @@ router.get('/api/admin/stats', adminAuth, async (req, res) => {
     _statsCacheTs = Date.now();
     return res.json(data);
   }
-  // Timed out — return stale cache or empty
-  return res.json(_statsCache || { total_users:0,users:0,total_jobs:0,jobs:0,total_applications:0,applications:0,total_escrows:0,escrows:0,active_escrows:0,total_revenue:0,payments:0,ratings:0,chats:0,pending_moderation:0, _timeout:true });
+  // Timed out — return stale cache, or signal retry (never return misleading zeros)
+  if (_statsCache) return res.json({ ..._statsCache, cached: true, _stale: true });
+  return res.json({ status: 'loading', retry_after: 5 });
 });
 
 // GET /api/admin/users
@@ -788,54 +789,62 @@ router.post('/api/admin/auto-merge-twins', adminAuth, async (req, res) => {
   } catch (err) { serverError(err, res); }
 });
 
+// In-memory cache for analytics (1-hour TTL)
+let _analyticsCache = null;
+let _analyticsCacheTs = 0;
+const ANALYTICS_TTL = 60 * 60 * 1000;
+
 // GET /api/admin/analytics — daily active users, job stats, revenue, top categories
 router.get('/api/admin/analytics', adminAuth, async (req, res) => {
-  try {
-    const [
-      dailyUsers,
-      jobStats,
-      revenueRow,
-      topCategories,
-      newUsers7d,
-      newJobs7d,
-    ] = await Promise.all([
-      // Daily active users over last 7 days (proxy: users who created/updated jobs or sent messages)
-      query(`
-        SELECT DATE(created_at) AS day, COUNT(DISTINCT posted_by) AS active_users
-        FROM jobs WHERE created_at >= NOW() - INTERVAL '7 days'
-        GROUP BY day ORDER BY day DESC
-      `),
-      query(`
-        SELECT status, COUNT(*) AS count FROM jobs GROUP BY status ORDER BY count DESC
-      `),
-      query(`
-        SELECT COALESCE(SUM(amount), 0) AS total_revenue FROM escrows WHERE status = 'released'
-      `),
-      query(`
-        SELECT category, COUNT(*) AS count FROM jobs
-        WHERE category IS NOT NULL AND category <> ''
-        GROUP BY category ORDER BY count DESC LIMIT 10
-      `),
-      query(`SELECT COUNT(*) AS count FROM users WHERE created_at >= NOW() - INTERVAL '7 days'`),
-      query(`SELECT COUNT(*) AS count FROM jobs WHERE created_at >= NOW() - INTERVAL '7 days'`),
-    ]);
-    const fee = await getPlatformFee();
-    const totalRevenue = parseFloat(revenueRow.rows[0].total_revenue);
-    res.json({
-      daily_active_users: dailyUsers.rows,
-      job_stats: jobStats.rows,
-      revenue: {
-        total_escrow_released: totalRevenue,
-        platform_fee_percent: parseFloat((fee * 100).toFixed(4)),
-        platform_earnings: parseFloat((totalRevenue * fee).toFixed(8)),
-      },
-      top_categories: topCategories.rows,
-      last_7_days: {
-        new_users: parseInt(newUsers7d.rows[0].count),
-        new_jobs: parseInt(newJobs7d.rows[0].count),
-      },
-    });
-  } catch (err) { serverError(err, res); }
+  const now = Date.now();
+  if (_analyticsCache && (now - _analyticsCacheTs) < ANALYTICS_TTL) {
+    return res.json({ ..._analyticsCache, cached: true });
+  }
+  const timeout = new Promise(resolve => setTimeout(() => resolve(null), 3000));
+  const work = (async () => {
+    try {
+      const fee = await getPlatformFee();
+      // 7 separate simple queries — no GROUP BY DISTINCT, no complex joins
+      const days = [0,1,2,3,4,5,6].map(d =>
+        query(`SELECT COUNT(*) AS count FROM jobs WHERE created_at::date = (NOW() - INTERVAL '${d} days')::date`)
+          .then(r => ({ day: d, jobs: parseInt(r.rows[0].count) }))
+      );
+      const [
+        jobStats, revenueRow, topCategories, newUsers7d, newJobs7d,
+        ...dailyJobsArr
+      ] = await Promise.all([
+        query(`SELECT status, COUNT(*) AS count FROM jobs GROUP BY status ORDER BY count DESC`),
+        query(`SELECT COALESCE(SUM(amount),0) AS total FROM escrows WHERE status='released'`),
+        query(`SELECT category, COUNT(*) AS count FROM jobs WHERE category IS NOT NULL AND category <> '' GROUP BY category ORDER BY count DESC LIMIT 10`),
+        query(`SELECT COUNT(*) AS count FROM users WHERE created_at >= NOW() - INTERVAL '7 days'`),
+        query(`SELECT COUNT(*) AS count FROM jobs WHERE created_at >= NOW() - INTERVAL '7 days'`),
+        ...days,
+      ]);
+      const totalRevenue = parseFloat(revenueRow.rows[0].total);
+      return {
+        daily_active_users: dailyJobsArr.map(d => ({ day: d.day, active_users: d.jobs })),
+        job_stats: jobStats.rows,
+        revenue: {
+          total_escrow_released: totalRevenue,
+          platform_fee_percent: parseFloat((fee * 100).toFixed(4)),
+          platform_earnings: parseFloat((totalRevenue * fee).toFixed(8)),
+        },
+        top_categories: topCategories.rows,
+        last_7_days: {
+          new_users: parseInt(newUsers7d.rows[0].count),
+          new_jobs: parseInt(newJobs7d.rows[0].count),
+        },
+      };
+    } catch (err) { console.error('[admin/analytics]', err.message); return null; }
+  })();
+  const data = await Promise.race([work, timeout]);
+  if (data) {
+    _analyticsCache = data;
+    _analyticsCacheTs = Date.now();
+    return res.json(data);
+  }
+  if (_analyticsCache) return res.json({ ..._analyticsCache, cached: true, _stale: true });
+  return res.json({ status: 'loading', retry_after: 5 });
 });
 
 // POST /api/admin/backup/trigger — run a DB backup now (for external cron-job.org trigger)
