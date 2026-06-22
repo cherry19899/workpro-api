@@ -19,13 +19,18 @@
 
 require('dotenv').config();
 const express = require('express');
+const http = require('http');
+const { Server: SocketIOServer } = require('socket.io');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
 const crypto = require('crypto');
+const jwt = require('jsonwebtoken');
 const { query, initDb } = require('./db');
 
 const app = express();
+const httpServer = http.createServer(app);
+
 // Render sits behind a proxy — needed so req.ip reflects the real client for rate limiting
 app.set('trust proxy', 1);
 const PORT = process.env.PORT || 3000;
@@ -408,13 +413,89 @@ initDb().then(async () => {
   // Remove test clutter jobs (description='test', title contains 'test') — idempotent
   await query(`DELETE FROM applications WHERE job_id IN (SELECT id FROM jobs WHERE description = 'test' AND title ILIKE '%test%')`).catch(() => {});
   await query(`DELETE FROM jobs WHERE description = 'test' AND title ILIKE '%test%'`).catch(() => {});
-  const server = app.listen(PORT, () => {
-    console.log(`[WorkPro API] v3.2.0 on port ${PORT} (${NODE_ENV})`);
+  // ─── Socket.io setup ──────────────────────────────────────────────
+  const { JWT_SECRET: _jwtSecret } = require('./src/middleware');
+  const FRONTEND_ORIGIN = process.env.FRONTEND_URL || 'https://cherry19899.github.io';
+  const io = new SocketIOServer(httpServer, {
+    cors: {
+      origin: [FRONTEND_ORIGIN, 'https://cherry19899.github.io', 'http://localhost:3000', 'http://localhost:5173'],
+      methods: ['GET', 'POST'],
+      credentials: true,
+    },
+    transports: ['websocket', 'polling'],
+  });
+
+  // Socket.io auth middleware — verify JWT token
+  io.use((socket, next) => {
+    const token = socket.handshake.auth.token;
+    if (!token) return next(new Error('Authentication required'));
+    try {
+      const decoded = jwt.verify(token, _jwtSecret);
+      socket.userId = decoded.id;
+      next();
+    } catch (err) {
+      next(new Error('Invalid token'));
+    }
+  });
+
+  io.on('connection', (socket) => {
+    const userId = socket.userId;
+
+    socket.on('join_room', (roomId) => {
+      if (typeof roomId === 'string' && roomId.length < 200) {
+        socket.join(roomId);
+      }
+    });
+
+    socket.on('leave_room', (roomId) => {
+      socket.leave(roomId);
+    });
+
+    socket.on('typing', ({ roomId, userId: uid }) => {
+      if (typeof roomId === 'string') {
+        socket.to(roomId).emit('typing', { userId: uid || userId });
+      }
+    });
+
+    socket.on('stop_typing', ({ roomId, userId: uid }) => {
+      if (typeof roomId === 'string') {
+        socket.to(roomId).emit('stop_typing', { userId: uid || userId });
+      }
+    });
+  });
+
+  // Export io for use in route handlers (push new messages to connected clients)
+  app.set('io', io);
+  console.log('[WorkPro API] Socket.io ready');
+
+  // ─── Web Push VAPID setup ──────────────────────────────────────────────
+  const webpush = require('web-push');
+  const VAPID_PUBLIC  = process.env.VAPID_PUBLIC_KEY  || null;
+  const VAPID_PRIVATE = process.env.VAPID_PRIVATE_KEY || null;
+  const VAPID_EMAIL   = process.env.VAPID_EMAIL || 'mailto:admin@workpro.app';
+  if (VAPID_PUBLIC && VAPID_PRIVATE) {
+    webpush.setVapidDetails(VAPID_EMAIL, VAPID_PUBLIC, VAPID_PRIVATE);
+    app.set('webpush', webpush);
+    console.log('[WorkPro API] Web Push VAPID configured');
+  } else {
+    console.warn('[WorkPro API] Web Push disabled — set VAPID_PUBLIC_KEY + VAPID_PRIVATE_KEY env vars');
+    // Generate keys and print them to logs (one-time helper)
+    if (process.env.GENERATE_VAPID === '1') {
+      const keys = webpush.generateVAPIDKeys();
+      console.log('[VAPID] Add these to Render env vars:');
+      console.log('  VAPID_PUBLIC_KEY =', keys.publicKey);
+      console.log('  VAPID_PRIVATE_KEY =', keys.privateKey);
+    }
+  }
+
+  const server = httpServer.listen(PORT, () => {
+    console.log(`[WorkPro API] v3.3.0 on port ${PORT} (${NODE_ENV})`);
   });
 
   // Graceful shutdown — Render sends SIGTERM before killing the process
   const shutdown = (signal) => {
     console.log(`[WorkPro API] ${signal} received — graceful shutdown`);
+    io.close();
     server.close(() => {
       console.log('[WorkPro API] HTTP server closed');
       // Use getPool() — db.js exports `pool` by value at load time (null then),

@@ -237,10 +237,26 @@ router.post('/api/chat/conversations/:id/messages', auth, checkBlocked, messageL
     const result = await query('INSERT INTO chat_messages (room_id, sender_id, sender_name, message) VALUES ($1, $2, $3, $4) RETURNING *', [req.params.id, req.userId, senderName, msg.trim()]);
     await query('UPDATE chat_rooms SET updated_at = NOW() WHERE id = $1', [req.params.id]);
     const otherUserId = room.rows[0].client_id === req.userId ? room.rows[0].freelancer_id : room.rows[0].client_id;
+    const newMsg = result.rows[0];
+    // Emit real-time event to all sockets in this room
+    const io = req.app.get('io');
+    if (io) io.to(req.params.id).emit('new_message', newMsg);
     if (otherUserId) {
       await notify(otherUserId, 'message', `Новое сообщение от ${senderName}`, msg.trim().substring(0, 100), null, req.params.id).catch(() => {});
+      // Web Push notification to recipient
+      const webpush = req.app.get('webpush');
+      if (webpush) {
+        const subRow = await query('SELECT endpoint, keys FROM push_subscriptions WHERE user_id = $1', [otherUserId]).catch(() => null);
+        if (subRow && subRow.rows.length) {
+          const sub = subRow.rows[0];
+          webpush.sendNotification(
+            { endpoint: sub.endpoint, keys: sub.keys },
+            JSON.stringify({ title: `Message from ${senderName}`, body: msg.trim().substring(0, 80), icon: '/icon-192.png' })
+          ).catch(() => {}); // fire-and-forget
+        }
+      }
     }
-    res.json({ message: result.rows[0] });
+    res.json({ message: newMsg });
   } catch (err) { serverError(err, res); }
 });
 
@@ -352,6 +368,13 @@ router.get('/api/chat/:roomId/messages', auth, async (req, res) => {
     );
     res.json({ messages: result.rows, limit, offset });
   } catch (err) { serverError(err, res); }
+});
+
+// GET /api/push/vapid-key — return the VAPID public key for the client
+router.get('/api/push/vapid-key', (req, res) => {
+  const key = process.env.VAPID_PUBLIC_KEY || null;
+  if (!key) return res.status(503).json({ error: 'Web Push not configured' });
+  res.json({ publicKey: key });
 });
 
 // POST /api/push/subscribe — Web Push notification subscription

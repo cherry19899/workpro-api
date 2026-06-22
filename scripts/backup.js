@@ -6,7 +6,8 @@
  * and notifies on failure via the WorkPro notify helper (in-app) or console.
  *
  * Run standalone:  node scripts/backup.js
- * Schedule (PM2):  pm2 start scripts/backup.js --cron "0 */6 * * *" --no-autorestart
+ * Schedule (PM2):  pm2 start scripts/backup.js --cron "0 *-6 * * *" --no-autorestart
+ *                  (cron syntax: every 6h — replace *-6 with star-slash-6)
  * Render:          Not available (Render free tier doesn't run cron jobs).
  *                  Use a free external cron (cron-job.org) to hit GET /api/admin/backup/trigger
  *                  with the ADMIN_API_KEY — see the companion admin endpoint below.
