@@ -5,22 +5,21 @@ const router = require('express').Router();
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const { query, getPool } = require('../src/db');
-const { notify, audit, serverError } = require('../src/helpers');
+const { notify, audit, serverError, getPlatformFee, invalidatePlatformFeeCache, FEE_MAX } = require('../src/helpers');
 const { adminAuth, twinId, JWT_SECRET, ADMIN_API_KEY } = require('../src/middleware');
-
-const PLATFORM_FEE = Math.min(Math.max(parseFloat(process.env.PLATFORM_FEE_PERCENT || '2') / 100, 0), 0.1);
 
 // GET /api/admin/stats
 router.get('/api/admin/stats', adminAuth, async (req, res) => {
   try {
-    const [users, jobs, applications, escrows, activeEscrows, payments, revenue, ratings, chats, disputes] = await Promise.all([
+    const fee = await getPlatformFee();
+    const [users, jobs, applications, escrows, activeEscrows, payments, escrowRevBase, ratings, chats, disputes] = await Promise.all([
       query('SELECT COUNT(*) FROM users'),
       query('SELECT COUNT(*) FROM jobs'),
       query('SELECT COUNT(*) FROM applications'),
       query('SELECT COUNT(*) FROM escrows'),
       query("SELECT COUNT(*) FROM escrows WHERE status IN ('pending','funded')"),
       query('SELECT COUNT(*) FROM payments'),
-      query(`SELECT COALESCE(SUM(amount*${PLATFORM_FEE}),0) AS total FROM escrows WHERE status='released'`),
+      query("SELECT COALESCE(SUM(amount),0) AS total FROM escrows WHERE status='released'"),
       query('SELECT COUNT(*) FROM ratings'),
       query('SELECT COUNT(*) FROM chat_rooms'),
       query("SELECT COUNT(*) FROM escrows WHERE status='disputed'"),
@@ -30,7 +29,7 @@ router.get('/api/admin/stats', adminAuth, async (req, res) => {
     const a = parseInt(applications.rows[0].count);
     const e = parseInt(escrows.rows[0].count);
     const ae = parseInt(activeEscrows.rows[0].count);
-    const rev = parseFloat(revenue.rows[0].total);
+    const rev = parseFloat(escrowRevBase.rows[0].total) * fee;
     res.json({
       total_users: u, users: u,
       total_jobs: j, jobs: j,
@@ -305,7 +304,8 @@ router.post('/api/admin/escrows/:id/resolve', adminAuth, async (req, res) => {
       );
       if (!guard.rows.length) { await pgC.query('ROLLBACK'); return res.status(409).json({ error: 'Escrow no longer disputed' }); }
       if (action === 'release_to_freelancer') {
-        const net = parseFloat((escrow.amount * (1 - PLATFORM_FEE)).toFixed(8));
+        const fee = await getPlatformFee();
+        const net = parseFloat((escrow.amount * (1 - fee)).toFixed(8));
         await pgC.query('UPDATE users SET balance_pi = COALESCE(balance_pi,0) + $1, total_jobs_completed = total_jobs_completed + 1, updated_at=NOW() WHERE id=$2', [net, escrow.freelancer_id]);
         await pgC.query("UPDATE jobs SET status='completed', updated_at=NOW() WHERE id=$1", [escrow.job_id]);
       } else {
@@ -325,28 +325,33 @@ router.post('/api/admin/escrows/:id/resolve', adminAuth, async (req, res) => {
 // GET /api/admin/earnings
 router.get('/api/admin/earnings', adminAuth, async (req, res) => {
   try {
-    const [result, transactions, pending, recentPayments] = await Promise.all([
-      query(`SELECT COALESCE(SUM(amount*${PLATFORM_FEE}), 0) as total FROM escrows WHERE status = 'released'`),
+    const fee = await getPlatformFee();
+    const freelancerShare = parseFloat((1 - fee).toFixed(4));
+    const [escrowBase, transactions, pending, recentPayments] = await Promise.all([
+      query("SELECT COALESCE(SUM(amount),0) as total FROM escrows WHERE status = 'released'"),
       query('SELECT COUNT(*) FROM payments'),
       query("SELECT COALESCE(SUM(amount), 0) as total FROM payments WHERE status = 'approved'"),
       query(`
-        SELECT p.*,
-          u.username AS client_name,
-          p.amount AS job_amount,
-          CAST(ROUND(CAST(p.amount AS numeric) * ${(1 - PLATFORM_FEE).toFixed(4)}, 4) AS float) AS freelancer_amount,
-          CAST(ROUND(CAST(p.amount AS numeric) * ${PLATFORM_FEE.toFixed(4)}, 4) AS float) AS developer_fee
+        SELECT p.*, u.username AS client_name, p.amount AS job_amount
         FROM payments p
         LEFT JOIN users u ON u.id = p.user_id
         ORDER BY p.created_at DESC LIMIT 50
       `),
     ]);
-    const total_earnings = parseFloat(result.rows[0].total);
+    const baseTotal = parseFloat(escrowBase.rows[0].total);
+    const total_earnings = parseFloat((baseTotal * fee).toFixed(8));
     const txCount = parseInt(transactions.rows[0].count);
+    // Annotate each payment with fee breakdown computed in JS (fee is dynamic)
+    const payments = recentPayments.rows.map(p => ({
+      ...p,
+      freelancer_amount: parseFloat((parseFloat(p.amount || 0) * freelancerShare).toFixed(4)),
+      developer_fee:     parseFloat((parseFloat(p.amount || 0) * fee).toFixed(4)),
+    }));
     res.json({
       total_earnings,
       transactions: txCount,
-      payments: recentPayments.rows,
-      history: recentPayments.rows,
+      payments,
+      history: payments,
       summary: {
         total_earnings,
         collected: total_earnings,
@@ -525,6 +530,58 @@ router.post('/api/admin/merge-users', adminAuth, async (req, res) => {
     } catch (e) { await pgM.query('ROLLBACK').catch(() => {}); throw e; }
     finally { pgM.release(); }
     res.json({ success: true, merged: from_id, into: to_id });
+  } catch (err) { serverError(err, res); }
+});
+
+// GET /api/admin/settings — returns all platform settings
+router.get('/api/admin/settings', adminAuth, async (req, res) => {
+  try {
+    const result = await query('SELECT key, value, updated_at, updated_by FROM platform_settings ORDER BY key');
+    // Also return the current effective fee so the UI can show it immediately
+    const fee = await getPlatformFee();
+    res.json({
+      settings: result.rows,
+      effective: { platform_fee_percent: parseFloat((fee * 100).toFixed(4)) },
+    });
+  } catch (err) { serverError(err, res); }
+});
+
+// PATCH /api/admin/settings — update a platform setting (whitelisted keys only)
+const SETTINGS_WHITELIST = {
+  platform_fee_percent: { min: 0, max: FEE_MAX * 100, label: 'Platform fee %' },
+};
+router.patch('/api/admin/settings', adminAuth, async (req, res) => {
+  const { key, value } = req.body;
+  if (!key || value === undefined || value === null) {
+    return res.status(400).json({ error: 'key and value required' });
+  }
+  const rule = SETTINGS_WHITELIST[key];
+  if (!rule) {
+    return res.status(400).json({ error: `Unknown setting key. Allowed: ${Object.keys(SETTINGS_WHITELIST).join(', ')}` });
+  }
+  const num = parseFloat(value);
+  if (isNaN(num) || num < rule.min || num > rule.max) {
+    return res.status(400).json({ error: `${rule.label} must be between ${rule.min} and ${rule.max}` });
+  }
+  const strVal = num.toString();
+  try {
+    const old = await query("SELECT value FROM platform_settings WHERE key = $1", [key]);
+    const oldVal = old.rows[0]?.value ?? null;
+    await query(
+      `INSERT INTO platform_settings (key, value, updated_at, updated_by)
+       VALUES ($1, $2, NOW(), $3)
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW(), updated_by = EXCLUDED.updated_by`,
+      [key, strVal, req.userId || 'admin']
+    );
+    invalidatePlatformFeeCache();
+    await audit('admin_setting_changed', { key, old_value: oldVal, new_value: strVal, by: req.userId });
+    const fee = await getPlatformFee();
+    res.json({
+      success: true,
+      key,
+      value: strVal,
+      effective: { platform_fee_percent: parseFloat((fee * 100).toFixed(4)) },
+    });
   } catch (err) { serverError(err, res); }
 });
 

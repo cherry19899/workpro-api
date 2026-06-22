@@ -7,6 +7,40 @@ const { query, getPool } = require('./db');
 const PI_API_KEY = process.env.PI_API_KEY || '';
 const PI_API_BASE = 'https://api.minepi.com';
 
+// ─── Platform fee ──────────────────────────────────────────────
+// Hard limits — no matter what's in the DB or env, fee is capped at 10%.
+const FEE_MIN = 0;
+const FEE_MAX = 0.1;
+const FEE_DEFAULT_PCT = parseFloat(process.env.PLATFORM_FEE_PERCENT || '2');
+const FEE_DEFAULT = Math.min(Math.max(FEE_DEFAULT_PCT / 100, FEE_MIN), FEE_MAX);
+
+let _feeCache = null;        // { value: number, expiresAt: number }
+const FEE_CACHE_TTL = 60000; // 60 seconds
+
+async function getPlatformFee() {
+  const now = Date.now();
+  if (_feeCache && now < _feeCache.expiresAt) return _feeCache.value;
+  try {
+    const row = await query(
+      "SELECT value FROM platform_settings WHERE key = 'platform_fee_percent' LIMIT 1"
+    );
+    if (row.rows.length) {
+      const pct = parseFloat(row.rows[0].value);
+      if (!isNaN(pct)) {
+        const fee = Math.min(Math.max(pct / 100, FEE_MIN), FEE_MAX);
+        _feeCache = { value: fee, expiresAt: now + FEE_CACHE_TTL };
+        return fee;
+      }
+    }
+  } catch (_) { /* DB unavailable — fall through to env default */ }
+  _feeCache = { value: FEE_DEFAULT, expiresAt: now + FEE_CACHE_TTL };
+  return FEE_DEFAULT;
+}
+
+function invalidatePlatformFeeCache() {
+  _feeCache = null;
+}
+
 // ─── Pi Platform API ──────────────────────────────────────────────
 // userAccessToken: when provided (e.g. for /v2/me identity check), use user Bearer token instead of server Key
 async function piApiRequest(path, method = 'GET', body = null, userAccessToken = null, { retries = 3, baseDelay = 300 } = {}) {
@@ -83,4 +117,7 @@ module.exports = {
   audit,
   serverError,
   PI_API_KEY,
+  getPlatformFee,
+  invalidatePlatformFeeCache,
+  FEE_MAX,
 };

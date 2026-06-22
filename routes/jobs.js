@@ -4,7 +4,7 @@
 const router = require('express').Router();
 const crypto = require('crypto');
 const { query, getPool } = require('../src/db');
-const { notify, audit, serverError } = require('../src/helpers');
+const { notify, audit, serverError, getPlatformFee } = require('../src/helpers');
 const { auth, softAuth, checkBlocked, jobPostLimiter } = require('../src/middleware');
 const { processJobImages } = require('../src/github-images');
 
@@ -532,7 +532,8 @@ router.post('/api/jobs/:id/complete', auth, checkBlocked, async (req, res) => {
       );
       if (escrow.rows.length) {
         const e = escrow.rows[0];
-        const net = parseFloat((e.amount * 0.98).toFixed(8));
+        const fee = await getPlatformFee();
+        const net = parseFloat((e.amount * (1 - fee)).toFixed(8));
         await pgClient5.query('UPDATE users SET balance_pi = COALESCE(balance_pi, 0) + $1, updated_at = NOW() WHERE id = $2', [net, e.freelancer_id]);
         paidAmount = net;
       }

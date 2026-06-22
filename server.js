@@ -281,6 +281,20 @@ async function ensureNotificationsTable() {
     `UPDATE applications SET updated_at = created_at WHERE updated_at IS NULL`,
     'backfill applications.updated_at'
   );
+  // Platform settings table — key/value store for runtime-configurable parameters
+  await run(`CREATE TABLE IF NOT EXISTS platform_settings (
+    key        VARCHAR(100) PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_by TEXT
+  )`, 'platform_settings table');
+  // Seed default platform fee (2%) — INSERT only if row doesn't already exist
+  await run(
+    `INSERT INTO platform_settings (key, value, updated_at)
+     VALUES ('platform_fee_percent', '2', NOW())
+     ON CONFLICT (key) DO NOTHING`,
+    'seed platform_fee_percent'
+  );
 }
 
 // ─── Start ──────────────────────────────────────────────

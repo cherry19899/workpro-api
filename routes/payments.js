@@ -5,10 +5,8 @@ const router = require('express').Router();
 const crypto = require('crypto');
 const fetch = require('node-fetch');
 const { query, getPool } = require('../src/db');
-const { piApprovePayment, piCompletePayment, piGetPayment, notify, audit, serverError, PI_API_KEY } = require('../src/helpers');
+const { piApprovePayment, piCompletePayment, piGetPayment, notify, audit, serverError, PI_API_KEY, getPlatformFee } = require('../src/helpers');
 const { auth, softAuth, checkBlocked } = require('../src/middleware');
-
-const PLATFORM_FEE = Math.min(Math.max(parseFloat(process.env.PLATFORM_FEE_PERCENT || '2') / 100, 0), 0.1);
 
 // Server-side package catalog — mirrors frontend packages. Never trust client-supplied quantity.
 const CONNECT_PACKAGES = [
@@ -174,7 +172,8 @@ async function handleEscrowRelease(req, res) {
     const escrow = result.rows[0];
     if (escrow.client_id !== req.userId) return res.status(403).json({ error: 'Not your escrow' });
     if (escrow.status !== 'funded') return res.status(400).json({ error: 'Escrow is not funded' });
-    const net = parseFloat((escrow.amount * (1 - PLATFORM_FEE)).toFixed(8)); // platform commission
+    const fee = await getPlatformFee();
+    const net = parseFloat((escrow.amount * (1 - fee)).toFixed(8)); // platform commission
     const pgClient3 = await getPool().connect();
     try {
       await pgClient3.query('BEGIN');
