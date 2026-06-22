@@ -543,6 +543,21 @@ initDb().then(async () => {
     console.log(`[WorkPro API] v3.3.0 on port ${PORT} (${NODE_ENV})`);
   });
 
+  // ─── Keep-alive self-ping ──────────────────────────────────────────────
+  // Render's free tier spins the instance down after ~15 min without inbound
+  // traffic. A cold start then takes 30-60s — which exceeds the Pi payment
+  // approval window (~60s) and makes admin requests time out. Pinging our own
+  // public URL through Render's load balancer every 10 min counts as inbound
+  // traffic and keeps the instance warm. (Requests to localhost would NOT count.)
+  const SELF_URL = process.env.RENDER_EXTERNAL_URL || 'https://workpro-api.onrender.com';
+  if (NODE_ENV === 'production') {
+    setInterval(() => {
+      fetch(`${SELF_URL}/api/health`, { method: 'GET' })
+        .then(r => console.log(`[keep-alive] self-ping ${r.status}`))
+        .catch(e => console.warn('[keep-alive] self-ping failed:', e.message));
+    }, 10 * 60 * 1000); // every 10 minutes
+  }
+
   // Graceful shutdown — Render sends SIGTERM before killing the process
   const shutdown = (signal) => {
     console.log(`[WorkPro API] ${signal} received — graceful shutdown`);
