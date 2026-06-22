@@ -8,65 +8,91 @@ const { query, getPool } = require('../src/db');
 const { notify, audit, serverError, getPlatformFee, invalidatePlatformFeeCache, FEE_MAX } = require('../src/helpers');
 const { adminAuth, twinId, JWT_SECRET, ADMIN_API_KEY, _rlBlocks } = require('../src/middleware');
 
+// In-memory cache for stats (5-minute TTL)
+let _statsCache = null;
+let _statsCacheTs = 0;
+const STATS_TTL = 5 * 60 * 1000;
+
 // GET /api/admin/stats
 router.get('/api/admin/stats', adminAuth, async (req, res) => {
-  try {
-    const fee = await getPlatformFee();
-    const [users, jobs, applications, escrows, activeEscrows, payments, escrowRevBase, ratings, chats, disputes] = await Promise.all([
-      query('SELECT COUNT(*) FROM users'),
-      query('SELECT COUNT(*) FROM jobs'),
-      query('SELECT COUNT(*) FROM applications'),
-      query('SELECT COUNT(*) FROM escrows'),
-      query("SELECT COUNT(*) FROM escrows WHERE status IN ('pending','funded')"),
-      query('SELECT COUNT(*) FROM payments'),
-      query("SELECT COALESCE(SUM(amount),0) AS total FROM escrows WHERE status='released'"),
-      query('SELECT COUNT(*) FROM ratings'),
-      query('SELECT COUNT(*) FROM chat_rooms'),
-      query("SELECT COUNT(*) FROM escrows WHERE status='disputed'"),
-    ]);
-    const u = parseInt(users.rows[0].count);
-    const j = parseInt(jobs.rows[0].count);
-    const a = parseInt(applications.rows[0].count);
-    const e = parseInt(escrows.rows[0].count);
-    const ae = parseInt(activeEscrows.rows[0].count);
-    const rev = parseFloat(escrowRevBase.rows[0].total) * fee;
-    res.json({
-      total_users: u, users: u,
-      total_jobs: j, jobs: j,
-      total_applications: a, applications: a,
-      total_escrows: e, escrows: e,
-      active_escrows: ae,
-      total_revenue: rev,
-      payments: parseInt(payments.rows[0].count),
-      ratings: parseInt(ratings.rows[0].count),
-      chats: parseInt(chats.rows[0].count),
-      pending_moderation: parseInt(disputes.rows[0].count),
-    });
-  } catch (err) { serverError(err, res); }
+  const now = Date.now();
+  if (_statsCache && (now - _statsCacheTs) < STATS_TTL) {
+    return res.json({ ..._statsCache, cached: true });
+  }
+  // 3-second timeout fallback — return stale/empty rather than error
+  const timeout = new Promise(resolve => setTimeout(() => resolve(null), 3000));
+  const work = (async () => {
+    try {
+      const fee = await getPlatformFee();
+      const [users, jobs, applications, escrows, activeEscrows, payments, escrowRevBase, ratings, chats, disputes] = await Promise.all([
+        query('SELECT COUNT(*) FROM users'),
+        query('SELECT COUNT(*) FROM jobs'),
+        query('SELECT COUNT(*) FROM applications'),
+        query('SELECT COUNT(*) FROM escrows'),
+        query("SELECT COUNT(*) FROM escrows WHERE status IN ('pending','funded')"),
+        query('SELECT COUNT(*) FROM payments'),
+        query("SELECT COALESCE(SUM(amount),0) AS total FROM escrows WHERE status='released'"),
+        query('SELECT COUNT(*) FROM ratings'),
+        query('SELECT COUNT(*) FROM chat_rooms'),
+        query("SELECT COUNT(*) FROM escrows WHERE status='disputed'"),
+      ]);
+      const u = parseInt(users.rows[0].count);
+      const j = parseInt(jobs.rows[0].count);
+      const a = parseInt(applications.rows[0].count);
+      const e = parseInt(escrows.rows[0].count);
+      const ae = parseInt(activeEscrows.rows[0].count);
+      const rev = parseFloat(escrowRevBase.rows[0].total) * fee;
+      return {
+        total_users: u, users: u,
+        total_jobs: j, jobs: j,
+        total_applications: a, applications: a,
+        total_escrows: e, escrows: e,
+        active_escrows: ae,
+        total_revenue: rev,
+        payments: parseInt(payments.rows[0].count),
+        ratings: parseInt(ratings.rows[0].count),
+        chats: parseInt(chats.rows[0].count),
+        pending_moderation: parseInt(disputes.rows[0].count),
+      };
+    } catch (err) { console.error('[admin/stats]', err.message); return null; }
+  })();
+  const data = await Promise.race([work, timeout]);
+  if (data) {
+    _statsCache = data;
+    _statsCacheTs = Date.now();
+    return res.json(data);
+  }
+  // Timed out — return stale cache or empty
+  return res.json(_statsCache || { total_users:0,users:0,total_jobs:0,jobs:0,total_applications:0,applications:0,total_escrows:0,escrows:0,active_escrows:0,total_revenue:0,payments:0,ratings:0,chats:0,pending_moderation:0, _timeout:true });
 });
 
 // GET /api/admin/users
 router.get('/api/admin/users', adminAuth, async (req, res) => {
-  const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 500, 2000));
+  const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 200, 500));
   const offset = Math.max(0, parseInt(req.query.offset) || 0);
+  // Exclude heavy fields (avatar/bio) on list to keep payload small
+  const safeFields = 'id, username, role, rating, total_jobs_posted, total_jobs_completed, balance_connects, balance_pi, is_blocked, status, created_at, updated_at';
   try {
-    const search = req.query.search || '';
-    if (search.length > 200) return res.status(400).json({ error: 'Search query too long (max 200 chars)' });
-    const safeFields = 'id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, is_blocked, status, created_at, updated_at';
-    let sql, params = [];
-    if (search) {
-      sql = `SELECT ${safeFields} FROM users WHERE username ILIKE $1 OR id ILIKE $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3`;
-      params = [`%${search}%`, limit, offset];
-    } else {
-      sql = `SELECT ${safeFields} FROM users ORDER BY created_at DESC LIMIT $1 OFFSET $2`;
-      params = [limit, offset];
-    }
-    const result = await query(sql, params);
-    const totalSql = search
-      ? 'SELECT COUNT(*) FROM users WHERE username ILIKE $1 OR id ILIKE $1'
-      : 'SELECT COUNT(*) FROM users';
-    const total = await query(totalSql, search ? [`%${search}%`] : []);
-    res.json({ users: result.rows, count: result.rows.length, total: parseInt(total.rows[0].count), limit, offset });
+    const search = (req.query.search || '').slice(0, 200);
+    const timeout = new Promise(resolve => setTimeout(() => resolve(null), 3000));
+    const work = (async () => {
+      let sql, params = [];
+      if (search) {
+        sql = `SELECT ${safeFields} FROM users WHERE username ILIKE $1 OR id ILIKE $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3`;
+        params = [`%${search}%`, limit, offset];
+      } else {
+        sql = `SELECT ${safeFields} FROM users ORDER BY created_at DESC LIMIT $1 OFFSET $2`;
+        params = [limit, offset];
+      }
+      const [result, total] = await Promise.all([
+        query(sql, params),
+        query(search ? 'SELECT COUNT(*) FROM users WHERE username ILIKE $1 OR id ILIKE $1' : 'SELECT COUNT(*) FROM users', search ? [`%${search}%`] : []),
+      ]);
+      return { users: result.rows, count: result.rows.length, total: parseInt(total.rows[0].count), limit, offset };
+    })();
+    const data = await Promise.race([work, timeout]);
+    if (data) return res.json(data);
+    return res.json({ users: [], count: 0, total: 0, limit, offset, _timeout: true });
   } catch (err) { serverError(err, res); }
 });
 
@@ -133,25 +159,37 @@ router.post('/api/admin/users/:id/grant-connects', adminAuth, async (req, res) =
   } catch (err) { serverError(err, res); }
 });
 
+const JOB_LIST_FIELDS = 'j.id, j.title, j.status, j.budget, j.category, j.posted_by, j.hired_freelancer_id, j.apply_cost, j.created_at, j.updated_at, u.username as posted_by_name';
+
 // GET /api/admin/jobs
 router.get('/api/admin/jobs', adminAuth, async (req, res) => {
   const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 100, 500));
   const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
-    const result = await query('SELECT * FROM jobs ORDER BY created_at DESC LIMIT $1 OFFSET $2', [limit, offset]);
-    const total = await query('SELECT COUNT(*) FROM jobs');
-    res.json({ jobs: result.rows, total: parseInt(total.rows[0].count), limit, offset });
+    const timeout = new Promise(resolve => setTimeout(() => resolve(null), 3000));
+    const work = Promise.all([
+      query(`SELECT ${JOB_LIST_FIELDS} FROM jobs j LEFT JOIN users u ON u.id = j.posted_by ORDER BY j.created_at DESC LIMIT $1 OFFSET $2`, [limit, offset]),
+      query('SELECT COUNT(*) FROM jobs'),
+    ]).then(([r, t]) => ({ jobs: r.rows, total: parseInt(t.rows[0].count), limit, offset }));
+    const data = await Promise.race([work, timeout]);
+    if (data) return res.json(data);
+    return res.json({ jobs: [], total: 0, limit, offset, _timeout: true });
   } catch (err) { serverError(err, res); }
 });
 
 // GET /api/admin/jobs/all
 router.get('/api/admin/jobs/all', adminAuth, async (req, res) => {
+  const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 200, 500));
+  const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
-    const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 200, 1000));
-    const offset = Math.max(0, parseInt(req.query.offset) || 0);
-    const result = await query('SELECT j.*, u.username as posted_by_name FROM jobs j LEFT JOIN users u ON u.id = j.posted_by ORDER BY j.created_at DESC LIMIT $1 OFFSET $2', [limit, offset]);
-    const total = await query('SELECT COUNT(*) FROM jobs');
-    res.json({ jobs: result.rows, total: parseInt(total.rows[0].count), limit, offset });
+    const timeout = new Promise(resolve => setTimeout(() => resolve(null), 3000));
+    const work = Promise.all([
+      query(`SELECT ${JOB_LIST_FIELDS} FROM jobs j LEFT JOIN users u ON u.id = j.posted_by ORDER BY j.created_at DESC LIMIT $1 OFFSET $2`, [limit, offset]),
+      query('SELECT COUNT(*) FROM jobs'),
+    ]).then(([r, t]) => ({ jobs: r.rows, total: parseInt(t.rows[0].count), limit, offset }));
+    const data = await Promise.race([work, timeout]);
+    if (data) return res.json(data);
+    return res.json({ jobs: [], total: 0, limit, offset, _timeout: true });
   } catch (err) { serverError(err, res); }
 });
 
@@ -324,43 +362,44 @@ router.post('/api/admin/escrows/:id/resolve', adminAuth, async (req, res) => {
 
 // GET /api/admin/earnings
 router.get('/api/admin/earnings', adminAuth, async (req, res) => {
-  try {
-    const fee = await getPlatformFee();
-    const freelancerShare = parseFloat((1 - fee).toFixed(4));
-    const [escrowBase, transactions, pending, recentPayments] = await Promise.all([
-      query("SELECT COALESCE(SUM(amount),0) as total FROM escrows WHERE status = 'released'"),
-      query('SELECT COUNT(*) FROM payments'),
-      query("SELECT COALESCE(SUM(amount), 0) as total FROM payments WHERE status = 'approved'"),
-      query(`
-        SELECT p.*, u.username AS client_name, p.amount AS job_amount
-        FROM payments p
-        LEFT JOIN users u ON u.id = p.user_id
-        ORDER BY p.created_at DESC LIMIT 50
-      `),
-    ]);
-    const baseTotal = parseFloat(escrowBase.rows[0].total);
-    const total_earnings = parseFloat((baseTotal * fee).toFixed(8));
-    const txCount = parseInt(transactions.rows[0].count);
-    // Annotate each payment with fee breakdown computed in JS (fee is dynamic)
-    const payments = recentPayments.rows.map(p => ({
-      ...p,
-      freelancer_amount: parseFloat((parseFloat(p.amount || 0) * freelancerShare).toFixed(4)),
-      developer_fee:     parseFloat((parseFloat(p.amount || 0) * fee).toFixed(4)),
-    }));
-    res.json({
-      total_earnings,
-      transactions: txCount,
-      payments,
-      history: payments,
-      summary: {
-        total_earnings,
-        collected: total_earnings,
-        total_transactions: txCount,
-        pending_volume: parseFloat(pending.rows[0].total),
-        average_transaction: txCount > 0 ? Math.round(total_earnings / txCount * 100) / 100 : 0,
-      }
-    });
-  } catch (err) { serverError(err, res); }
+  const timeout = new Promise(resolve => setTimeout(() => resolve(null), 3000));
+  const work = (async () => {
+    try {
+      const fee = await getPlatformFee();
+      const freelancerShare = parseFloat((1 - fee).toFixed(4));
+      // Single combined query instead of 4 separate ones
+      const [summary, recentPayments] = await Promise.all([
+        query(`SELECT
+          (SELECT COALESCE(SUM(amount),0) FROM escrows WHERE status='released') AS escrow_total,
+          (SELECT COUNT(*) FROM payments) AS tx_count,
+          (SELECT COALESCE(SUM(amount),0) FROM payments WHERE status='approved') AS pending_vol
+        `),
+        query(`SELECT p.id, p.user_id, p.type, p.amount, p.status, p.created_at, u.username AS client_name
+               FROM payments p LEFT JOIN users u ON u.id = p.user_id
+               ORDER BY p.created_at DESC LIMIT 30`),
+      ]);
+      const baseTotal = parseFloat(summary.rows[0].escrow_total);
+      const total_earnings = parseFloat((baseTotal * fee).toFixed(8));
+      const txCount = parseInt(summary.rows[0].tx_count);
+      const payments = recentPayments.rows.map(p => ({
+        ...p,
+        freelancer_amount: parseFloat((parseFloat(p.amount || 0) * freelancerShare).toFixed(4)),
+        developer_fee:     parseFloat((parseFloat(p.amount || 0) * fee).toFixed(4)),
+      }));
+      return {
+        total_earnings, transactions: txCount, payments, history: payments,
+        summary: {
+          total_earnings, collected: total_earnings,
+          total_transactions: txCount,
+          pending_volume: parseFloat(summary.rows[0].pending_vol),
+          average_transaction: txCount > 0 ? Math.round(total_earnings / txCount * 100) / 100 : 0,
+        }
+      };
+    } catch (err) { console.error('[admin/earnings]', err.message); return null; }
+  })();
+  const data = await Promise.race([work, timeout]);
+  if (data) return res.json(data);
+  return res.json({ total_earnings: 0, transactions: 0, payments: [], history: [], summary: { total_earnings:0, collected:0, total_transactions:0, pending_volume:0, average_transaction:0 }, _timeout: true });
 });
 
 // GET /api/admin/audit-logs

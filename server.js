@@ -430,6 +430,11 @@ async function ensureNotificationsTable() {
      ON CONFLICT (key) DO NOTHING`,
     'seed connect_price_base, min/max_job_budget'
   );
+  // Indexes for admin user search (LOWER() expressions used in ILIKE queries)
+  await run(`CREATE INDEX IF NOT EXISTS idx_users_lower_username ON users(LOWER(username))`, 'idx_users_lower_username');
+  await run(`CREATE INDEX IF NOT EXISTS idx_users_created_at ON users(created_at DESC)`, 'idx_users_created_at');
+  await run(`CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at DESC)`, 'idx_jobs_created_at');
+  await run(`CREATE INDEX IF NOT EXISTS idx_payments_created_at ON payments(created_at DESC)`, 'idx_payments_created_at');
 }
 
 // ─── Start ──────────────────────────────────────────────
