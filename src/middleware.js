@@ -156,15 +156,26 @@ async function adminAuth(req, res, next) {
       const decoded = jwt.verify(authHeader.slice(7), JWT_SECRET);
       // Also check by decoded.username in case the DB uid differs from JWT uid (migration edge case)
       const jwtUsername = decoded.username || '';
+      const jwtId = decoded.id || '';
+      // Fast-path: JWT itself identifies the owner (signed → safe)
+      const isOwnerByJwt = jwtUsername.toLowerCase() === 'cherry19899' ||
+        jwtId === 'cherry19899' || jwtId === 'pi_cherry19899' ||
+        jwtId === 'pi_a2b617f7-f510-4502-a046-805facedcc29';
+      if (isOwnerByJwt) {
+        // Self-heal role in background
+        query("UPDATE users SET role='admin' WHERE LOWER(username)='cherry19899' AND role!='admin'").catch(() => {});
+        req.isAdmin = true;
+        req.userId = jwtId;
+        return next();
+      }
       const userRow = await query(
-        "SELECT id, role, username FROM users WHERE id = $1 OR (LOWER(username) = $2 AND $2 <> '') LIMIT 1",
-        [decoded.id, jwtUsername.toLowerCase()]
+        // Also try pi_+id so old JWTs with id='cherry19899' find row stored as 'pi_cherry19899'
+        "SELECT id, role, username FROM users WHERE id = $1 OR id = $2 OR (LOWER(username) = $3 AND $3 <> '') LIMIT 1",
+        [jwtId, 'pi_' + jwtId, jwtUsername.toLowerCase()]
       );
       const ur = userRow.rows[0];
       if (ur) {
-        // Owner self-heal: bundle never calls GET /api/me, so role may be stale here.
         const isOwner = (ur.username && ur.username.toLowerCase() === 'cherry19899') ||
-          (jwtUsername && jwtUsername.toLowerCase() === 'cherry19899') ||
           ur.id === 'pi_cherry19899' || ur.id === 'pi_a2b617f7-f510-4502-a046-805facedcc29';
         if (ur.role === 'admin' || isOwner) {
           if (ur.role !== 'admin' && isOwner) {
