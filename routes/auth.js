@@ -258,7 +258,13 @@ router.post('/api/auth/refresh', async (req, res) => {
   const token = authHeader.slice(7);
   try {
     const decoded = jwt.verify(token, JWT_SECRET, { ignoreExpiration: true });
-    const user = await query('SELECT id, username, role, status, is_blocked FROM users WHERE id = $1 LIMIT 1', [decoded.id]);
+    const jwtUsername = (decoded.username || '').toLowerCase();
+    // Look up by id OR by username — handles old JWTs where id='cherry19899' but DB has 'pi_cherry19899'
+    const user = await query(
+      `SELECT id, username, role, status, is_blocked FROM users
+       WHERE id = $1 OR id = $2 OR (LOWER(username) = $3 AND $3 <> '') LIMIT 1`,
+      [decoded.id, 'pi_' + decoded.id, jwtUsername]
+    );
     if (!user.rows.length) return res.status(401).json({ error: 'User not found' });
     const u = user.rows[0];
     if (u.status === 'deleted') return res.status(403).json({ error: 'Account has been deleted' });
