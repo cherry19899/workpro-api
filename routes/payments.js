@@ -41,31 +41,38 @@ async function handlePaymentApprove(paymentId, metadata, userId, res, paymentsEn
       return res.status(403).json({ error: 'Payment does not belong to you' });
     }
 
-    // Respond immediately so Pi SDK doesn't time out (<300ms budget).
-    // Pi approval and DB write happen asynchronously after the response is sent.
-    res.json({ success: true });
-
-    // Pre-insert a pending row so /complete can find it even if the async block below
-    // hasn't finished yet when the frontend calls /complete right after /approve.
-    query(
+    // Pre-insert a pending row so /complete can find it later.
+    await query(
       `INSERT INTO payments (id, user_id, type, amount, metadata, status, payment_id)
        VALUES ($1,$2,$3,0,$4,'pending',$1)
        ON CONFLICT (id) DO NOTHING`,
       [paymentId, userId, metadata?.type || 'payment', JSON.stringify(metadata || {})]
     ).catch(() => {});
 
-    // Async: call Pi API, then upsert to 'approved'.
-    (PI_API_KEY
-      ? piApprovePayment(paymentId).catch(err => { console.error('[Payment] Pi approval failed:', err.message); return { amount: 0 }; })
-      : Promise.resolve({ amount: 0 })
-    ).then(piPayment => {
-      return query(
-        `INSERT INTO payments (id, user_id, type, amount, metadata, status, payment_id)
-         VALUES ($1,$2,$3,$4,$5,'approved',$1)
-         ON CONFLICT (id) DO UPDATE SET status='approved', amount=EXCLUDED.amount, updated_at=NOW()`,
-        [paymentId, userId, metadata?.type || 'payment', piPayment.amount || 0, JSON.stringify(metadata || {})]
-      ).then(() => audit('payment_approved', { payment_id: paymentId, user_id: userId, amount: piPayment.amount }));
-    }).catch(err => console.error('[Payment] Async approve post-processing failed:', err.message));
+    // CANONICAL Pi flow: the server must successfully call /approve BEFORE responding —
+    // the Pi wallet UI stays locked ("Preparing payment…") until Pi receives this approval.
+    // Approving asynchronously after responding meant a failed approve silently expired the
+    // payment ("developer could not approve"). So we await it and surface any Pi error.
+    let piPayment = { amount: 0 };
+    if (PI_API_KEY) {
+      try {
+        piPayment = await piApprovePayment(paymentId);
+      } catch (piErr) {
+        console.error('[Payment] Pi /approve FAILED:', piErr.message, '| paymentId:', paymentId);
+        return res.status(502).json({ error: 'Pi approval failed: ' + piErr.message });
+      }
+    }
+
+    // Persist approved state, then acknowledge to the frontend.
+    await query(
+      `INSERT INTO payments (id, user_id, type, amount, metadata, status, payment_id)
+       VALUES ($1,$2,$3,$4,$5,'approved',$1)
+       ON CONFLICT (id) DO UPDATE SET status='approved', amount=EXCLUDED.amount, updated_at=NOW()`,
+      [paymentId, userId, metadata?.type || 'payment', piPayment.amount || 0, JSON.stringify(metadata || {})]
+    ).catch(err => console.error('[Payment] approved-row upsert failed:', err.message));
+    audit('payment_approved', { payment_id: paymentId, user_id: userId, amount: piPayment.amount }).catch(() => {});
+
+    return res.json({ success: true, amount: piPayment.amount || 0 });
   } catch (err) {
     console.error('[Payment] Approve error:', err.message);
     if (!res.headersSent) serverError(err, res);
