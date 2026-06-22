@@ -549,6 +549,9 @@ router.get('/api/admin/settings', adminAuth, async (req, res) => {
 // PATCH /api/admin/settings — update a platform setting (whitelisted keys only)
 const SETTINGS_WHITELIST = {
   platform_fee_percent: { min: 0, max: FEE_MAX * 100, label: 'Platform fee %' },
+  connect_price_base:   { min: 0.001, max: 10,        label: 'Connect price base (Pi)' },
+  min_job_budget:       { min: 0.1,   max: 1000,      label: 'Minimum job budget (Pi)' },
+  max_job_budget:       { min: 100,   max: 1000000,   label: 'Maximum job budget (Pi)' },
 };
 router.patch('/api/admin/settings', adminAuth, async (req, res) => {
   const { key, value } = req.body;

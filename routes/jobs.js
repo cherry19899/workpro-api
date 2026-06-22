@@ -134,14 +134,14 @@ router.get('/api/jobs', async (req, res) => {
       }
     }
 
-    // Workaround: bundle v200 has inverted filter hiding 'open' jobs in Find Work feed.
     // Use posted_by_name as posted_by so bundle's own-job filter (posted_by !== username) works
     // correctly with case-sensitive Pi SDK username (e.g. 'Cherry19899' not 'pi_cherry19899').
+    // _open:true marks open jobs so the frontend fetch interceptor can remap status for the bundle.
     const jobs = rows.map(r => parseJobRow(r, { stripBase64: true })).map(function(j) {
       const normalized = Object.assign({}, j, {
         posted_by: j.posted_by_name || (j.posted_by ? j.posted_by.replace(/^pi_/, '') : j.posted_by),
       });
-      if (normalized.status === 'open') return Object.assign({}, normalized, { status: 'in_progress', _open: true });
+      if (normalized.status === 'open') return Object.assign({}, normalized, { _open: true });
       return normalized;
     });
 
@@ -214,11 +214,13 @@ router.post('/api/jobs', auth, checkBlocked, jobPostLimiter, async (req, res) =>
     // If any image is still base64 (GITHUB_TOKEN set), upload to GitHub Pages now
     // that we have the job id for a stable filename.
     if (Array.isArray(images) && images.some(i => typeof i === 'string' && i.startsWith('data:'))) {
-      const uploadedImgs = await processJobImages(images, newJob.id);
+      const { images: uploadedImgs, upload_failed } = await processJobImages(images, newJob.id);
       const anyUploaded = uploadedImgs.some((u, i) => u !== images[i]);
-      if (anyUploaded) {
-        await query('UPDATE jobs SET images = $1, updated_at = NOW() WHERE id = $2',
-          [serializeImages(uploadedImgs), newJob.id]).catch(() => {});
+      if (anyUploaded || upload_failed) {
+        const meta = newJob.metadata ? (typeof newJob.metadata === 'string' ? JSON.parse(newJob.metadata) : newJob.metadata) : {};
+        if (upload_failed) meta.upload_failed = true;
+        await query('UPDATE jobs SET images = $1, metadata = $2, updated_at = NOW() WHERE id = $3',
+          [serializeImages(uploadedImgs), JSON.stringify(meta), newJob.id]).catch(() => {});
         newJob.images = serializeImages(uploadedImgs);
       }
     }
@@ -373,9 +375,14 @@ router.put('/api/jobs/:id', auth, checkBlocked, async (req, res) => {
     if (images !== undefined) {
       if (Array.isArray(images) && images.length > 10) return res.status(400).json({ error: 'Too many images (max 10)' });
       // Upload any base64 to GitHub Pages before storing
-      const finalImgs = Array.isArray(images) && images.some(x => typeof x === 'string' && x.startsWith('data:'))
-        ? await processJobImages(images, req.params.id)
-        : images;
+      let finalImgs = images;
+      if (Array.isArray(images) && images.some(x => typeof x === 'string' && x.startsWith('data:'))) {
+        const { images: uploaded, upload_failed } = await processJobImages(images, req.params.id);
+        finalImgs = uploaded;
+        if (upload_failed) {
+          fields.push(`metadata=jsonb_set(COALESCE(metadata,'{}'), '{upload_failed}', 'true')`);
+        }
+      }
       fields.push(`images=$${i++}`); vals.push(serializeImages(finalImgs));
     }
     if (!fields.length) return res.status(400).json({ error: 'Nothing to update' });
@@ -491,6 +498,13 @@ router.post('/api/jobs/:id/hire', auth, checkBlocked, async (req, res) => {
     const job = jobResult.rows[0];
     if (job.posted_by !== req.userId) return res.status(403).json({ error: 'Not your job' });
     if (job.status !== 'open') return res.status(400).json({ error: 'Job is not open' });
+    // Verify the client has Pi payments enabled before creating escrow
+    if (!process.env.SANDBOX_MODE) {
+      const clientRow = await query('SELECT payments_enabled FROM users WHERE id = $1 LIMIT 1', [req.userId]);
+      if (clientRow.rows[0]?.payments_enabled === false) {
+        return res.status(403).json({ error: 'Pi payments are not enabled for your account. Complete Pi KYC to hire freelancers.' });
+      }
+    }
     const pmtRec = await query('SELECT id, user_id, amount, status FROM payments WHERE id = $1', [payment_id]);
     if (!pmtRec.rows.length) return res.status(402).json({ error: 'Payment not found — complete Pi payment first' });
     if (pmtRec.rows[0].user_id !== req.userId) return res.status(403).json({ error: 'Payment does not belong to you' });
@@ -574,7 +588,8 @@ router.post('/api/jobs/:id/complete', auth, checkBlocked, async (req, res) => {
     // Block completion until the escrow is funded — otherwise the freelancer is paid 0π for finished work.
     const unfundedComplete = await query("SELECT id FROM escrows WHERE job_id = $1 AND status = 'pending' LIMIT 1", [req.params.id]);
     if (unfundedComplete.rows.length) return res.status(400).json({ error: 'Пополните эскроу, прежде чем принимать работу и завершать задачу' });
-    let paidAmount = 0;
+    // Payment is handled exclusively by POST /api/escrow/:id/release (handleEscrowRelease).
+    // job/complete only changes the job status — no escrow release or balance_pi credit here.
     const pgClient5 = await getPool().connect();
     try {
       await pgClient5.query('BEGIN');
@@ -583,31 +598,18 @@ router.post('/api/jobs/:id/complete', auth, checkBlocked, async (req, res) => {
         [req.params.id, ['in_progress', 'submitted']]
       );
       if (!jobUpdate.rows.length) { await pgClient5.query('ROLLBACK'); return res.status(400).json({ error: 'Job already completed or status changed' }); }
-      const escrow = await pgClient5.query(
-        "UPDATE escrows SET status='released', updated_at=NOW() WHERE job_id=$1 AND status='funded' RETURNING *",
-        [req.params.id]
-      );
-      if (escrow.rows.length) {
-        const e = escrow.rows[0];
-        const fee = await getPlatformFee();
-        const net = parseFloat((e.amount * (1 - fee)).toFixed(8));
-        await pgClient5.query('UPDATE users SET balance_pi = COALESCE(balance_pi, 0) + $1, updated_at = NOW() WHERE id = $2', [net, e.freelancer_id]);
-        paidAmount = net;
-      }
       if (job.hired_freelancer_id) {
         await pgClient5.query('UPDATE users SET total_jobs_completed = total_jobs_completed + 1, updated_at = NOW() WHERE id = $1', [job.hired_freelancer_id]);
       }
       await pgClient5.query('COMMIT');
     } catch (txErr) { await pgClient5.query('ROLLBACK').catch(() => {}); throw txErr; }
     finally { pgClient5.release(); }
-    await audit('job_completed', { job_id: req.params.id, paid: paidAmount });
+    await audit('job_completed', { job_id: req.params.id });
     if (job.hired_freelancer_id) {
-      const payMsg = paidAmount > 0
-        ? `Заказчик принял работу. Зачислено ${paidAmount}π на ваш счёт.`
-        : 'Заказчик принял работу.';
-      await notify(job.hired_freelancer_id, 'completed', `Задача "${job.title}" принята`, payMsg, parseInt(req.params.id), null);
+      await notify(job.hired_freelancer_id, 'completed', `Задача "${job.title}" принята`,
+        'Заказчик принял работу.', parseInt(req.params.id), null);
     }
-    res.json({ success: true, paid: paidAmount });
+    res.json({ success: true });
   } catch (err) { serverError(err, res); }
 });
 

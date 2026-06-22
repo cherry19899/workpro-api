@@ -36,17 +36,24 @@ app.set('trust proxy', 1);
 const PORT = process.env.PORT || 3000;
 const NODE_ENV = process.env.NODE_ENV || 'production';
 
-// Warn if secrets are defaults — do this at startup before routes load
-if (!process.env.JWT_SECRET) {
-  console.warn('[SECURITY] JWT_SECRET env var is not set — using a random secret. All sessions will be invalidated on each restart.');
+// ── Pre-flight secret checks (fatal in production without SANDBOX escape hatch) ──
+const IS_SANDBOX = !!process.env.SANDBOX_MODE;
+if (NODE_ENV === 'production') {
+  if (IS_SANDBOX) {
+    console.error('[FATAL] SANDBOX_MODE is enabled in production! Remove SANDBOX_MODE before mainnet. Refusing to start.');
+    process.exit(1);
+  }
+  if (!process.env.JWT_SECRET) {
+    console.error('[FATAL] JWT_SECRET env var is not set. Set a strong JWT_SECRET in Render env vars. Refusing to start.');
+    process.exit(1);
+  }
+  const _adminKey = process.env.ADMIN_API_KEY;
+  if (!_adminKey || _adminKey === 'admin-secret-key') {
+    console.error('[FATAL] ADMIN_API_KEY is missing or using the default value. Set a strong ADMIN_API_KEY in Render env vars. Refusing to start.');
+    process.exit(1);
+  }
 }
 const ADMIN_API_KEY = process.env.ADMIN_API_KEY || 'admin-secret-key';
-if (ADMIN_API_KEY === 'admin-secret-key') {
-  console.warn('[SECURITY] ADMIN_API_KEY is the default value — set a strong ADMIN_API_KEY env var, otherwise the admin panel is publicly accessible.');
-}
-if (process.env.SANDBOX_MODE && NODE_ENV === 'production') {
-  console.error('[SECURITY] WARNING: SANDBOX_MODE is enabled in production! Pi verification is disabled. Remove SANDBOX_MODE env var before mainnet launch.');
-}
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://cherry19899.github.io';
 
 // ─── Core middleware ──────────────────────────────────────────────
@@ -185,11 +192,17 @@ app.get('/api/openapi.json', (req, res) => {
 
 // Pi Network calls this to verify backend ownership
 app.get('/.well-known/pi-network', (req, res) => {
-  res.json({ app: 'workpro', backend: true, version: '3.2.0' });
+  res.json({
+    app: 'workpro',
+    backend: true,
+    version: '3.2.0',
+    app_identifier: process.env.PI_APP_IDENTIFIER || 'workpro',
+  });
 });
 
 const _serverStartTime = Date.now();
 let _lastError = null; // set by the global error handler
+let _piHealthCache = null; // { ts, reachable, latency_ms } — 60s TTL
 
 app.get('/api/health', async (req, res) => {
   const result = {
@@ -218,16 +231,24 @@ app.get('/api/health', async (req, res) => {
   const { PI_API_KEY: piKey } = require('./src/helpers');
   result.pi_api = piKey ? 'configured' : 'missing';
 
-  // Pi API latency (only on deep=1 to avoid slowing every ping)
+  // Pi API latency (only on deep=1 to avoid slowing every ping) — cached 60s
   if (piKey && process.env.SANDBOX_MODE !== 'true' && req.query.deep === '1') {
-    const piStart = Date.now();
-    try {
-      const r = await fetch('https://api.minepi.com/v2/payments/health_check_nonexistent', {
-        headers: { Authorization: `Key ${piKey}` },
-      }).catch(() => null);
-      result.pi_api_reachable = r ? (r.status < 500 ? 'ok' : 'error') : 'unreachable';
-      result.pi_api_latency_ms = Date.now() - piStart;
-    } catch (_) { result.pi_api_reachable = 'unreachable'; result.pi_api_latency_ms = null; }
+    const now = Date.now();
+    if (_piHealthCache && (now - _piHealthCache.ts) < 60000) {
+      result.pi_api_reachable = _piHealthCache.reachable;
+      result.pi_api_latency_ms = _piHealthCache.latency_ms;
+      result.pi_api_cached = true;
+    } else {
+      const piStart = now;
+      try {
+        const r = await fetch('https://api.minepi.com/v2/payments/health_check_nonexistent', {
+          headers: { Authorization: `Key ${piKey}` },
+        }).catch(() => null);
+        result.pi_api_reachable = r ? (r.status < 500 ? 'ok' : 'error') : 'unreachable';
+        result.pi_api_latency_ms = Date.now() - piStart;
+      } catch (_) { result.pi_api_reachable = 'unreachable'; result.pi_api_latency_ms = null; }
+      _piHealthCache = { ts: Date.now(), reachable: result.pi_api_reachable, latency_ms: result.pi_api_latency_ms };
+    }
   }
 
   if (_lastError) result.last_error = _lastError;
@@ -399,6 +420,16 @@ async function ensureNotificationsTable() {
      ON CONFLICT (key) DO NOTHING`,
     'seed platform_fee_percent'
   );
+  await run(
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS payments_enabled BOOLEAN DEFAULT NULL`,
+    'users.payments_enabled'
+  );
+  await run(
+    `INSERT INTO platform_settings (key, value, updated_at)
+     VALUES ('connect_price_base','0.1',NOW()),('min_job_budget','1',NOW()),('max_job_budget','10000',NOW())
+     ON CONFLICT (key) DO NOTHING`,
+    'seed connect_price_base, min/max_job_budget'
+  );
 }
 
 // ─── Start ──────────────────────────────────────────────
@@ -441,10 +472,19 @@ initDb().then(async () => {
   io.on('connection', (socket) => {
     const userId = socket.userId;
 
-    socket.on('join_room', (roomId) => {
-      if (typeof roomId === 'string' && roomId.length < 200) {
-        socket.join(roomId);
-      }
+    socket.on('join_room', async (roomId) => {
+      if (typeof roomId !== 'string' || roomId.length >= 200) return;
+      try {
+        const room = await query(
+          'SELECT client_id, freelancer_id FROM chat_rooms WHERE id = $1 LIMIT 1',
+          [roomId]
+        );
+        if (!room.rows.length) return;
+        const r = room.rows[0];
+        if (r.client_id === userId || r.freelancer_id === userId) {
+          socket.join(roomId);
+        }
+      } catch (_) {}
     });
 
     socket.on('leave_room', (roomId) => {

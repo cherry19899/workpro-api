@@ -74,20 +74,23 @@ async function uploadBase64ToGitHub(dataUrl, filename) {
  * jobId is used to derive filenames (job{jobId}_{index}.jpg).
  */
 async function processJobImages(images, jobId) {
-  if (!Array.isArray(images) || images.length === 0) return images;
+  if (!Array.isArray(images) || images.length === 0) return { images, upload_failed: false };
   const results = [];
+  let upload_failed = false;
   for (let i = 0; i < images.length; i++) {
     const img = images[i];
     if (typeof img === 'string' && img.startsWith('data:')) {
       const mime = img.match(/^data:([^;]+)/)?.[1] || 'image/jpeg';
       const ext  = mime.includes('png') ? 'png' : mime.includes('gif') ? 'gif' : 'jpg';
       const filename = `job${jobId}_${i + 1}.${ext}`;
-      results.push(await uploadBase64ToGitHub(img, filename));
+      const uploaded = await uploadBase64ToGitHub(img, filename);
+      if (uploaded === img) upload_failed = true; // still base64 — upload failed
+      results.push(uploaded);
     } else {
       results.push(img);
     }
   }
-  return results;
+  return { images: results, upload_failed };
 }
 
 module.exports = { uploadBase64ToGitHub, processJobImages };

@@ -6,14 +6,24 @@ const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
 const { query } = require('./db');
 
+const _isProd = (process.env.NODE_ENV || 'production') === 'production';
+const _isSandbox = !!process.env.SANDBOX_MODE;
+
 const JWT_SECRET = process.env.JWT_SECRET || (() => {
-  // This warning is also emitted in server.js; the module-level call here is only reached
-  // when middleware.js is loaded outside the main server (e.g. tests). The canonical warning
-  // lives in server.js.
+  if (_isProd && !_isSandbox) {
+    console.error('[FATAL] JWT_SECRET is not set in production. Refusing to start.');
+    process.exit(1);
+  }
   return crypto.randomBytes(64).toString('hex');
 })();
 
-const ADMIN_API_KEY = process.env.ADMIN_API_KEY || 'admin-secret-key';
+const ADMIN_API_KEY = process.env.ADMIN_API_KEY || (() => {
+  if (_isProd && !_isSandbox) {
+    console.error('[FATAL] ADMIN_API_KEY is not set in production. Refusing to start.');
+    process.exit(1);
+  }
+  return 'admin-secret-key';
+})();
 
 // RATE_LIMIT_BYPASS_KEY — set this env var to skip rate limiting for automated
 // testing / CI. Callers pass it as x-rate-bypass header. Never expose in client code.
@@ -60,11 +70,20 @@ const adminLimiter = rateLimit({
   handler: _rlHandler('admin'),
 });
 
-// Strict limiter for connects/payments to prevent abuse
+// Strict limiter for connects/payments — key by userId (from JWT) so multiple
+// users behind the same NAT IP don't share the cap, and IP rotation doesn't bypass it.
 const connectsLimiter = rateLimit({
   windowMs: 60 * 60 * 1000, max: 20 * DEV_MULTIPLIER,
-  // Key by IP, NOT x-user-id — the user header is client-controlled and trivially rotated to bypass the cap
-  keyGenerator: (req) => req.ip || req.socket?.remoteAddress || 'unknown',
+  keyGenerator: (req) => {
+    try {
+      const h = req.headers['authorization'];
+      if (h && h.startsWith('Bearer ')) {
+        const decoded = jwt.verify(h.slice(7), JWT_SECRET);
+        if (decoded && decoded.id) return 'user_' + decoded.id;
+      }
+    } catch (_) {}
+    return req.ip || req.socket?.remoteAddress || 'unknown';
+  },
   skip: skipIfBypassed,
   handler: _rlHandler('connects'),
 });

@@ -84,13 +84,15 @@ async function handlePaymentComplete(paymentId, txid, metadata, userId, res) {
     const pgPmtC = await getPool().connect();
     try {
       await pgPmtC.query('BEGIN');
+      // Lock payment row first to prevent concurrent complete calls double-crediting connects
+      await pgPmtC.query('SELECT id FROM payments WHERE id = $1 FOR UPDATE', [paymentId]).catch(() => {});
       let markRes = await pgPmtC.query(
         "UPDATE payments SET status='completed', txid=$1, updated_at=NOW() WHERE id=$2 AND status='approved' RETURNING *",
         [txid, paymentId]
       );
       if (!markRes.rows.length) {
         // No approved row — check if already completed (idempotent) or never approved (approve step failed).
-        const existingRow = await pgPmtC.query('SELECT * FROM payments WHERE id = $1', [paymentId]);
+        const existingRow = await pgPmtC.query('SELECT * FROM payments WHERE id = $1 FOR UPDATE', [paymentId]);
         if (existingRow.rows.length && existingRow.rows[0].status === 'completed') {
           // Already completed by a previous call — idempotent success.
           await pgPmtC.query('ROLLBACK');
@@ -436,6 +438,13 @@ router.post('/api/connects/purchase', auth, checkBlocked, async (req, res) => {
 // POST /api/connects/buy — credit connects via Pi-verified payment (full flow)
 // Different call pattern from /purchase — keeps both as per requirement #3
 router.post('/api/connects/buy', auth, checkBlocked, async (req, res) => {
+  // In production, require Pi payments to be enabled for this user
+  if (!process.env.SANDBOX_MODE) {
+    const userRow = await query('SELECT payments_enabled FROM users WHERE id = $1 LIMIT 1', [req.userId]).catch(() => ({ rows: [] }));
+    if (userRow.rows[0]?.payments_enabled === false) {
+      return res.status(403).json({ error: 'Pi payments are not enabled for your account. Complete Pi KYC first.' });
+    }
+  }
   const { payment_id, txid, amount, status, pi_amount, package_amount } = req.body;
 
   // Approval / pending step: record intent only. NEVER credit connects here.
