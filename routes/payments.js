@@ -325,6 +325,29 @@ router.post('/api/payments/:paymentId/cancelled', softAuth, async (req, res) => 
   } catch (err) { res.json({ success: true }); }
 });
 
+// POST /api/payments/:paymentId/resolve-incomplete — no auth, called from onIncompletePaymentFound
+// Tries to approve+complete (or just approve) the stuck payment via Pi API so Pi SDK unblocks.
+router.post('/api/payments/:paymentId/resolve-incomplete', async (req, res) => {
+  const paymentId = req.params.paymentId;
+  try {
+    let piPayment = null;
+    if (PI_API_KEY) {
+      try { piPayment = await piGetPayment(paymentId); } catch (_) {}
+      if (piPayment) {
+        const st = piPayment.status || {};
+        if (!st.developer_approved) {
+          try { await piApprovePayment(paymentId); } catch (_) {}
+        }
+        if (st.transaction_verified && piPayment.transaction?.txid && !st.developer_completed) {
+          try { await piCompletePayment(paymentId, piPayment.transaction.txid); } catch (_) {}
+        }
+      }
+    }
+    await query(`UPDATE payments SET status='cancelled', updated_at=NOW() WHERE id=$1`, [paymentId]).catch(() => {});
+    res.json({ success: true });
+  } catch (err) { res.json({ success: true }); }
+});
+
 // POST /api/payments/clear-pending
 router.post('/api/payments/clear-pending', auth, async (req, res) => {
   try {
