@@ -5,7 +5,9 @@ const fetch = require('node-fetch');
 const { query, getPool } = require('./db');
 
 const PI_API_KEY = process.env.PI_API_KEY || '';
-const PI_API_BASE = 'https://api.minepi.com';
+const PI_API_BASE = process.env.SANDBOX_MODE
+  ? 'https://api.testnet.minepi.com'
+  : 'https://api.minepi.com';
 
 // ─── Platform fee ──────────────────────────────────────────────
 // Hard limits — no matter what's in the DB or env, fee is capped at 10%.
