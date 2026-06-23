@@ -306,12 +306,21 @@ router.post('/api/payments/complete', auth, async (req, res) => {
 });
 
 // POST /api/payments/:paymentId/cancelled
-router.post('/api/payments/:paymentId/cancelled', auth, async (req, res) => {
+router.post('/api/payments/:paymentId/cancelled', softAuth, async (req, res) => {
   try {
-    await query(
-      `UPDATE payments SET status = 'cancelled', updated_at = NOW() WHERE id = $1 AND user_id = $2`,
-      [req.params.paymentId, req.userId]
-    ).catch(() => {});
+    // softAuth — called from onIncompletePaymentFound before JWT is available, so no strict auth.
+    // Cancel by paymentId only; if userId known from JWT, also filter by it.
+    if (req.userId) {
+      await query(
+        `UPDATE payments SET status = 'cancelled', updated_at = NOW() WHERE id = $1 AND user_id = $2`,
+        [req.params.paymentId, req.userId]
+      ).catch(() => {});
+    } else {
+      await query(
+        `UPDATE payments SET status = 'cancelled', updated_at = NOW() WHERE id = $1`,
+        [req.params.paymentId]
+      ).catch(() => {});
+    }
     res.json({ success: true });
   } catch (err) { res.json({ success: true }); }
 });
