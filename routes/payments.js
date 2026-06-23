@@ -226,7 +226,12 @@ async function handleGetEscrow(req, res) {
 // is unforgeable (issued by Pi per-user), so uid-from-metadata is safe as a fallback.
 async function resolveUserId(req) {
   if (req.userId) return req.userId;
-  const uid = req.body?.metadata?.uid || req.body?.uid;
+  // Frontend sends userId in various shapes depending on the flow
+  const uid = req.body?.metadata?.uid
+    || req.body?.metadata?.userId
+    || req.body?.user?.id
+    || req.body?.userId
+    || req.body?.uid;
   if (!uid) return null;
   try {
     const row = await query('SELECT id FROM users WHERE pi_uid = $1 OR id = $1 LIMIT 1', [uid]);
