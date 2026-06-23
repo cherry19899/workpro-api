@@ -54,7 +54,11 @@ async function handlePaymentApprove(paymentId, metadata, userId, res, paymentsEn
     // Approving asynchronously after responding meant a failed approve silently expired the
     // payment ("developer could not approve"). So we await it and surface any Pi error.
     let piPayment = { amount: 0 };
-    if (PI_API_KEY) {
+    if (process.env.SANDBOX_MODE) {
+      // In sandbox/testnet: Pi SDK creates testnet payment IDs that the mainnet Pi API
+      // does not recognise. Skip the /approve call and approve locally so the wallet unlocks.
+      console.log('[Payment] SANDBOX: skipping Pi API /approve, approving locally | paymentId:', paymentId);
+    } else if (PI_API_KEY) {
       try {
         piPayment = await piApprovePayment(paymentId);
       } catch (piErr) {
@@ -80,7 +84,8 @@ async function handlePaymentApprove(paymentId, metadata, userId, res, paymentsEn
 }
 
 async function handlePaymentComplete(paymentId, txid, metadata, userId, res) {
-  if (!txid) return res.status(400).json({ error: 'txid required' });
+  if (!txid && !process.env.SANDBOX_MODE) return res.status(400).json({ error: 'txid required' });
+  if (!txid) txid = 'sandbox_' + paymentId;
   try {
     const ownerCheck = await query('SELECT user_id FROM payments WHERE id = $1', [paymentId]).catch(() => ({ rows: [] }));
     if (ownerCheck.rows.length && ownerCheck.rows[0].user_id && ownerCheck.rows[0].user_id !== userId) {
