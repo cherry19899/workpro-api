@@ -338,8 +338,23 @@ router.post('/api/payments/:paymentId/resolve-incomplete', async (req, res) => {
         if (!st.developer_approved) {
           try { await piApprovePayment(paymentId); } catch (_) {}
         }
-        if (st.transaction_verified && piPayment.transaction?.txid && !st.developer_completed) {
-          try { await piCompletePayment(paymentId, piPayment.transaction.txid); } catch (_) {}
+        const txid = piPayment.transaction?.txid;
+        if (st.transaction_verified && txid && !st.developer_completed) {
+          try { await piCompletePayment(paymentId, txid); } catch (_) {}
+          // Credit connects if this was a connects payment
+          const row = await query(`SELECT * FROM payments WHERE id=$1`, [paymentId]).catch(() => ({ rows: [] }));
+          const pay = row.rows[0];
+          const meta = pay?.metadata || {};
+          if (pay && !meta.connects_credited && (meta.type === 'connects' || pay.type === 'connects')) {
+            const amount = resolveConnects(parseFloat(piPayment.amount || pay.amount || 0));
+            if (amount > 0 && pay.user_id) {
+              await query(`UPDATE users SET balance_connects = balance_connects + $1, updated_at=NOW() WHERE id=$2`, [amount, pay.user_id]).catch(() => {});
+              await query(`UPDATE payments SET metadata = metadata || '{"connects_credited":true}', status='completed', txid=$1, updated_at=NOW() WHERE id=$2`, [txid, paymentId]).catch(() => {});
+              return res.json({ success: true, credited: amount });
+            }
+          }
+          await query(`UPDATE payments SET status='completed', txid=$1, updated_at=NOW() WHERE id=$2`, [txid, paymentId]).catch(() => {});
+          return res.json({ success: true });
         }
       }
     }
