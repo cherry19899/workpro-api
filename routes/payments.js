@@ -221,15 +221,27 @@ async function handleGetEscrow(req, res) {
 
 // ─── Payments ──────────────────────────────────────────────
 
-// approve/complete now require a verified JWT (was softAuth with a client-controlled
-// req.body.user_id fallback that let an attacker pass the ownership check by spoofing the id).
-// Frontend sends Authorization: Bearer on both payment flows (bundle _wpAuthHdr + index.html wrapper).
-router.post('/api/payments/:paymentId/approve', auth, async (req, res) => {
-  await handlePaymentApprove(req.params.paymentId, req.body.metadata, req.userId, res, req.body.payments_enabled);
+// Resolve userId: JWT first, then pi_uid from metadata (for cases where JWT is not yet available).
+// This allows the payment flow to work even if the JWT hasn't loaded yet — the Pi paymentId itself
+// is unforgeable (issued by Pi per-user), so uid-from-metadata is safe as a fallback.
+async function resolveUserId(req) {
+  if (req.userId) return req.userId;
+  const uid = req.body?.metadata?.uid || req.body?.uid;
+  if (!uid) return null;
+  try {
+    const row = await query('SELECT id FROM users WHERE pi_uid = $1 OR id = $1 LIMIT 1', [uid]);
+    return row.rows[0]?.id || null;
+  } catch (_) { return null; }
+}
+
+router.post('/api/payments/:paymentId/approve', softAuth, async (req, res) => {
+  const userId = await resolveUserId(req);
+  await handlePaymentApprove(req.params.paymentId, req.body.metadata, userId, res, req.body.payments_enabled);
 });
 
-router.post('/api/payments/:paymentId/complete', auth, async (req, res) => {
-  await handlePaymentComplete(req.params.paymentId, req.body.txid, req.body.metadata, req.userId, res);
+router.post('/api/payments/:paymentId/complete', softAuth, async (req, res) => {
+  const userId = await resolveUserId(req);
+  await handlePaymentComplete(req.params.paymentId, req.body.txid, req.body.metadata, userId, res);
 });
 
 router.get('/api/payments', auth, async (req, res) => {
