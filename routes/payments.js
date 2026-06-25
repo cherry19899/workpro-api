@@ -54,11 +54,11 @@ async function handlePaymentApprove(paymentId, metadata, userId, res, paymentsEn
     res.json({ success: true });
 
     // Async: call Pi API /approve (unlocks the Pi wallet), then persist approved state.
-    (PI_API_KEY
+    (PI_API_KEY && process.env.SANDBOX_MODE !== 'true'
       ? piApprovePayment(paymentId)
           .then(p => { console.log('[Payment] Pi /approve OK | paymentId:', paymentId); return p; })
           .catch(err => { console.error('[Payment] Pi /approve FAILED:', err.message, '| paymentId:', paymentId); return { amount: 0 }; })
-      : Promise.resolve({ amount: 0 })
+      : Promise.resolve({ amount: 0, status: { developer_approved: true } })
     ).then(piPayment => query(
       `INSERT INTO payments (id, user_id, type, amount, metadata, status, payment_id)
        VALUES ($1,$2,$3,$4,$5,'approved',$1)
@@ -81,7 +81,7 @@ async function handlePaymentComplete(paymentId, txid, metadata, userId, res) {
       return res.status(403).json({ error: 'Payment does not belong to you' });
     }
     let piPayment = { amount: 0 };
-    if (PI_API_KEY) {
+    if (PI_API_KEY && process.env.SANDBOX_MODE !== 'true') {
       try {
         piPayment = await piCompletePayment(paymentId, txid);
       } catch (piErr) {
@@ -548,7 +548,7 @@ router.post('/api/connects/buy', auth, checkBlocked, async (req, res) => {
     // (best-effort approve/complete first in case the client never finished it).
     let piPayment = null;
     let verified = false;
-    if (PI_API_KEY) {
+    if (PI_API_KEY && process.env.SANDBOX_MODE !== 'true') {
       try {
         if (txid) {
           await piApprovePayment(payment_id).catch(() => {});
@@ -560,6 +560,9 @@ router.post('/api/connects/buy', auth, checkBlocked, async (req, res) => {
       } catch (piErr) {
         console.error('[Connects] Pi verification failed:', piErr.message);
       }
+    } else {
+      piPayment = { amount: parseFloat(pi_amount || amount || 0), status: { transaction_verified: true, developer_completed: true } };
+      verified = true;
     }
 
     const pgClient = await getPool().connect();
