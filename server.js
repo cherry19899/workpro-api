@@ -27,6 +27,7 @@ const helmet = require('helmet');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const { query, initDb } = require('./db');
+const { PI_API_KEY: piKey } = require('./src/helpers');
 
 const app = express();
 const httpServer = http.createServer(app);
@@ -227,7 +228,6 @@ app.get('/api/health', async (req, res) => {
     result.db_latency_ms = null;
   }
 
-  const { PI_API_KEY: piKey } = require('./src/helpers');
   result.pi_api = piKey ? 'configured' : 'missing';
 
   // Pi API latency (only on deep=1 to avoid slowing every ping) — cached 60s

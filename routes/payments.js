@@ -5,7 +5,7 @@ const router = require('express').Router();
 const crypto = require('crypto');
 const fetch = require('node-fetch');
 const { query, getPool } = require('../src/db');
-const { piApprovePayment, piCompletePayment, piGetPayment, notify, audit, serverError, PI_API_KEY, getPlatformFee } = require('../src/helpers');
+const { piApprovePayment, piCompletePayment, piGetPayment, notify, audit, serverError, PI_API_KEY, PI_API_BASE, getPlatformFee } = require('../src/helpers');
 const { auth, softAuth, checkBlocked } = require('../src/middleware');
 
 // Server-side package catalog — mirrors frontend packages. Never trust client-supplied quantity.
@@ -401,14 +401,14 @@ router.post('/api/payments/:paymentId/resolve-complete', auth, async (req, res) 
   try {
     let txid = null;
     if (PI_API_KEY) {
-      const piRes = await fetch(`https://api.minepi.com/v2/payments/${paymentId}`, {
+      const piRes = await fetch(`${PI_API_BASE}/v2/payments/${paymentId}`, {
         headers: { 'Authorization': `Key ${PI_API_KEY}` }
       }).catch(() => null);
       if (piRes && piRes.ok) {
         const piData = await piRes.json().catch(() => ({}));
         txid = piData.transaction?.txid || piData.txid || null;
         if (txid) {
-          await fetch(`https://api.minepi.com/v2/payments/${paymentId}/complete`, {
+          await fetch(`${PI_API_BASE}/v2/payments/${paymentId}/complete`, {
             method: 'POST',
             headers: { 'Authorization': `Key ${PI_API_KEY}`, 'Content-Type': 'application/json' },
             body: JSON.stringify({ txid })

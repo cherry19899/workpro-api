@@ -123,6 +123,7 @@ module.exports = {
   audit,
   serverError,
   PI_API_KEY,
+  PI_API_BASE,
   getPlatformFee,
   invalidatePlatformFeeCache,
   FEE_MAX,
