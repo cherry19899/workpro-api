@@ -96,6 +96,7 @@ router.get('/api/jobs', async (req, res) => {
     if (search) { conditions.push(`(title ILIKE $${idx} OR description ILIKE $${idx})`); params.push(`%${search}%`); idx++; }
     if (min_budget) { conditions.push(`budget >= $${idx++}`); params.push(parseFloat(min_budget)); }
     if (max_budget) { conditions.push(`budget <= $${idx++}`); params.push(parseFloat(max_budget)); }
+    if (req.query.featured === 'true') { conditions.push(`featured = true`); }
 
     // Decode cursor and add keyset condition (created_at DESC: fetch rows older than cursor)
     let cursorData = null;

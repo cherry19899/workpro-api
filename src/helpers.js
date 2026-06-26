@@ -117,6 +117,16 @@ function serverError(err, res) {
   return res.status(500).json({ error: 'Internal server error' });
 }
 
+// Lightweight uid extractor from request body (no DB lookup — use payments.js resolveUserId for that).
+function resolveUserIdFromBody(body) {
+  return body?.metadata?.uid
+    || body?.metadata?.userId
+    || body?.user?.id
+    || body?.userId
+    || body?.uid
+    || null;
+}
+
 module.exports = {
   piApiRequest,
   piApprovePayment,
@@ -130,4 +140,5 @@ module.exports = {
   getPlatformFee,
   invalidatePlatformFeeCache,
   FEE_MAX,
+  resolveUserIdFromBody,
 };

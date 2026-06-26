@@ -19,6 +19,7 @@
 
 require('dotenv').config();
 const express = require('express');
+const compression = require('compression');
 const http = require('http');
 const { Server: SocketIOServer } = require('socket.io');
 const cors = require('cors');
@@ -57,6 +58,7 @@ const ADMIN_API_KEY = process.env.ADMIN_API_KEY || 'admin-secret-key';
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://cherry19899.github.io';
 
 // ─── Core middleware ──────────────────────────────────────────────
+app.use(compression());
 app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
 app.use(express.json({ limit: '4mb' }));
 app.use(express.urlencoded({ extended: true, limit: '4mb' }));

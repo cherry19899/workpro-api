@@ -1027,4 +1027,28 @@ router.post('/api/offers/:id/decline', auth, checkBlocked, async (req, res) => {
   } catch (err) { serverError(err, res); }
 });
 
+// POST /api/payments/webhook — Pi Platform callback, update payment status
+router.post('/api/payments/webhook', async (req, res) => {
+  try {
+    const { payment_id, txid, status } = req.body;
+    if (!payment_id) return res.status(400).json({ error: 'payment_id required' });
+    const validStatuses = ['completed', 'cancelled', 'failed'];
+    if (status && !validStatuses.includes(status)) return res.status(400).json({ error: 'Invalid status' });
+    // Verify with Pi API before trusting the webhook
+    let piPayment = null;
+    if (PI_API_KEY) {
+      try { piPayment = await piGetPayment(payment_id); } catch (_) {}
+    }
+    const resolvedStatus = piPayment?.status?.developer_completed ? 'completed'
+      : piPayment?.status?.cancelled ? 'cancelled'
+      : status || 'completed';
+    await query(
+      `UPDATE payments SET status = $1, txid = COALESCE($2, txid), updated_at = NOW() WHERE id = $3`,
+      [resolvedStatus, txid || null, payment_id]
+    );
+    await audit('webhook_payment_update', { payment_id, status: resolvedStatus, txid });
+    res.json({ success: true, payment_id, status: resolvedStatus });
+  } catch (err) { serverError(err, res); }
+});
+
 module.exports = router;

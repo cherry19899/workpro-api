@@ -278,6 +278,19 @@ router.patch('/api/admin/jobs/:id/images', adminAuth, async (req, res) => {
   } catch (err) { serverError(err, res); }
 });
 
+// PATCH /api/admin/jobs/:id — update featured flag (and other admin-level job fields)
+router.patch('/api/admin/jobs/:id', adminAuth, async (req, res) => {
+  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Job not found' });
+  const { featured } = req.body;
+  if (typeof featured !== 'boolean') return res.status(400).json({ error: 'featured (boolean) required' });
+  try {
+    const r = await query('UPDATE jobs SET featured = $1, updated_at = NOW() WHERE id = $2 RETURNING id, featured', [featured, req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ error: 'Job not found' });
+    await audit('job_featured_updated', { job_id: req.params.id, featured, by: req.userId });
+    res.json({ success: true, job: r.rows[0] });
+  } catch (err) { serverError(err, res); }
+});
+
 // DELETE /api/admin/jobs/:id
 router.delete('/api/admin/jobs/:id', adminAuth, async (req, res) => {
   if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Job not found' });
@@ -900,6 +913,60 @@ router.post('/api/admin/rate-limits/unblock', adminAuth, async (req, res) => {
   _rlBlocks.delete(ip);
   await audit('rate_limit_unblock', { ip, by: req.userId });
   res.json({ success: true, was_blocked: had });
+});
+
+// GET /api/admin/payments — paginated list of all payments with optional status filter
+router.get('/api/admin/payments', adminAuth, async (req, res) => {
+  const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 50, 200));
+  const offset = Math.max(0, parseInt(req.query.offset) || 0);
+  const status = req.query.status;
+  try {
+    const where = status ? 'WHERE status = $3' : '';
+    const params = status ? [limit, offset, status] : [limit, offset];
+    const rows = await query(
+      `SELECT p.*, u.username FROM payments p LEFT JOIN users u ON p.user_id = u.id ${where} ORDER BY p.created_at DESC LIMIT $1 OFFSET $2`,
+      params
+    );
+    const total = await query(
+      `SELECT COUNT(*) FROM payments${status ? ' WHERE status = $1' : ''}`,
+      status ? [status] : []
+    );
+    res.json({ payments: rows.rows, total: parseInt(total.rows[0].count), limit, offset });
+  } catch (err) { serverError(err, res); }
+});
+
+// POST /api/admin/users/bulk-block
+router.post('/api/admin/users/bulk-block', adminAuth, async (req, res) => {
+  const { user_ids } = req.body;
+  if (!Array.isArray(user_ids) || user_ids.length === 0) return res.status(400).json({ error: 'user_ids array required' });
+  if (user_ids.length > 100) return res.status(400).json({ error: 'Max 100 users per request' });
+  const OWNER_IDS = ['cherry19899', 'pi_cherry19899', 'a2b617f7-f510-4502-a046-805facedcc29', 'pi_a2b617f7-f510-4502-a046-805facedcc29'];
+  const safe = user_ids.filter(id => !OWNER_IDS.includes(id));
+  const skipped = user_ids.length - safe.length;
+  if (safe.length === 0) return res.status(403).json({ error: 'Cannot block owner account(s)' });
+  try {
+    await query(
+      `UPDATE users SET is_blocked = true, status = 'blocked', updated_at = NOW() WHERE id = ANY($1::text[])`,
+      [safe]
+    );
+    await audit('bulk_user_blocked', { user_ids: safe, count: safe.length, skipped_owner: skipped, by: req.userId });
+    res.json({ success: true, blocked: safe.length, skipped_owner: skipped });
+  } catch (err) { serverError(err, res); }
+});
+
+// POST /api/admin/users/bulk-unblock
+router.post('/api/admin/users/bulk-unblock', adminAuth, async (req, res) => {
+  const { user_ids } = req.body;
+  if (!Array.isArray(user_ids) || user_ids.length === 0) return res.status(400).json({ error: 'user_ids array required' });
+  if (user_ids.length > 100) return res.status(400).json({ error: 'Max 100 users per request' });
+  try {
+    await query(
+      `UPDATE users SET is_blocked = false, status = 'active', updated_at = NOW() WHERE id = ANY($1::text[])`,
+      [user_ids]
+    );
+    await audit('bulk_user_unblocked', { user_ids, count: user_ids.length, by: req.userId });
+    res.json({ success: true, unblocked: user_ids.length });
+  } catch (err) { serverError(err, res); }
 });
 
 router.warmStats = warmStats;

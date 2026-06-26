@@ -59,6 +59,20 @@ async function query(text, params) {
   return result;
 }
 
+const MAX_RETRIES = 3;
+async function queryWithRetry(text, params, retries = MAX_RETRIES) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      return await query(text, params);
+    } catch (err) {
+      // Only retry on transient connection errors, not logic/constraint errors
+      const transient = err.code === 'ECONNRESET' || err.code === '57P01' || err.message.includes('Connection terminated');
+      if (!transient || attempt === retries) throw err;
+      await new Promise(r => setTimeout(r, 200 * attempt));
+    }
+  }
+}
+
 async function initDb() {
   if (!usePg) {
     await loadJsonDb();
@@ -92,8 +106,11 @@ async function initDb() {
       skills TEXT, images TEXT, deadline TIMESTAMP, status VARCHAR(50) DEFAULT 'open',
       posted_by VARCHAR(255), posted_by_name VARCHAR(255), applications INTEGER DEFAULT 0,
       connects_spent INTEGER DEFAULT 1, apply_cost INTEGER DEFAULT 1,
+      featured BOOLEAN DEFAULT false,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )`);
+    // Add featured column to existing tables (idempotent — ALTER TABLE ADD COLUMN IF NOT EXISTS)
+    await query(`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS featured BOOLEAN DEFAULT false`).catch(() => {});
     await query(`CREATE TABLE IF NOT EXISTS applications (
       id SERIAL PRIMARY KEY, job_id INTEGER, job_title VARCHAR(500),
       freelancer_id VARCHAR(255), freelancer_name VARCHAR(255), message TEXT,
@@ -147,4 +164,4 @@ async function initDb() {
 }
 
 function getPool() { return pool; }
-module.exports = { query, initDb, pool, getPool, usePg, db, saveJsonDb, healthCheck };
+module.exports = { query, queryWithRetry, initDb, pool, getPool, usePg, db, saveJsonDb, healthCheck };
