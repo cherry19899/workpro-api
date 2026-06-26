@@ -393,7 +393,14 @@ router.get('/api/chat/:roomId/messages', auth, async (req, res) => {
 // POST /api/chat/rooms/:id/upload — upload a file attachment to a chat room.
 // File is stored in Postgres (durable across Render restarts), then posted as a
 // chat message whose body links to GET /api/chat/attachments/:attId.
-router.post('/api/chat/rooms/:id/upload', auth, checkBlocked, messageLimiter, upload.single('file'), async (req, res) => {
+const uploadSingle = (req, res, next) => upload.single('file')(req, res, (err) => {
+  if (err) {
+    if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: 'File too large (max 5 MB)' });
+    return res.status(400).json({ error: err.message || 'Upload failed' });
+  }
+  next();
+});
+router.post('/api/chat/rooms/:id/upload', auth, checkBlocked, messageLimiter, uploadSingle, async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded (field name must be "file")' });
     const roomCheck = await query('SELECT * FROM chat_rooms WHERE id = $1 AND (client_id = $2 OR freelancer_id = $2)', [req.params.id, req.userId]);
