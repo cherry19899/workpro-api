@@ -180,7 +180,9 @@ router.post('/api/jobs', auth, checkBlocked, jobPostLimiter, async (req, res) =>
     if (isNaN(dl.getTime())) return res.status(400).json({ error: 'Invalid deadline date' });
     if (dl < new Date()) return res.status(400).json({ error: 'Deadline must be in the future' });
   }
-  const applyCost = Math.ceil(budgetNum / 50);
+  const applyCost = (req.body.connects_required !== undefined && !isNaN(parseInt(req.body.connects_required)) && parseInt(req.body.connects_required) >= 1 && parseInt(req.body.connects_required) <= 200)
+  ? parseInt(req.body.connects_required)
+  : Math.ceil(budgetNum / 50);
   const POST_COST = 1;
   try {
     const userRes = await query('SELECT username, balance_connects FROM users WHERE id = $1', [req.userId]);
