@@ -355,18 +355,22 @@ router.get('/api/auth/me', auth, async (req, res) => {
 router.get('/api/users/me', auth, async (req, res) => {
   try {
     const result = await query(
-      'SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, is_blocked, status, created_at, updated_at FROM users WHERE id = $1',
+      'SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, is_blocked, status, title, hourly_rate, location, website, created_at, updated_at FROM users WHERE id = $1',
       [req.userId]
     );
     if (!result.rows.length) return res.status(404).json({ error: 'User not found' });
     const u = result.rows[0];
+    if (!Array.isArray(u.skills)) {
+      u.skills = (typeof u.skills === 'string' && u.skills && u.skills !== '{}')
+        ? u.skills.split(',').map(s => s.trim()).filter(Boolean) : [];
+    }
     res.json({ ...u, uid: u.id, is_admin: u.role === 'admin' });
   } catch (err) { serverError(err, res); }
 });
 
 // PUT /api/users/me — update current user profile
 router.put('/api/users/me', auth, checkBlocked, async (req, res) => {
-  const { username, bio, skills, availability, avatar, email } = req.body;
+  const { username, bio, skills, availability, avatar, email, title, hourly_rate, location, website } = req.body;
   if (username && username.length > 50) return res.status(400).json({ error: 'Username too long (max 50)' });
   if (bio && bio.length > 1000) return res.status(400).json({ error: 'Bio too long (max 1000)' });
   const skillsStr = skills !== undefined ? (Array.isArray(skills) ? skills.join(',') : (skills || null)) : undefined;
@@ -389,11 +393,18 @@ router.put('/api/users/me', auth, checkBlocked, async (req, res) => {
     if (availability) { fields.push(`availability=$${i++}`); vals.push(availability); }
     if (avatar) { fields.push(`avatar=$${i++}`); vals.push(avatar); }
     if (email) { fields.push(`email=$${i++}`); vals.push(email); }
+    if (title !== undefined) { fields.push(`title=$${i++}`); vals.push(title || null); }
+    if (hourly_rate !== undefined) { fields.push(`hourly_rate=$${i++}`); vals.push(hourly_rate ? parseFloat(hourly_rate) : null); }
+    if (location !== undefined) { fields.push(`location=$${i++}`); vals.push(location || null); }
+    if (website !== undefined) {
+      if (website && !/^https?:\/\//i.test(website)) return res.status(400).json({ error: 'Website must start with http:// or https://' });
+      fields.push(`website=$${i++}`); vals.push(website || null);
+    }
     if (!fields.length) return res.status(400).json({ error: 'Nothing to update' });
     fields.push(`updated_at=NOW()`);
     vals.push(req.userId);
     await query(`UPDATE users SET ${fields.join(',')} WHERE id=$${i}`, vals);
-    const result = await query('SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, is_blocked, status, created_at, updated_at FROM users WHERE id = $1', [req.userId]);
+    const result = await query('SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, is_blocked, status, title, hourly_rate, location, website, created_at, updated_at FROM users WHERE id = $1', [req.userId]);
     const u = result.rows[0];
     if (!Array.isArray(u.skills)) {
       u.skills = (typeof u.skills === 'string' && u.skills && u.skills !== '{}')

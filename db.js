@@ -133,6 +133,11 @@ async function initDb() {
     await query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS txid VARCHAR(255)`).catch(() => {});
     await query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS payment_id VARCHAR(255)`).catch(() => {});
     await query(`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS hired_freelancer_id VARCHAR(255)`).catch(() => {});
+    // Profile extended fields
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS title VARCHAR(255)`).catch(() => {});
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS hourly_rate DECIMAL(10,2)`).catch(() => {});
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS location VARCHAR(255)`).catch(() => {});
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS website VARCHAR(500)`).catch(() => {});
     await query(`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS hired_freelancer_name VARCHAR(255)`).catch(() => {});
     await query(`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS escrow_id INTEGER`).catch(() => {});
     await query(`ALTER TABLE applications ADD COLUMN IF NOT EXISTS bid_amount DECIMAL(10,2)`).catch(() => {});
