@@ -130,7 +130,7 @@ router.post('/api/admin/users/:id/block', adminAuth, async (req, res) => {
     // Block both duplicate-account twins so the block can't be bypassed by logging
     // in as the unblocked twin (same person, "pi_" prefix mismatch).
     await query('UPDATE users SET is_blocked = true, status = $1, updated_at = NOW() WHERE id IN ($2, $3)', ['blocked', req.params.id, twin]);
-    await audit('user_blocked', { user_id: req.params.id });
+    await audit('user_blocked', { user_id: req.params.id, by: req.userId, ip: req.headers['x-forwarded-for'] || req.ip });
     res.json({ success: true });
   } catch (err) { serverError(err, res); }
 });
@@ -140,7 +140,7 @@ router.post('/api/admin/users/:id/unblock', adminAuth, async (req, res) => {
   try {
     const twin = twinId(req.params.id);
     await query('UPDATE users SET is_blocked = false, status = $1, updated_at = NOW() WHERE id IN ($2, $3)', ['active', req.params.id, twin]);
-    await audit('user_unblocked', { user_id: req.params.id });
+    await audit('user_unblocked', { user_id: req.params.id, by: req.userId, ip: req.headers['x-forwarded-for'] || req.ip });
     res.json({ success: true });
   } catch (err) { serverError(err, res); }
 });
