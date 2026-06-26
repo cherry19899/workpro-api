@@ -344,6 +344,18 @@ router.post('/api/chat/:roomId/messages', auth, messageLimiter, checkBlocked, as
     const otherUserId2 = roomCheck.rows[0].client_id === req.userId ? roomCheck.rows[0].freelancer_id : roomCheck.rows[0].client_id;
     if (otherUserId2) {
       await notify(otherUserId2, 'message', `Новое сообщение от ${senderName}`, msg.substring(0, 100), null, req.params.roomId).catch(() => {});
+      // Web Push to recipient (same as the /conversations route — this is the route the frontend uses).
+      const webpush = req.app.get('webpush');
+      if (webpush) {
+        const subRow = await query('SELECT endpoint, keys FROM push_subscriptions WHERE user_id = $1', [otherUserId2]).catch(() => null);
+        if (subRow && subRow.rows.length) {
+          const sub = subRow.rows[0];
+          webpush.sendNotification(
+            { endpoint: sub.endpoint, keys: sub.keys },
+            JSON.stringify({ title: `Message from ${senderName}`, body: msg.substring(0, 80), icon: '/icon-192.png' })
+          ).catch(() => {}); // fire-and-forget
+        }
+      }
     }
     res.json({ message: result.rows[0], success: true });
   } catch (err) { serverError(err, res); }
