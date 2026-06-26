@@ -5,9 +5,12 @@ const fetch = require('node-fetch');
 const { query, getPool } = require('./db');
 
 const PI_API_KEY = process.env.PI_API_KEY || '';
-const PI_API_BASE = process.env.SANDBOX_MODE
-  ? 'https://api.testnet.minepi.com'
-  : 'https://api.minepi.com';
+// The Pi Platform API (payments approve/complete/get) is served from api.minepi.com
+// for BOTH testnet/sandbox and mainnet apps — sandbox is a frontend-SDK concern only.
+// api.testnet.minepi.com is the Stellar testnet Horizon (blockchain), NOT the Platform
+// API: calling it for /v2/payments/* returns Horizon "Resource Missing" 404s and the
+// Pi wallet never gets approved. Always use api.minepi.com here.
+const PI_API_BASE = 'https://api.minepi.com';
 
 // ─── Platform fee ──────────────────────────────────────────────
 // Hard limits — no matter what's in the DB or env, fee is capped at 10%.
