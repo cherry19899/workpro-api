@@ -338,6 +338,9 @@ router.post('/api/chat/:roomId/messages', auth, messageLimiter, checkBlocked, as
       [req.params.roomId, req.userId, senderName, msg]
     );
     await query('UPDATE chat_rooms SET updated_at = NOW() WHERE id = $1', [req.params.roomId]);
+    // Real-time: broadcast to everyone in the room (this is the route the frontend actually uses).
+    const io = req.app.get('io');
+    if (io) io.to(req.params.roomId).emit('new_message', result.rows[0]);
     const otherUserId2 = roomCheck.rows[0].client_id === req.userId ? roomCheck.rows[0].freelancer_id : roomCheck.rows[0].client_id;
     if (otherUserId2) {
       await notify(otherUserId2, 'message', `Новое сообщение от ${senderName}`, msg.substring(0, 100), null, req.params.roomId).catch(() => {});
