@@ -151,6 +151,11 @@ async function initDb() {
       id SERIAL PRIMARY KEY, room_id VARCHAR(255), sender_id VARCHAR(255),
       sender_name VARCHAR(255), message TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )`);
+    await query(`CREATE TABLE IF NOT EXISTS chat_attachments (
+      id VARCHAR(255) PRIMARY KEY, room_id VARCHAR(255), uploader_id VARCHAR(255),
+      filename VARCHAR(500), mimetype VARCHAR(255), size INTEGER, data BYTEA,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`);
     await query(`CREATE TABLE IF NOT EXISTS audit_logs (
       id SERIAL PRIMARY KEY, action VARCHAR(255) NOT NULL, data JSONB DEFAULT '{}',
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP

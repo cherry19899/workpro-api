@@ -6,6 +6,11 @@ const crypto = require('crypto');
 const { query } = require('../src/db');
 const { notify, serverError } = require('../src/helpers');
 const { auth, softAuth, checkBlocked, messageLimiter } = require('../src/middleware');
+const multer = require('multer');
+// memoryStorage — NOT disk: Render's filesystem is ephemeral (wiped on every
+// restart/deploy), so 'uploads/' would lose files. We persist bytes in Postgres
+// (chat_attachments) so attachments survive restarts. 5 MB cap.
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
 
 // GET /api/chat/rooms
 router.get('/api/chat/rooms', auth, async (req, res) => {
@@ -382,6 +387,49 @@ router.get('/api/chat/:roomId/messages', auth, async (req, res) => {
       [req.params.roomId, limit, offset]
     );
     res.json({ messages: result.rows, limit, offset });
+  } catch (err) { serverError(err, res); }
+});
+
+// POST /api/chat/rooms/:id/upload — upload a file attachment to a chat room.
+// File is stored in Postgres (durable across Render restarts), then posted as a
+// chat message whose body links to GET /api/chat/attachments/:attId.
+router.post('/api/chat/rooms/:id/upload', auth, checkBlocked, messageLimiter, upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded (field name must be "file")' });
+    const roomCheck = await query('SELECT * FROM chat_rooms WHERE id = $1 AND (client_id = $2 OR freelancer_id = $2)', [req.params.id, req.userId]);
+    if (!roomCheck.rows.length) return res.status(403).json({ error: 'Not in this room' });
+    const attId = 'att_' + crypto.randomBytes(12).toString('hex');
+    await query(
+      'INSERT INTO chat_attachments (id, room_id, uploader_id, filename, mimetype, size, data) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+      [attId, req.params.id, req.userId, req.file.originalname, req.file.mimetype, req.file.size, req.file.buffer]
+    );
+    const userRes = await query('SELECT username FROM users WHERE id = $1', [req.userId]);
+    const senderName = userRes.rows[0]?.username || req.userId;
+    const body = `📎 ${req.file.originalname}|/api/chat/attachments/${attId}`;
+    const result = await query(
+      'INSERT INTO chat_messages (room_id, sender_id, sender_name, message) VALUES ($1,$2,$3,$4) RETURNING *',
+      [req.params.id, req.userId, senderName, body]
+    );
+    await query('UPDATE chat_rooms SET updated_at = NOW() WHERE id = $1', [req.params.id]);
+    const io = req.app.get('io');
+    if (io) io.to(req.params.id).emit('new_message', result.rows[0]);
+    const otherId = roomCheck.rows[0].client_id === req.userId ? roomCheck.rows[0].freelancer_id : roomCheck.rows[0].client_id;
+    if (otherId) await notify(otherId, 'message', `Файл от ${senderName}`, req.file.originalname, null, req.params.id).catch(() => {});
+    res.json({ success: true, attachment_id: attId, url: `/api/chat/attachments/${attId}`, message: result.rows[0] });
+  } catch (err) { serverError(err, res); }
+});
+
+// GET /api/chat/attachments/:attId — stream a stored attachment (room members only).
+router.get('/api/chat/attachments/:attId', auth, async (req, res) => {
+  try {
+    const r = await query('SELECT * FROM chat_attachments WHERE id = $1', [req.params.attId]);
+    if (!r.rows.length) return res.status(404).json({ error: 'Attachment not found' });
+    const att = r.rows[0];
+    const member = await query('SELECT id FROM chat_rooms WHERE id = $1 AND (client_id = $2 OR freelancer_id = $2)', [att.room_id, req.userId]);
+    if (!member.rows.length) return res.status(403).json({ error: 'Access denied' });
+    res.setHeader('Content-Type', att.mimetype || 'application/octet-stream');
+    res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(att.filename)}"`);
+    res.send(att.data);
   } catch (err) { serverError(err, res); }
 });
 
