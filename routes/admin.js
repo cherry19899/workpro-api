@@ -116,10 +116,14 @@ router.get('/api/admin/users', adminAuth, async (req, res) => {
 router.post('/api/admin/users/:id/block', adminAuth, async (req, res) => {
   try {
     const twin = twinId(req.params.id);
-    // Guard the owner under either id form (with/without pi_ prefix).
-    const target = await query('SELECT username FROM users WHERE id IN ($1, $2)', [req.params.id, twin]);
-    const isOwner = ['cherry19899', 'pi_cherry19899'].includes(req.params.id) ||
-      target.rows.some(r => r.username === 'cherry19899');
+    // Guard the owner under EVERY id form and any username casing. The real Pi Browser
+    // owner account is id 'pi_a2b617f7-…' username 'Cherry19899' (capital C) — the old
+    // guard only matched lowercase 'cherry19899' and missed it, so the owner kept getting
+    // blocked by automated callers. Mirror the owner identities used in middleware adminAuth.
+    const OWNER_IDS = ['cherry19899', 'pi_cherry19899', 'a2b617f7-f510-4502-a046-805facedcc29', 'pi_a2b617f7-f510-4502-a046-805facedcc29'];
+    const target = await query('SELECT username, role FROM users WHERE id IN ($1, $2)', [req.params.id, twin]);
+    const isOwner = OWNER_IDS.includes(req.params.id) || OWNER_IDS.includes(twin) ||
+      target.rows.some(r => (r.username || '').toLowerCase() === 'cherry19899');
     if (isOwner) {
       return res.status(403).json({ error: 'Cannot block owner' });
     }
