@@ -247,7 +247,11 @@ router.post('/api/me', authLimiter, async (req, res) => {
     }
     await audit('user_login', { user_id: uid });
     const token = jwt.sign({ id: uid, username: uname }, JWT_SECRET, { expiresIn: '30d' });
-    res.json({ ...u, uid: u.id, is_admin: u.role === 'admin', token });
+    const incompletePayments = await query(
+      "SELECT id, type, amount, status, created_at FROM payments WHERE user_id = $1 AND status = 'pending'",
+      [uid]
+    ).then(r => r.rows).catch(() => []);
+    res.json({ ...u, uid: u.id, is_admin: u.role === 'admin', token, incompletePayments });
   } catch (err) { serverError(err, res); }
 });
 

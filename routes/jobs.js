@@ -482,7 +482,7 @@ router.post('/api/jobs/:id/apply', auth, checkBlocked, async (req, res) => {
     } finally { pgClient.release(); }
     await audit('job_applied', { job_id: req.params.id, user_id: req.userId });
     await notify(job.posted_by, 'application', `Новый отклик на задачу "${job.title}"`,
-      `${user.username || 'Фрилансер'} откликнулся на вашу задачу`, parseInt(req.params.id), null);
+      `${user.username || 'Фрилансер'} откликнулся на вашу задачу`, parseInt(req.params.id), null).catch(() => {});
     const newBalance = (user.balance_connects || 0) - lockedCost;
     res.json({ application: appResult.rows[0], success: true, remaining_connects: newBalance, new_balance: newBalance });
   } catch (err) { serverError(err, res); }
