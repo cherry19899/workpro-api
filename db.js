@@ -25,9 +25,21 @@ async function loadJsonDb() {
 async function saveJsonDb() {
   try {
     await fs.mkdir(DATA_DIR, { recursive: true });
-    await fs.writeFile(DB_FILE, JSON.stringify(db, null, 2));
+    const tmpFile = DB_FILE + '.tmp';
+    await fs.writeFile(tmpFile, JSON.stringify(db, null, 2));
+    await fs.rename(tmpFile, DB_FILE);
   } catch (e) {
     console.error('[DB] JSON save error:', e.message);
+  }
+}
+
+async function healthCheck() {
+  if (!usePg) return { ok: true, mode: 'json' };
+  try {
+    await pool.query('SELECT 1');
+    return { ok: true, mode: 'pg' };
+  } catch (e) {
+    return { ok: false, error: e.message };
   }
 }
 
@@ -57,7 +69,10 @@ async function initDb() {
   const { Pool } = require('pg');
   pool = new Pool({
     connectionString: process.env.DATABASE_URL,
-    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+    max: 8,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 5000,
   });
 
   try {
@@ -132,4 +147,4 @@ async function initDb() {
 }
 
 function getPool() { return pool; }
-module.exports = { query, initDb, pool, getPool, usePg, db, saveJsonDb };
+module.exports = { query, initDb, pool, getPool, usePg, db, saveJsonDb, healthCheck };
