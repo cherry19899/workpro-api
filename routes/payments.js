@@ -212,12 +212,33 @@ async function handleEscrowRelease(req, res) {
 async function handleGetEscrow(req, res) {
   const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 50, 200));
   const offset = Math.max(0, parseInt(req.query.offset) || 0);
+  // Match both pi_xxx and xxx forms of the userId to handle legacy records
+  const uid = req.userId;
+  const uidAlt = uid.startsWith('pi_') ? uid.slice(3) : 'pi_' + uid;
   try {
     const [result, totalRes] = await Promise.all([
-      query('SELECT * FROM escrows WHERE client_id = $1 OR freelancer_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3', [req.userId, limit, offset]),
-      query('SELECT COUNT(*) FROM escrows WHERE client_id = $1 OR freelancer_id = $1', [req.userId]),
+      query(
+        `SELECT e.*, j.title AS job_title,
+                REGEXP_REPLACE(e.client_id, '^pi_', '') AS client_id_norm,
+                REGEXP_REPLACE(e.freelancer_id, '^pi_', '') AS freelancer_id_norm
+         FROM escrows e
+         LEFT JOIN jobs j ON j.id = e.job_id
+         WHERE e.client_id = ANY($1) OR e.freelancer_id = ANY($1)
+         ORDER BY e.created_at DESC LIMIT $2 OFFSET $3`,
+        [[uid, uidAlt], limit, offset]
+      ),
+      query(
+        'SELECT COUNT(*) FROM escrows WHERE client_id = ANY($1) OR freelancer_id = ANY($1)',
+        [[uid, uidAlt]]
+      ),
     ]);
-    res.json({ escrows: result.rows, total: parseInt(totalRes.rows[0].count), limit, offset });
+    // Return client_id/freelancer_id without pi_ prefix so bundle comparison works
+    const escrows = result.rows.map(e => ({
+      ...e,
+      client_id: e.client_id_norm || normalizeId(e.client_id),
+      freelancer_id: e.freelancer_id_norm || normalizeId(e.freelancer_id),
+    }));
+    res.json({ escrows, total: parseInt(totalRes.rows[0].count), limit, offset });
   } catch (err) { serverError(err, res); }
 }
 
@@ -641,19 +662,32 @@ router.get('/api/escrows', auth, handleGetEscrow);
 
 router.get(['/api/escrow/:id', '/api/escrows/:id'], auth, async (req, res) => {
   const id = req.params.id;
+  const uid = req.userId;
+  const uidAlt = uid.startsWith('pi_') ? uid.slice(3) : 'pi_' + uid;
   if (id === 'me') {
     const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 50, 200));
     const offset = Math.max(0, parseInt(req.query.offset) || 0);
     try {
-      const result = await query('SELECT * FROM escrows WHERE client_id = $1 OR freelancer_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3', [req.userId, limit, offset]);
-      return res.json({ escrows: result.rows, limit, offset });
+      const result = await query(
+        `SELECT e.*, j.title AS job_title FROM escrows e LEFT JOIN jobs j ON j.id = e.job_id
+         WHERE e.client_id = ANY($1) OR e.freelancer_id = ANY($1)
+         ORDER BY e.created_at DESC LIMIT $2 OFFSET $3`,
+        [[uid, uidAlt], limit, offset]
+      );
+      const escrows = result.rows.map(e => ({ ...e, client_id: normalizeId(e.client_id), freelancer_id: normalizeId(e.freelancer_id) }));
+      return res.json({ escrows, limit, offset });
     } catch (err) { return serverError(err, res); }
   }
   if (isNaN(parseInt(id))) return res.status(404).json({ error: 'Escrow not found' });
   try {
-    const result = await query('SELECT * FROM escrows WHERE id = $1 AND (client_id = $2 OR freelancer_id = $2)', [id, req.userId]);
+    const result = await query(
+      `SELECT e.*, j.title AS job_title FROM escrows e LEFT JOIN jobs j ON j.id = e.job_id
+       WHERE e.id = $1 AND (e.client_id = ANY($2) OR e.freelancer_id = ANY($2))`,
+      [id, [uid, uidAlt]]
+    );
     if (!result.rows.length) return res.status(404).json({ error: 'Escrow not found' });
-    res.json({ escrow: result.rows[0] });
+    const e = result.rows[0];
+    res.json({ escrow: { ...e, client_id: normalizeId(e.client_id), freelancer_id: normalizeId(e.freelancer_id) } });
   } catch (err) { serverError(err, res); }
 });
 
