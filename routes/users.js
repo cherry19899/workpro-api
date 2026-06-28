@@ -6,6 +6,8 @@ const { query } = require('../src/db');
 const { notify, serverError } = require('../src/helpers');
 const { auth, softAuth, checkBlocked } = require('../src/middleware');
 
+const normalizeId = (id) => (id || '').toString().toLowerCase().replace(/^pi_/, '');
+
 // ─── Level helper ──────────────────────────────────────────────
 function computeLevel(completedJobs, rating) {
   const r = parseFloat(rating) || 0;
@@ -192,10 +194,10 @@ router.post('/api/ratings', auth, checkBlocked, async (req, res) => {
       const jobCheck = await query('SELECT posted_by, hired_freelancer_id, status FROM jobs WHERE id = $1', [job_id]);
       if (jobCheck.rows.length) {
         const job = jobCheck.rows[0];
-        const isParticipant = job.posted_by === req.userId || job.hired_freelancer_id === req.userId;
+        const isParticipant = normalizeId(job.posted_by) === normalizeId(req.userId) || normalizeId(job.hired_freelancer_id) === normalizeId(req.userId);
         if (!isParticipant) return res.status(403).json({ error: 'You were not a participant in this job' });
         if (job.status !== 'completed') return res.status(400).json({ error: 'Job must be completed before rating' });
-        const expectedTarget = job.posted_by === req.userId ? job.hired_freelancer_id : job.posted_by;
+        const expectedTarget = normalizeId(job.posted_by) === normalizeId(req.userId) ? job.hired_freelancer_id : job.posted_by;
         if (to_user_id !== expectedTarget) return res.status(403).json({ error: 'You can only rate the other participant of this job' });
       }
     } else {
@@ -240,10 +242,10 @@ router.post('/api/reviews', auth, checkBlocked, async (req, res) => {
       const jobCheck = await query('SELECT posted_by, hired_freelancer_id, status FROM jobs WHERE id = $1', [job_id]);
       if (jobCheck.rows.length) {
         const job = jobCheck.rows[0];
-        const isParticipant = job.posted_by === req.userId || job.hired_freelancer_id === req.userId;
+        const isParticipant = normalizeId(job.posted_by) === normalizeId(req.userId) || normalizeId(job.hired_freelancer_id) === normalizeId(req.userId);
         if (!isParticipant) return res.status(403).json({ error: 'You were not a participant in this job' });
         if (job.status !== 'completed') return res.status(400).json({ error: 'Job must be completed before rating' });
-        const expectedTargetR = job.posted_by === req.userId ? job.hired_freelancer_id : job.posted_by;
+        const expectedTargetR = normalizeId(job.posted_by) === normalizeId(req.userId) ? job.hired_freelancer_id : job.posted_by;
         if (toId !== expectedTargetR) return res.status(403).json({ error: 'You can only rate the other participant of this job' });
       }
     } else {

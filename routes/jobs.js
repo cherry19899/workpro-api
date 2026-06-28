@@ -8,6 +8,8 @@ const { notify, audit, serverError, getPlatformFee } = require('../src/helpers')
 const { auth, softAuth, checkBlocked, jobPostLimiter } = require('../src/middleware');
 const { processJobImages } = require('../src/github-images');
 
+const normalizeId = (id) => (id || '').toString().toLowerCase().replace(/^pi_/, '');
+
 // ─── Image helpers ──────────────────────────────────────────────
 function serializeImages(images) {
   if (!images) return null;
@@ -309,7 +311,7 @@ router.patch('/api/jobs/:id', auth, checkBlocked, async (req, res) => {
     if (!jobResult.rows.length) return res.status(404).json({ error: 'Job not found' });
     const job = jobResult.rows[0];
     const { status } = req.body;
-    const isHiredFreelancer = job.hired_freelancer_id === req.userId;
+    const isHiredFreelancer = normalizeId(job.hired_freelancer_id) === normalizeId(req.userId);
     if (!(isHiredFreelancer && status === 'submitted')) {
       return res.status(403).json({ error: 'Forbidden' });
     }
@@ -335,7 +337,7 @@ router.put('/api/jobs/:id', auth, checkBlocked, async (req, res) => {
     const jobResult = await query('SELECT * FROM jobs WHERE id = $1', [req.params.id]);
     if (!jobResult.rows.length) return res.status(404).json({ error: 'Job not found' });
     const job = jobResult.rows[0];
-    if (job.posted_by !== req.userId) return res.status(403).json({ error: 'Not your job' });
+    if (normalizeId(job.posted_by) !== normalizeId(req.userId)) return res.status(403).json({ error: 'Not your job' });
     if (job.status !== 'open') return res.status(400).json({ error: 'Can only edit open jobs' });
     const fields = [], vals = [];
     let i = 1;
@@ -419,7 +421,7 @@ router.post('/api/jobs/:id/apply', auth, checkBlocked, async (req, res) => {
     const jobResult = await query('SELECT * FROM jobs WHERE id = $1', [req.params.id]);
     if (!jobResult.rows.length) return res.status(404).json({ error: 'Job not found' });
     const job = jobResult.rows[0];
-    if (job.posted_by === req.userId) return res.status(400).json({ error: 'Cannot apply to own job' });
+    if (normalizeId(job.posted_by) === normalizeId(req.userId)) return res.status(400).json({ error: 'Cannot apply to own job' });
     if (job.status !== 'open') return res.status(400).json({ error: 'Job is not open' });
     const existingApp = await query('SELECT id, status FROM applications WHERE job_id = $1 AND freelancer_id = $2', [req.params.id, req.userId]);
     if (existingApp.rows.length && !['withdrawn', 'rejected', 'offer', 'declined'].includes(existingApp.rows[0].status)) {
@@ -499,7 +501,7 @@ router.post('/api/jobs/:id/hire', auth, checkBlocked, async (req, res) => {
     const jobResult = await query('SELECT * FROM jobs WHERE id = $1', [req.params.id]);
     if (!jobResult.rows.length) return res.status(404).json({ error: 'Job not found' });
     const job = jobResult.rows[0];
-    if (job.posted_by !== req.userId) return res.status(403).json({ error: 'Not your job' });
+    if (normalizeId(job.posted_by) !== normalizeId(req.userId)) return res.status(403).json({ error: 'Not your job' });
     if (job.status !== 'open') return res.status(400).json({ error: 'Job is not open' });
     // Verify the client has Pi payments enabled before creating escrow
     if (!process.env.SANDBOX_MODE) {
@@ -584,7 +586,7 @@ router.post('/api/jobs/:id/complete', auth, checkBlocked, async (req, res) => {
     const jobResult = await query('SELECT * FROM jobs WHERE id = $1', [req.params.id]);
     if (!jobResult.rows.length) return res.status(404).json({ error: 'Job not found' });
     const job = jobResult.rows[0];
-    if (job.posted_by !== req.userId) return res.status(403).json({ error: 'Not your job' });
+    if (normalizeId(job.posted_by) !== normalizeId(req.userId)) return res.status(403).json({ error: 'Not your job' });
     if (!['in_progress', 'submitted'].includes(job.status)) return res.status(400).json({ error: 'Job is not in progress' });
     const disputedEscrow = await query("SELECT id FROM escrows WHERE job_id = $1 AND status = 'disputed' LIMIT 1", [req.params.id]);
     if (disputedEscrow.rows.length) return res.status(400).json({ error: 'Cannot complete job while escrow is under dispute — wait for admin resolution' });
@@ -623,7 +625,7 @@ router.delete('/api/jobs/:id', auth, checkBlocked, async (req, res) => {
     const jobResult = await query('SELECT * FROM jobs WHERE id = $1', [req.params.id]);
     if (!jobResult.rows.length) return res.status(404).json({ error: 'Job not found' });
     const job = jobResult.rows[0];
-    if (job.posted_by !== req.userId) return res.status(403).json({ error: 'Not your job' });
+    if (normalizeId(job.posted_by) !== normalizeId(req.userId)) return res.status(403).json({ error: 'Not your job' });
     if (['in_progress', 'submitted'].includes(job.status)) return res.status(400).json({ error: 'Cannot delete a job that is in progress' });
     const applyRefundCost = job.apply_cost || 1;
     const applicants = await query("SELECT DISTINCT freelancer_id FROM applications WHERE job_id = $1 AND status = 'pending'", [req.params.id]);
@@ -654,7 +656,7 @@ router.get('/api/jobs/:id/applications', auth, async (req, res) => {
   try {
     const jobResult = await query('SELECT posted_by FROM jobs WHERE id = $1', [req.params.id]);
     if (!jobResult.rows.length) return res.status(404).json({ error: 'Job not found' });
-    if (jobResult.rows[0].posted_by !== req.userId) return res.status(403).json({ error: 'Forbidden' });
+    if (normalizeId(jobResult.rows[0].posted_by) !== normalizeId(req.userId)) return res.status(403).json({ error: 'Forbidden' });
     const [result, totalRes] = await Promise.all([
       query('SELECT * FROM applications WHERE job_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3', [req.params.id, limit, offset]),
       query('SELECT COUNT(*) FROM applications WHERE job_id = $1', [req.params.id]),
@@ -690,7 +692,7 @@ router.post('/api/applications', auth, checkBlocked, async (req, res) => {
     const jobResult = await query('SELECT * FROM jobs WHERE id = $1', [job_id]);
     if (!jobResult.rows.length) return res.status(404).json({ error: 'Job not found' });
     const job = jobResult.rows[0];
-    if (job.posted_by === req.userId) return res.status(400).json({ error: 'Cannot apply to own job' });
+    if (normalizeId(job.posted_by) === normalizeId(req.userId)) return res.status(400).json({ error: 'Cannot apply to own job' });
     if (job.status !== 'open') return res.status(400).json({ error: 'Job is not open' });
     const existing = await query('SELECT id, status FROM applications WHERE job_id = $1 AND freelancer_id = $2', [job_id, req.userId]);
     if (existing.rows.length && !['withdrawn', 'rejected', 'offer', 'declined'].includes(existing.rows[0].status)) {
@@ -806,7 +808,7 @@ router.get('/api/applications/job/:jobId', auth, async (req, res) => {
   try {
     const jobResult = await query('SELECT posted_by FROM jobs WHERE id = $1', [req.params.jobId]);
     if (!jobResult.rows.length) return res.status(404).json({ error: 'Job not found' });
-    if (jobResult.rows[0].posted_by !== req.userId) return res.status(403).json({ error: 'Forbidden' });
+    if (normalizeId(jobResult.rows[0].posted_by) !== normalizeId(req.userId)) return res.status(403).json({ error: 'Forbidden' });
     const [result, totalRes] = await Promise.all([
       query('SELECT * FROM applications WHERE job_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3', [req.params.jobId, limit, offset]),
       query('SELECT COUNT(*) FROM applications WHERE job_id = $1', [req.params.jobId]),
@@ -824,7 +826,7 @@ router.patch('/api/applications/:id', auth, checkBlocked, async (req, res) => {
   try {
     const appResult = await query('SELECT a.*, j.posted_by, j.apply_cost, j.budget AS job_budget, j.title AS job_title_full FROM applications a JOIN jobs j ON a.job_id = j.id WHERE a.id = $1', [req.params.id]);
     if (!appResult.rows.length) return res.status(404).json({ error: 'Application not found' });
-    if (appResult.rows[0].posted_by !== req.userId) return res.status(403).json({ error: 'Forbidden' });
+    if (normalizeId(appResult.rows[0].posted_by) !== normalizeId(req.userId)) return res.status(403).json({ error: 'Forbidden' });
     const app_ = appResult.rows[0];
     let patchedApp;
     const pgPatch = await getPool().connect();
@@ -893,7 +895,7 @@ router.post('/api/applications/:id/accept', auth, checkBlocked, async (req, res)
     );
     if (!appResult.rows.length) return res.status(404).json({ error: 'Application not found' });
     const app_ = appResult.rows[0];
-    if (app_.posted_by !== req.userId) return res.status(403).json({ error: 'Forbidden' });
+    if (normalizeId(app_.posted_by) !== normalizeId(req.userId)) return res.status(403).json({ error: 'Forbidden' });
     const jobStatusCheck = await query('SELECT status FROM jobs WHERE id = $1', [app_.job_id]);
     if (!jobStatusCheck.rows.length || ['completed', 'cancelled'].includes(jobStatusCheck.rows[0].status)) {
       return res.status(400).json({ error: 'Cannot accept application — job is already completed or cancelled' });
@@ -964,7 +966,7 @@ router.post('/api/applications/:id/reject', auth, checkBlocked, async (req, res)
   try {
     const appResult = await query('SELECT a.*, j.posted_by, j.apply_cost FROM applications a JOIN jobs j ON a.job_id = j.id WHERE a.id = $1', [req.params.id]);
     if (!appResult.rows.length) return res.status(404).json({ error: 'Application not found' });
-    if (appResult.rows[0].posted_by !== req.userId) return res.status(403).json({ error: 'Forbidden' });
+    if (normalizeId(appResult.rows[0].posted_by) !== normalizeId(req.userId)) return res.status(403).json({ error: 'Forbidden' });
     const app_ = appResult.rows[0];
     let rejectedApp;
     const pgRej = await getPool().connect();
@@ -993,7 +995,7 @@ router.post('/api/applications/:id/withdraw', auth, checkBlocked, async (req, re
     const appResult = await query('SELECT a.*, j.apply_cost FROM applications a JOIN jobs j ON a.job_id = j.id WHERE a.id = $1', [req.params.id]);
     if (!appResult.rows.length) return res.status(404).json({ error: 'Application not found' });
     const app_ = appResult.rows[0];
-    if (app_.freelancer_id !== req.userId) return res.status(403).json({ error: 'Forbidden' });
+    if (normalizeId(app_.freelancer_id) !== normalizeId(req.userId)) return res.status(403).json({ error: 'Forbidden' });
     if (app_.status !== 'pending') return res.status(400).json({ error: 'Can only withdraw pending applications' });
     let withdrawnApp;
     const pgWith = await getPool().connect();
@@ -1019,7 +1021,7 @@ router.put('/api/applications/:id/status', auth, checkBlocked, async (req, res) 
   try {
     const appResult = await query('SELECT a.*, j.posted_by, j.apply_cost, j.budget AS job_budget, j.title AS job_title_full FROM applications a JOIN jobs j ON a.job_id = j.id WHERE a.id = $1', [req.params.id]);
     if (!appResult.rows.length) return res.status(404).json({ error: 'Application not found' });
-    if (appResult.rows[0].posted_by !== req.userId) return res.status(403).json({ error: 'Forbidden' });
+    if (normalizeId(appResult.rows[0].posted_by) !== normalizeId(req.userId)) return res.status(403).json({ error: 'Forbidden' });
     const app_ = appResult.rows[0];
     let updatedApp;
     const pgStatusClient = await getPool().connect();
@@ -1092,7 +1094,7 @@ router.post('/api/applications/:id/hire', auth, checkBlocked, async (req, res) =
     );
     if (!appResult.rows.length) return res.status(404).json({ error: 'Application not found' });
     const app_ = appResult.rows[0];
-    if (app_.posted_by !== req.userId) return res.status(403).json({ error: 'Forbidden' });
+    if (normalizeId(app_.posted_by) !== normalizeId(req.userId)) return res.status(403).json({ error: 'Forbidden' });
     const escrowAmount = parseFloat(paymentCheck.rows[0].amount || 0);
     const freelancerId = app_.freelancer_id;
     let escrowRow;
@@ -1165,7 +1167,7 @@ router.post('/api/applications/:id/view', auth, async (req, res) => {
       [req.params.id]
     );
     if (!appRes.rows.length) return res.status(404).json({ error: 'Application not found' });
-    if (appRes.rows[0].posted_by !== req.userId) return res.status(403).json({ error: 'Forbidden' });
+    if (normalizeId(appRes.rows[0].posted_by) !== normalizeId(req.userId)) return res.status(403).json({ error: 'Forbidden' });
     await query('UPDATE applications SET viewed = true, viewed_at = NOW() WHERE id = $1', [req.params.id]).catch(() => {});
     res.json({ success: true });
   } catch (err) { res.json({ success: true }); }

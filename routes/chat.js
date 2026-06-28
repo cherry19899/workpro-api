@@ -7,6 +7,7 @@ const { query } = require('../src/db');
 const { notify, serverError } = require('../src/helpers');
 const { auth, softAuth, checkBlocked, messageLimiter } = require('../src/middleware');
 const multer = require('multer');
+const normalizeId = (id) => (id || '').toString().toLowerCase().replace(/^pi_/, '');
 // memoryStorage — NOT disk: Render's filesystem is ephemeral (wiped on every
 // restart/deploy), so 'uploads/' would lose files. We persist bytes in Postgres
 // (chat_attachments) so attachments survive restarts. 5 MB cap.
@@ -118,7 +119,7 @@ router.post('/api/chat/rooms/:id/messages', auth, checkBlocked, messageLimiter, 
       [req.params.id, req.userId, senderName, message.trim()]
     );
     await query('UPDATE chat_rooms SET updated_at = NOW() WHERE id = $1', [req.params.id]);
-    const otherUserId = room.rows[0].client_id === req.userId ? room.rows[0].freelancer_id : room.rows[0].client_id;
+    const otherUserId = normalizeId(room.rows[0].client_id) === normalizeId(req.userId) ? room.rows[0].freelancer_id : room.rows[0].client_id;
     if (otherUserId) {
       await notify(otherUserId, 'message', `Новое сообщение от ${senderName}`, message.trim().substring(0, 100), null, req.params.id);
     }
@@ -138,7 +139,7 @@ router.post('/api/chat/start', auth, checkBlocked, messageLimiter, async (req, r
     if (jobId) {
       const jobCheck = await query('SELECT posted_by FROM jobs WHERE id = $1', [jobId]);
       if (!jobCheck.rows.length) return res.status(404).json({ error: 'Job not found' });
-      if (jobCheck.rows[0].posted_by !== req.userId) {
+      if (normalizeId(jobCheck.rows[0].posted_by) !== normalizeId(req.userId)) {
         const appCheck = await query('SELECT id FROM applications WHERE job_id = $1 AND freelancer_id = $2 LIMIT 1', [jobId, req.userId]);
         if (!appCheck.rows.length) return res.status(403).json({ error: 'You are not a participant in this job' });
       }
@@ -241,7 +242,7 @@ router.post('/api/chat/conversations/:id/messages', auth, checkBlocked, messageL
     const senderName = userResult.rows[0]?.username || req.userId;
     const result = await query('INSERT INTO chat_messages (room_id, sender_id, sender_name, message) VALUES ($1, $2, $3, $4) RETURNING *', [req.params.id, req.userId, senderName, msg.trim()]);
     await query('UPDATE chat_rooms SET updated_at = NOW() WHERE id = $1', [req.params.id]);
-    const otherUserId = room.rows[0].client_id === req.userId ? room.rows[0].freelancer_id : room.rows[0].client_id;
+    const otherUserId = normalizeId(room.rows[0].client_id) === normalizeId(req.userId) ? room.rows[0].freelancer_id : room.rows[0].client_id;
     const newMsg = result.rows[0];
     // Emit real-time event to all sockets in this room
     const io = req.app.get('io');
@@ -346,7 +347,7 @@ router.post('/api/chat/:roomId/messages', auth, messageLimiter, checkBlocked, as
     // Real-time: broadcast to everyone in the room (this is the route the frontend actually uses).
     const io = req.app.get('io');
     if (io) io.to(req.params.roomId).emit('new_message', result.rows[0]);
-    const otherUserId2 = roomCheck.rows[0].client_id === req.userId ? roomCheck.rows[0].freelancer_id : roomCheck.rows[0].client_id;
+    const otherUserId2 = normalizeId(roomCheck.rows[0].client_id) === normalizeId(req.userId) ? roomCheck.rows[0].freelancer_id : roomCheck.rows[0].client_id;
     if (otherUserId2) {
       await notify(otherUserId2, 'message', `Новое сообщение от ${senderName}`, msg.substring(0, 100), null, req.params.roomId).catch(() => {});
       // Web Push to recipient (same as the /conversations route — this is the route the frontend uses).
@@ -420,7 +421,7 @@ router.post('/api/chat/rooms/:id/upload', auth, checkBlocked, messageLimiter, up
     await query('UPDATE chat_rooms SET updated_at = NOW() WHERE id = $1', [req.params.id]);
     const io = req.app.get('io');
     if (io) io.to(req.params.id).emit('new_message', result.rows[0]);
-    const otherId = roomCheck.rows[0].client_id === req.userId ? roomCheck.rows[0].freelancer_id : roomCheck.rows[0].client_id;
+    const otherId = normalizeId(roomCheck.rows[0].client_id) === normalizeId(req.userId) ? roomCheck.rows[0].freelancer_id : roomCheck.rows[0].client_id;
     if (otherId) await notify(otherId, 'message', `Файл от ${senderName}`, req.file.originalname, null, req.params.id).catch(() => {});
     res.json({ success: true, attachment_id: attId, url: `/api/chat/attachments/${attId}`, message: result.rows[0] });
   } catch (err) { serverError(err, res); }

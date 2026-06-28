@@ -8,6 +8,8 @@ const { query, getPool } = require('../src/db');
 const { piApprovePayment, piCompletePayment, piGetPayment, notify, audit, serverError, PI_API_KEY, PI_API_BASE, getPlatformFee } = require('../src/helpers');
 const { auth, softAuth, checkBlocked } = require('../src/middleware');
 
+const normalizeId = (id) => (id || '').toString().toLowerCase().replace(/^pi_/, '');
+
 // Server-side package catalog — mirrors frontend packages. Never trust client-supplied quantity.
 const CONNECT_PACKAGES = [
   { connects: 10,  price: 1 },
@@ -183,7 +185,7 @@ async function handleEscrowRelease(req, res) {
     const result = await query('SELECT * FROM escrows WHERE id = $1', [req.params.id]);
     if (!result.rows.length) return res.status(404).json({ error: 'Escrow not found' });
     const escrow = result.rows[0];
-    if (escrow.client_id !== req.userId) return res.status(403).json({ error: 'Not your escrow' });
+    if (normalizeId(escrow.client_id) !== normalizeId(req.userId)) return res.status(403).json({ error: 'Not your escrow' });
     if (escrow.status !== 'funded') return res.status(400).json({ error: 'Escrow is not funded' });
     const fee = await getPlatformFee();
     const net = parseFloat((escrow.amount * (1 - fee)).toFixed(8)); // platform commission
@@ -666,7 +668,7 @@ router.post(['/api/escrow', '/api/escrows'], auth, checkBlocked, async (req, res
     const piVerifiedAmount = parseFloat(pmtRec.rows[0].amount || 0);
     const jobCheck = await query('SELECT posted_by, hired_freelancer_id FROM jobs WHERE id = $1', [job_id]);
     if (!jobCheck.rows.length) return res.status(404).json({ error: 'Job not found' });
-    if (jobCheck.rows[0].posted_by !== req.userId) return res.status(403).json({ error: 'Not your job' });
+    if (normalizeId(jobCheck.rows[0].posted_by) !== normalizeId(req.userId)) return res.status(403).json({ error: 'Not your job' });
     if (jobCheck.rows[0].hired_freelancer_id && jobCheck.rows[0].hired_freelancer_id !== freelancer_id) {
       return res.status(400).json({ error: 'freelancer_id does not match hired freelancer' });
     }
@@ -713,7 +715,7 @@ router.post(['/api/escrows/:id/cancel', '/api/escrow/:id/cancel'], auth, checkBl
     const result = await query('SELECT * FROM escrows WHERE id = $1', [req.params.id]);
     if (!result.rows.length) return res.status(404).json({ error: 'Escrow not found' });
     const escrow = result.rows[0];
-    if (escrow.client_id !== req.userId) return res.status(403).json({ error: 'Not your escrow' });
+    if (normalizeId(escrow.client_id) !== normalizeId(req.userId)) return res.status(403).json({ error: 'Not your escrow' });
     if (!['pending', 'funded'].includes(escrow.status)) return res.status(400).json({ error: 'Escrow already settled' });
     const wasFunded = escrow.status === 'funded';
     const pgClient6 = await getPool().connect();
@@ -749,7 +751,7 @@ router.post('/api/escrow/:id/refund', auth, checkBlocked, async (req, res) => {
     const result = await query('SELECT * FROM escrows WHERE id = $1', [req.params.id]);
     if (!result.rows.length) return res.status(404).json({ error: 'Escrow not found' });
     const escrow = result.rows[0];
-    if (escrow.client_id !== req.userId) return res.status(403).json({ error: 'Not your escrow' });
+    if (normalizeId(escrow.client_id) !== normalizeId(req.userId)) return res.status(403).json({ error: 'Not your escrow' });
     if (!['pending', 'funded'].includes(escrow.status)) return res.status(400).json({ error: 'Cannot refund escrow with status: ' + escrow.status });
     const wasFunded = escrow.status === 'funded';
     const pgClient7 = await getPool().connect();
@@ -783,7 +785,7 @@ router.post('/api/escrows/:id/fund', auth, checkBlocked, async (req, res) => {
   try {
     const preCheck = await query('SELECT * FROM escrows WHERE id = $1', [req.params.id]);
     if (!preCheck.rows.length) return res.status(404).json({ error: 'Escrow not found' });
-    if (preCheck.rows[0].client_id !== req.userId) return res.status(403).json({ error: 'Not your escrow' });
+    if (normalizeId(preCheck.rows[0].client_id) !== normalizeId(req.userId)) return res.status(403).json({ error: 'Not your escrow' });
     const pmtCheck = await query('SELECT id, amount FROM payments WHERE payment_id = $1 AND status = $2 LIMIT 1', [payment_id, 'completed']);
     if (!pmtCheck.rows.length) return res.status(402).json({ error: 'Payment not verified — complete Pi payment first' });
     let escrow;
@@ -814,7 +816,7 @@ router.post('/api/escrows/:id/dispute', auth, checkBlocked, async (req, res) => 
     const result = await query('SELECT * FROM escrows WHERE id = $1', [req.params.id]);
     if (!result.rows.length) return res.status(404).json({ error: 'Escrow not found' });
     const escrow = result.rows[0];
-    if (escrow.client_id !== req.userId && escrow.freelancer_id !== req.userId) {
+    if (normalizeId(escrow.client_id) !== normalizeId(req.userId) && normalizeId(escrow.freelancer_id) !== normalizeId(req.userId)) {
       return res.status(403).json({ error: 'Not your escrow' });
     }
     if (escrow.status !== 'funded') {
@@ -822,7 +824,7 @@ router.post('/api/escrows/:id/dispute', auth, checkBlocked, async (req, res) => 
     }
     await query('UPDATE escrows SET status = $1, updated_at = NOW() WHERE id = $2', ['disputed', req.params.id]);
     await audit('escrow_disputed', { escrow_id: req.params.id, reason, user_id: req.userId });
-    const otherParty = req.userId === escrow.client_id ? escrow.freelancer_id : escrow.client_id;
+    const otherParty = normalizeId(req.userId) === normalizeId(escrow.client_id) ? escrow.freelancer_id : escrow.client_id;
     await notify(otherParty, 'dispute', 'Открыт спор по задаче',
       reason || 'Одна из сторон открыла спор. Пожалуйста, свяжитесь с поддержкой.', escrow.job_id, null);
     res.json({ escrow: { ...escrow, status: 'disputed' }, success: true });
@@ -888,7 +890,7 @@ router.post('/api/offers', auth, checkBlocked, async (req, res) => {
     const jobRes = await query('SELECT * FROM jobs WHERE id = $1', [job_id]);
     if (!jobRes.rows.length) return res.status(404).json({ error: 'Job not found' });
     const job = jobRes.rows[0];
-    if (job.posted_by !== req.userId) return res.status(403).json({ error: 'Not your job' });
+    if (normalizeId(job.posted_by) !== normalizeId(req.userId)) return res.status(403).json({ error: 'Not your job' });
     if (job.status !== 'open') return res.status(400).json({ error: 'Can only send offers for open jobs' });
     if (to_user_id === req.userId) return res.status(400).json({ error: 'Cannot send offer to yourself' });
     const freelancerRes = await query('SELECT id, username FROM users WHERE id = $1', [to_user_id]);

@@ -57,6 +57,9 @@ if (NODE_ENV === 'production') {
 const ADMIN_API_KEY = process.env.ADMIN_API_KEY || 'admin-secret-key';
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://cherry19899.github.io';
 
+// ─── Helpers ─────────────────────────────────────────────────
+const normalizeId = (id) => (id || '').toString().toLowerCase().replace(/^pi_/, '');
+
 // ─── Core middleware ──────────────────────────────────────────────
 app.use(compression());
 app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
