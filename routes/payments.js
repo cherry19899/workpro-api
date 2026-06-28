@@ -218,9 +218,7 @@ async function handleGetEscrow(req, res) {
   try {
     const [result, totalRes] = await Promise.all([
       query(
-        `SELECT e.*, j.title AS job_title,
-                REGEXP_REPLACE(e.client_id, '^pi_', '') AS client_id_norm,
-                REGEXP_REPLACE(e.freelancer_id, '^pi_', '') AS freelancer_id_norm
+        `SELECT e.*, j.title AS job_title
          FROM escrows e
          LEFT JOIN jobs j ON j.id = e.job_id
          WHERE e.client_id = ANY($1) OR e.freelancer_id = ANY($1)
@@ -232,13 +230,7 @@ async function handleGetEscrow(req, res) {
         [[uid, uidAlt]]
       ),
     ]);
-    // Return client_id/freelancer_id without pi_ prefix so bundle comparison works
-    const escrows = result.rows.map(e => ({
-      ...e,
-      client_id: e.client_id_norm || normalizeId(e.client_id),
-      freelancer_id: e.freelancer_id_norm || normalizeId(e.freelancer_id),
-    }));
-    res.json({ escrows, total: parseInt(totalRes.rows[0].count), limit, offset });
+    res.json({ escrows: result.rows, total: parseInt(totalRes.rows[0].count), limit, offset });
   } catch (err) { serverError(err, res); }
 }
 
@@ -674,8 +666,7 @@ router.get(['/api/escrow/:id', '/api/escrows/:id'], auth, async (req, res) => {
          ORDER BY e.created_at DESC LIMIT $2 OFFSET $3`,
         [[uid, uidAlt], limit, offset]
       );
-      const escrows = result.rows.map(e => ({ ...e, client_id: normalizeId(e.client_id), freelancer_id: normalizeId(e.freelancer_id) }));
-      return res.json({ escrows, limit, offset });
+      return res.json({ escrows: result.rows, limit, offset });
     } catch (err) { return serverError(err, res); }
   }
   if (isNaN(parseInt(id))) return res.status(404).json({ error: 'Escrow not found' });
@@ -687,7 +678,7 @@ router.get(['/api/escrow/:id', '/api/escrows/:id'], auth, async (req, res) => {
     );
     if (!result.rows.length) return res.status(404).json({ error: 'Escrow not found' });
     const e = result.rows[0];
-    res.json({ escrow: { ...e, client_id: normalizeId(e.client_id), freelancer_id: normalizeId(e.freelancer_id) } });
+    res.json({ escrow: e });
   } catch (err) { serverError(err, res); }
 });
 
