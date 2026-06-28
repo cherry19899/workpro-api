@@ -654,9 +654,12 @@ router.get('/api/jobs/:id/applications', auth, async (req, res) => {
   const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 100, 500));
   const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
-    const jobResult = await query('SELECT posted_by FROM jobs WHERE id = $1', [req.params.id]);
+    const jobResult = await query('SELECT j.posted_by, j.posted_by_name, u.username FROM jobs j LEFT JOIN users u ON u.id = $1 WHERE j.id = $2', [req.userId, req.params.id]);
     if (!jobResult.rows.length) return res.status(404).json({ error: 'Job not found' });
-    if (normalizeId(jobResult.rows[0].posted_by) !== normalizeId(req.userId)) return res.status(403).json({ error: 'Forbidden' });
+    const { posted_by, posted_by_name, username: callerUsername } = jobResult.rows[0];
+    const isOwner = normalizeId(posted_by) === normalizeId(req.userId)
+      || (posted_by_name && callerUsername && posted_by_name.toLowerCase() === callerUsername.toLowerCase());
+    if (!isOwner) return res.status(403).json({ error: 'Forbidden' });
     const [result, totalRes] = await Promise.all([
       query('SELECT * FROM applications WHERE job_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3', [req.params.id, limit, offset]),
       query('SELECT COUNT(*) FROM applications WHERE job_id = $1', [req.params.id]),
