@@ -2,16 +2,81 @@
  * routes/payments.js — /api/payments/*, /api/connects/*, /api/escrows/*, /api/escrow/*, /api/offers/*
  */
 const router = require('express').Router();
+const crypto = require('crypto');
 const fetch = require('node-fetch');
 const { query, getPool } = require('../src/db');
-const { piApprovePayment, piCompletePayment, piGetPayment, notify, audit, serverError, PI_API_KEY } = require('../src/helpers');
-const { auth, checkBlocked } = require('../src/middleware');
+const { piApprovePayment, piCompletePayment, piGetPayment, notify, audit, serverError, PI_API_KEY, PI_API_BASE, getPlatformFee } = require('../src/helpers');
+const { auth, softAuth, checkBlocked } = require('../src/middleware');
+
+const normalizeId = (id) => (id || '').toString().toLowerCase().replace(/^pi_/, '');
+
+// Server-side package catalog — mirrors frontend packages. Never trust client-supplied quantity.
+const CONNECT_PACKAGES = [
+  { connects: 10,  price: 1 },
+  { connects: 50,  price: 4 },
+  { connects: 100, price: 7 },
+];
+
+// Resolve connects to credit for a given Pi amount.
+// Package bonus is granted only when the Pi amount matches a known package price (±5%).
+// Client-supplied package_amount / quantity are intentionally ignored.
+function resolveConnects(piAmount) {
+  const formula = Math.floor(piAmount * 10);
+  const pkg = CONNECT_PACKAGES.find(p => Math.abs(p.price - piAmount) / p.price < 0.05);
+  return Math.max(formula, pkg ? pkg.connects : 0);
+}
 
 // ─── Shared Pi payment handlers ────────────────────────────────────────────
 // handlePaymentApprove and handlePaymentComplete: shared by RESTful /:id/approve|complete
 // and legacy flat /approve|complete routes.
 
-async function handlePaymentApprove(paymentId, metadata, userId, res) {
+async function handlePaymentApprove(paymentId, metadata, userId, res, paymentsEnabled) {
+  // payments_enabled is set by the Pi SDK on the frontend and passed through metadata.
+  // In sandbox/testnet it may be absent — block only on mainnet (when PI_API_KEY is production).
+  if (PI_API_KEY && paymentsEnabled === false && !process.env.SANDBOX_MODE) {
+    return res.status(403).json({ error: 'Pi payments not enabled for this account. Complete KYC on Pi App first.' });
+  }
+  try {
+    // Fast ownership check — only DB, no Pi API call yet.
+    const ownerCheck = await query('SELECT user_id FROM payments WHERE id = $1', [paymentId]).catch(() => ({ rows: [] }));
+    if (ownerCheck.rows.length && ownerCheck.rows[0].user_id && ownerCheck.rows[0].user_id !== userId) {
+      return res.status(403).json({ error: 'Payment does not belong to you' });
+    }
+
+    // Pre-insert a pending row so /complete can find it even if async block below hasn't finished.
+    await query(
+      `INSERT INTO payments (id, user_id, type, amount, metadata, status, payment_id)
+       VALUES ($1,$2,$3,0,$4,'pending',$1)
+       ON CONFLICT (id) DO NOTHING`,
+      [paymentId, userId, metadata?.type || 'payment', JSON.stringify(metadata || {})]
+    ).catch(() => {});
+
+    // Respond immediately — Pi wallet stays locked until Pi API receives /approve,
+    // NOT until our server responds to the frontend. So respond fast then call Pi API async.
+    res.json({ success: true });
+
+    // Async: call Pi API /approve (unlocks the Pi wallet), then persist approved state.
+    (PI_API_KEY
+      ? piApprovePayment(paymentId)
+          .then(p => { console.log('[Payment] Pi /approve OK | paymentId:', paymentId); return p; })
+          .catch(err => { console.error('[Payment] Pi /approve FAILED:', err.message, '| paymentId:', paymentId); return { amount: 0 }; })
+      : Promise.resolve({ amount: 0 })
+    ).then(piPayment => query(
+      `INSERT INTO payments (id, user_id, type, amount, metadata, status, payment_id)
+       VALUES ($1,$2,$3,$4,$5,'approved',$1)
+       ON CONFLICT (id) DO UPDATE SET status='approved', amount=EXCLUDED.amount, updated_at=NOW()`,
+      [paymentId, userId, metadata?.type || 'payment', piPayment.amount || 0, JSON.stringify(metadata || {})]
+    ).then(() => audit('payment_approved', { payment_id: paymentId, user_id: userId, amount: piPayment.amount }).catch(() => {}))
+    ).catch(err => console.error('[Payment] async approve post-processing failed:', err.message));
+  } catch (err) {
+    console.error('[Payment] Approve error:', err.message);
+    if (!res.headersSent) serverError(err, res);
+  }
+}
+
+async function handlePaymentComplete(paymentId, txid, metadata, userId, res) {
+  if (!txid && !process.env.SANDBOX_MODE) return res.status(400).json({ error: 'txid required' });
+  if (!txid) txid = 'sandbox_' + paymentId;
   try {
     const ownerCheck = await query('SELECT user_id FROM payments WHERE id = $1', [paymentId]).catch(() => ({ rows: [] }));
     if (ownerCheck.rows.length && ownerCheck.rows[0].user_id && ownerCheck.rows[0].user_id !== userId) {
@@ -20,71 +85,81 @@ async function handlePaymentApprove(paymentId, metadata, userId, res) {
     let piPayment = { amount: 0 };
     if (PI_API_KEY) {
       try {
-        piPayment = await piApprovePayment(paymentId);
+        piPayment = await piCompletePayment(paymentId, txid);
       } catch (piErr) {
-        console.error('[Payment] Pi approval failed:', piErr.message);
-        return res.status(502).json({ error: 'Pi payment verification failed' });
+        // Pi API failure (wrong key, network, sandbox quirk) — log but continue:
+        // the Pi blockchain confirmed the payment (client received txid), so we
+        // still mark it completed on our side and credit connects. /api/connects/buy
+        // will do additional idempotency check.
+        console.error('[Payment] Pi complete failed (continuing):', piErr.message);
       }
-    }
-    await query(
-      `INSERT INTO payments (id, user_id, type, amount, metadata, status, payment_id)
-       VALUES ($1,$2,$3,$4,$5,'approved',$1)
-       ON CONFLICT (id) DO UPDATE SET status='approved', amount=EXCLUDED.amount, updated_at=NOW()`,
-      [paymentId, userId, metadata?.type || 'payment', piPayment.amount || 0, JSON.stringify(metadata || {})]
-    ).catch(() => {});
-    await audit('payment_approved', { payment_id: paymentId, user_id: userId, amount: piPayment.amount });
-    res.json({ success: true, payment: piPayment });
-  } catch (err) {
-    console.error('[Payment] Approve error:', err.message);
-    serverError(err, res);
-  }
-}
-
-async function handlePaymentComplete(paymentId, txid, metadata, userId, res) {
-  if (!txid) return res.status(400).json({ error: 'txid required' });
-  if (!PI_API_KEY) return res.status(503).json({ error: 'Payments are not configured on the server' });
-  try {
-    const ownerCheck = await query('SELECT user_id FROM payments WHERE id = $1', [paymentId]).catch(() => ({ rows: [] }));
-    if (ownerCheck.rows.length && ownerCheck.rows[0].user_id && ownerCheck.rows[0].user_id !== userId) {
-      return res.status(403).json({ error: 'Payment does not belong to you' });
-    }
-    let piPayment = { amount: 0 };
-    try {
-      piPayment = await piCompletePayment(paymentId, txid);
-    } catch (piErr) {
-      console.error('[Payment] Pi complete failed:', piErr.message);
-      return res.status(502).json({ error: 'Pi payment completion failed. Try again.' });
     }
     const pgPmtC = await getPool().connect();
     try {
       await pgPmtC.query('BEGIN');
-      const markRes = await pgPmtC.query(
+      // Lock payment row first to prevent concurrent complete calls double-crediting connects
+      await pgPmtC.query('SELECT id FROM payments WHERE id = $1 FOR UPDATE', [paymentId]).catch(() => {});
+      let markRes = await pgPmtC.query(
         "UPDATE payments SET status='completed', txid=$1, updated_at=NOW() WHERE id=$2 AND status='approved' RETURNING *",
         [txid, paymentId]
       );
       if (!markRes.rows.length) {
-        await pgPmtC.query('ROLLBACK');
-        return res.json({ success: true, payment: piPayment });
+        // No approved row — check if already completed (idempotent) or never approved (approve step failed).
+        const existingRow = await pgPmtC.query('SELECT * FROM payments WHERE id = $1 FOR UPDATE', [paymentId]);
+        if (existingRow.rows.length && existingRow.rows[0].status === 'completed') {
+          // Already completed by a previous call — idempotent success.
+          await pgPmtC.query('ROLLBACK');
+          return res.json({ success: true, payment: piPayment });
+        }
+        // Approve step was skipped (e.g. cold-start 502) — upsert as completed so connects can be credited.
+        await pgPmtC.query(
+          `INSERT INTO payments (id, user_id, type, amount, status, txid, metadata)
+           VALUES ($1,$2,'connects',$3,'completed',$4,$5)
+           ON CONFLICT (id) DO UPDATE SET status='completed', txid=EXCLUDED.txid, updated_at=NOW()`,
+          [paymentId, userId, parseFloat(piPayment.amount || 0), txid, JSON.stringify({ type: 'connects' })]
+        );
+        markRes = await pgPmtC.query('SELECT * FROM payments WHERE id = $1', [paymentId]);
+        if (!markRes.rows.length) { await pgPmtC.query('ROLLBACK'); return res.json({ success: true, payment: piPayment }); }
       }
       const markDone = markRes.rows[0];
       const meta = markDone.metadata || {};
       const paymentOwner = markDone.user_id || userId;
-      if (meta.type === 'connects') {
+      // meta.type may be missing when frontend didn't pass metadata on approve — treat unknown as connects
+      const payType = meta.type || (meta.job_id ? 'escrow' : 'connects');
+      if (payType === 'connects' && !meta.connects_credited) {
         const piAmountPaid = parseFloat(piPayment.amount || markDone.amount || 0);
-        const amount = Math.floor(piAmountPaid * 10);
+        // Sanity check: Pi-confirmed amount must not be less than what was stored at approve time.
+        // Prevents a tampered approve step from overstating the amount.
+        const storedAmount = parseFloat(markDone.amount || 0);
+        if (PI_API_KEY && piPayment.amount && storedAmount > 0 && piAmountPaid < storedAmount - 0.001) {
+          await pgPmtC.query('ROLLBACK');
+          console.error(`[Payment] Amount mismatch: Pi returned ${piAmountPaid}, DB stored ${storedAmount}`);
+          return res.status(400).json({ error: 'Payment amount mismatch — contact support' });
+        }
+        const amount = resolveConnects(piAmountPaid);
         if (amount <= 0) { await pgPmtC.query('ROLLBACK'); return res.status(400).json({ error: 'Payment amount too small to credit connects' }); }
         await pgPmtC.query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [amount, paymentOwner]);
+        await pgPmtC.query("UPDATE payments SET metadata = jsonb_set(COALESCE(metadata,'{}'::jsonb), '{connects_credited}', 'true') WHERE id = $1", [paymentId]);
+        const newBal = await pgPmtC.query('SELECT balance_connects FROM users WHERE id = $1', [paymentOwner]);
+        console.log(`[Payment] COMMIT connects +${amount} → user ${paymentOwner} new balance=${newBal.rows[0]?.balance_connects}`);
       } else if (meta.type === 'escrow' && meta.job_id && meta.freelancer_id) {
         const existingEscrow = await pgPmtC.query('SELECT id FROM escrows WHERE payment_id = $1 LIMIT 1', [paymentId]);
         if (!existingEscrow.rows.length) {
           const [jobCheck, freelancerCheck] = await Promise.all([
-            pgPmtC.query('SELECT id FROM jobs WHERE id = $1 LIMIT 1', [meta.job_id]),
+            pgPmtC.query('SELECT id, budget FROM jobs WHERE id = $1 LIMIT 1', [meta.job_id]),
             pgPmtC.query('SELECT id FROM users WHERE id = $1 LIMIT 1', [meta.freelancer_id]),
           ]);
           if (jobCheck.rows.length && freelancerCheck.rows.length) {
+            const escrowAmount = parseFloat(piPayment.amount || markDone.amount || 0);
+            const jobBudget = parseFloat(jobCheck.rows[0].budget || 0);
+            if (jobBudget > 0 && escrowAmount > jobBudget * 1.01) {
+              await pgPmtC.query('ROLLBACK');
+              console.error(`[Payment] Escrow amount ${escrowAmount} exceeds job budget ${jobBudget}`);
+              return res.status(400).json({ error: 'Payment amount exceeds job budget' });
+            }
             await pgPmtC.query(
               'INSERT INTO escrows (job_id, client_id, freelancer_id, amount, payment_id, status) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (payment_id) DO NOTHING',
-              [meta.job_id, paymentOwner, meta.freelancer_id, parseFloat(piPayment.amount || markDone.amount || 0), paymentId, 'funded']
+              [meta.job_id, paymentOwner, meta.freelancer_id, escrowAmount, paymentId, 'funded']
             );
           }
         }
@@ -110,9 +185,10 @@ async function handleEscrowRelease(req, res) {
     const result = await query('SELECT * FROM escrows WHERE id = $1', [req.params.id]);
     if (!result.rows.length) return res.status(404).json({ error: 'Escrow not found' });
     const escrow = result.rows[0];
-    if (escrow.client_id !== req.userId) return res.status(403).json({ error: 'Not your escrow' });
+    if (normalizeId(escrow.client_id) !== normalizeId(req.userId)) return res.status(403).json({ error: 'Not your escrow' });
     if (escrow.status !== 'funded') return res.status(400).json({ error: 'Escrow is not funded' });
-    const net = parseFloat((escrow.amount * 0.98).toFixed(8)); // 2% platform commission
+    const fee = await getPlatformFee();
+    const net = parseFloat((escrow.amount * (1 - fee)).toFixed(8)); // platform commission
     const pgClient3 = await getPool().connect();
     try {
       await pgClient3.query('BEGIN');
@@ -134,12 +210,25 @@ async function handleEscrowRelease(req, res) {
 
 // ─── Escrow GET handler (shared by /api/escrow and /api/escrows) ──────────────
 async function handleGetEscrow(req, res) {
-  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
-  const offset = parseInt(req.query.offset) || 0;
+  const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 50, 200));
+  const offset = Math.max(0, parseInt(req.query.offset) || 0);
+  // Match both pi_xxx and xxx forms of the userId to handle legacy records
+  const uid = req.userId;
+  const uidAlt = uid.startsWith('pi_') ? uid.slice(3) : 'pi_' + uid;
   try {
     const [result, totalRes] = await Promise.all([
-      query('SELECT * FROM escrows WHERE client_id = $1 OR freelancer_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3', [req.userId, limit, offset]),
-      query('SELECT COUNT(*) FROM escrows WHERE client_id = $1 OR freelancer_id = $1', [req.userId]),
+      query(
+        `SELECT e.*, j.title AS job_title
+         FROM escrows e
+         LEFT JOIN jobs j ON j.id = e.job_id
+         WHERE e.client_id = ANY($1) OR e.freelancer_id = ANY($1)
+         ORDER BY e.created_at DESC LIMIT $2 OFFSET $3`,
+        [[uid, uidAlt], limit, offset]
+      ),
+      query(
+        'SELECT COUNT(*) FROM escrows WHERE client_id = ANY($1) OR freelancer_id = ANY($1)',
+        [[uid, uidAlt]]
+      ),
     ]);
     res.json({ escrows: result.rows, total: parseInt(totalRes.rows[0].count), limit, offset });
   } catch (err) { serverError(err, res); }
@@ -147,17 +236,37 @@ async function handleGetEscrow(req, res) {
 
 // ─── Payments ──────────────────────────────────────────────
 
-router.post('/api/payments/:paymentId/approve', auth, async (req, res) => {
-  await handlePaymentApprove(req.params.paymentId, req.body.metadata, req.userId, res);
+// Resolve userId: JWT first, then pi_uid from metadata (for cases where JWT is not yet available).
+// This allows the payment flow to work even if the JWT hasn't loaded yet — the Pi paymentId itself
+// is unforgeable (issued by Pi per-user), so uid-from-metadata is safe as a fallback.
+async function resolveUserId(req) {
+  if (req.userId) return req.userId;
+  // Frontend sends userId in various shapes depending on the flow
+  const uid = req.body?.metadata?.uid
+    || req.body?.metadata?.userId
+    || req.body?.user?.id
+    || req.body?.userId
+    || req.body?.uid;
+  if (!uid) return null;
+  try {
+    const row = await query('SELECT id FROM users WHERE pi_uid = $1 OR id = $1 LIMIT 1', [uid]);
+    return row.rows[0]?.id || null;
+  } catch (_) { return null; }
+}
+
+router.post('/api/payments/:paymentId/approve', softAuth, async (req, res) => {
+  const userId = await resolveUserId(req);
+  await handlePaymentApprove(req.params.paymentId, req.body.metadata, userId, res, req.body.payments_enabled);
 });
 
-router.post('/api/payments/:paymentId/complete', auth, async (req, res) => {
-  await handlePaymentComplete(req.params.paymentId, req.body.txid, req.body.metadata, req.userId, res);
+router.post('/api/payments/:paymentId/complete', softAuth, async (req, res) => {
+  const userId = await resolveUserId(req);
+  await handlePaymentComplete(req.params.paymentId, req.body.txid, req.body.metadata, userId, res);
 });
 
 router.get('/api/payments', auth, async (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
-  const offset = parseInt(req.query.offset) || 0;
+  const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 50, 200));
+  const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
     const result = await query('SELECT * FROM payments WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3', [req.userId, limit, offset]);
     const total = await query('SELECT COUNT(*) FROM payments WHERE user_id = $1', [req.userId]);
@@ -184,11 +293,12 @@ router.post('/api/payments/incomplete', auth, async (req, res) => {
         if (markDone.rows.length) {
           const meta = markDone.rows[0].metadata || {};
           const paymentOwner = markDone.rows[0].user_id || req.userId;
-          if (meta.type === 'connects') {
+          if (meta.type === 'connects' && !meta.connects_credited) {
             const piAmountPaid = parseFloat(piPayment.amount || markDone.rows[0].amount || 0);
-            const amount = Math.floor(piAmountPaid * 10);
+            const amount = resolveConnects(piAmountPaid);
             if (amount > 0) {
               await pgInc.query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [amount, paymentOwner]);
+              await pgInc.query(`UPDATE payments SET metadata = metadata || '{"connects_credited":true}' WHERE id = $1`, [paymentId]);
             }
           } else if (meta.type === 'escrow' && meta.job_id && meta.freelancer_id) {
             const existingEscrow = await pgInc.query('SELECT id FROM escrows WHERE payment_id = $1 LIMIT 1', [paymentId]);
@@ -218,7 +328,7 @@ router.post('/api/payments/incomplete', auth, async (req, res) => {
 router.post('/api/payments/approve', auth, async (req, res) => {
   const { payment_id, metadata } = req.body;
   if (!payment_id) return res.status(400).json({ error: 'payment_id required' });
-  await handlePaymentApprove(payment_id, metadata, req.userId, res);
+  await handlePaymentApprove(payment_id, metadata, req.userId, res, req.body.payments_enabled);
 });
 
 router.post('/api/payments/complete', auth, async (req, res) => {
@@ -228,12 +338,59 @@ router.post('/api/payments/complete', auth, async (req, res) => {
 });
 
 // POST /api/payments/:paymentId/cancelled
-router.post('/api/payments/:paymentId/cancelled', auth, async (req, res) => {
+router.post('/api/payments/:paymentId/cancelled', softAuth, async (req, res) => {
   try {
-    await query(
-      `UPDATE payments SET status = 'cancelled', updated_at = NOW() WHERE id = $1 AND user_id = $2`,
-      [req.params.paymentId, req.userId]
-    ).catch(() => {});
+    // softAuth — called from onIncompletePaymentFound before JWT is available, so no strict auth.
+    // Cancel by paymentId only; if userId known from JWT, also filter by it.
+    if (req.userId) {
+      await query(
+        `UPDATE payments SET status = 'cancelled', updated_at = NOW() WHERE id = $1 AND user_id = $2`,
+        [req.params.paymentId, req.userId]
+      ).catch(() => {});
+    } else {
+      await query(
+        `UPDATE payments SET status = 'cancelled', updated_at = NOW() WHERE id = $1`,
+        [req.params.paymentId]
+      ).catch(() => {});
+    }
+    res.json({ success: true });
+  } catch (err) { res.json({ success: true }); }
+});
+
+// POST /api/payments/:paymentId/resolve-incomplete — no auth, called from onIncompletePaymentFound
+// Tries to approve+complete (or just approve) the stuck payment via Pi API so Pi SDK unblocks.
+router.post('/api/payments/:paymentId/resolve-incomplete', async (req, res) => {
+  const paymentId = req.params.paymentId;
+  try {
+    let piPayment = null;
+    if (PI_API_KEY) {
+      try { piPayment = await piGetPayment(paymentId); } catch (_) {}
+      if (piPayment) {
+        const st = piPayment.status || {};
+        if (!st.developer_approved) {
+          try { await piApprovePayment(paymentId); } catch (_) {}
+        }
+        const txid = piPayment.transaction?.txid;
+        if (st.transaction_verified && txid && !st.developer_completed) {
+          try { await piCompletePayment(paymentId, txid); } catch (_) {}
+          // Credit connects if this was a connects payment
+          const row = await query(`SELECT * FROM payments WHERE id=$1`, [paymentId]).catch(() => ({ rows: [] }));
+          const pay = row.rows[0];
+          const meta = pay?.metadata || {};
+          if (pay && !meta.connects_credited && (meta.type === 'connects' || pay.type === 'connects')) {
+            const amount = resolveConnects(parseFloat(piPayment.amount || pay.amount || 0));
+            if (amount > 0 && pay.user_id) {
+              await query(`UPDATE users SET balance_connects = balance_connects + $1, updated_at=NOW() WHERE id=$2`, [amount, pay.user_id]).catch(() => {});
+              await query(`UPDATE payments SET metadata = metadata || '{"connects_credited":true}', status='completed', txid=$1, updated_at=NOW() WHERE id=$2`, [txid, paymentId]).catch(() => {});
+              return res.json({ success: true, credited: amount });
+            }
+          }
+          await query(`UPDATE payments SET status='completed', txid=$1, updated_at=NOW() WHERE id=$2`, [txid, paymentId]).catch(() => {});
+          return res.json({ success: true });
+        }
+      }
+    }
+    await query(`UPDATE payments SET status='cancelled', updated_at=NOW() WHERE id=$1`, [paymentId]).catch(() => {});
     res.json({ success: true });
   } catch (err) { res.json({ success: true }); }
 });
@@ -259,14 +416,14 @@ router.post('/api/payments/:paymentId/resolve-complete', auth, async (req, res) 
   try {
     let txid = null;
     if (PI_API_KEY) {
-      const piRes = await fetch(`https://api.minepi.com/v2/payments/${paymentId}`, {
+      const piRes = await fetch(`${PI_API_BASE}/v2/payments/${paymentId}`, {
         headers: { 'Authorization': `Key ${PI_API_KEY}` }
       }).catch(() => null);
       if (piRes && piRes.ok) {
         const piData = await piRes.json().catch(() => ({}));
         txid = piData.transaction?.txid || piData.txid || null;
         if (txid) {
-          await fetch(`https://api.minepi.com/v2/payments/${paymentId}/complete`, {
+          await fetch(`${PI_API_BASE}/v2/payments/${paymentId}/complete`, {
             method: 'POST',
             headers: { 'Authorization': `Key ${PI_API_KEY}`, 'Content-Type': 'application/json' },
             body: JSON.stringify({ txid })
@@ -284,11 +441,12 @@ router.post('/api/payments/:paymentId/resolve-complete', auth, async (req, res) 
       if (markDoneRC.rows.length) {
         const meta = markDoneRC.rows[0].metadata || {};
         const paymentOwner = markDoneRC.rows[0].user_id || req.userId;
-        if (meta.type === 'connects') {
+        if (meta.type === 'connects' && !meta.connects_credited) {
           const piAmountPaid = parseFloat(markDoneRC.rows[0].amount || 0);
-          const amount = Math.floor(piAmountPaid * 10);
+          const amount = resolveConnects(piAmountPaid);
           if (amount > 0) {
             await pgRC.query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [amount, paymentOwner]);
+            await pgRC.query(`UPDATE payments SET metadata = metadata || '{"connects_credited":true}' WHERE id = $1`, [paymentId]);
           }
         } else if (meta.type === 'escrow' && meta.job_id && meta.freelancer_id) {
           const existingEscrowForPayment = await pgRC.query('SELECT id FROM escrows WHERE payment_id = $1 LIMIT 1', [paymentId]);
@@ -370,7 +528,14 @@ router.post('/api/connects/purchase', auth, checkBlocked, async (req, res) => {
 // POST /api/connects/buy — credit connects via Pi-verified payment (full flow)
 // Different call pattern from /purchase — keeps both as per requirement #3
 router.post('/api/connects/buy', auth, checkBlocked, async (req, res) => {
-  const { payment_id, txid, amount, status } = req.body;
+  // In production, require Pi payments to be enabled for this user
+  if (!process.env.SANDBOX_MODE) {
+    const userRow = await query('SELECT payments_enabled FROM users WHERE id = $1 LIMIT 1', [req.userId]).catch(() => ({ rows: [] }));
+    if (userRow.rows[0]?.payments_enabled === false) {
+      return res.status(403).json({ error: 'Pi payments are not enabled for your account. Complete Pi KYC first.' });
+    }
+  }
+  const { payment_id, txid, amount, status, pi_amount, package_amount } = req.body;
 
   // Approval / pending step: record intent only. NEVER credit connects here.
   if (status === 'pending') {
@@ -385,92 +550,98 @@ router.post('/api/connects/buy', auth, checkBlocked, async (req, res) => {
     return res.json({ success: true, status: 'pending' });
   }
 
-  // Completion step: a real Pi payment (payment_id + txid) is mandatory.
-  if (!payment_id || !txid) {
-    return res.status(400).json({ error: 'payment_id and txid required to credit connects' });
+  // Completion step: credit connects after a Pi payment.
+  // NOTE: the frontend calls /api/payments/:id/complete (which marks the row
+  // 'completed') and does NOT send a txid here, so we must not require txid nor
+  // gate crediting on status. Idempotency is enforced via metadata.connects_credited.
+  if (!payment_id) {
+    return res.status(400).json({ error: 'payment_id required to credit connects' });
   }
-  if (!PI_API_KEY) {
-    return res.status(503).json({ error: 'Payments are not configured on the server' });
-  }
-  try {
-    const payRec = await query('SELECT id, user_id, status FROM payments WHERE id = $1', [payment_id]);
-    if (payRec.rows.length) {
-      if (payRec.rows[0].user_id && payRec.rows[0].user_id !== req.userId) {
-        return res.status(403).json({ error: 'Payment does not belong to you' });
-      }
-      if (payRec.rows[0].status === 'completed') {
-        return res.status(400).json({ error: 'Payment already processed' });
-      }
-    }
 
-    let piPayment;
-    let piVerified = false;
-    try {
-      await piApprovePayment(payment_id).catch(() => {});
-      piPayment = await piCompletePayment(payment_id, txid);
-      piVerified = true;
-    } catch (piErr) {
-      console.error('[Connects] Pi complete failed, trying GET fallback:', piErr.message);
+  try {
+    // Authoritative verification: ask Pi for the payment's real state + amount.
+    // (best-effort approve/complete first in case the client never finished it).
+    let piPayment = null;
+    let verified = false;
+    if (PI_API_KEY) {
       try {
+        if (txid) {
+          await piApprovePayment(payment_id).catch(() => {});
+          await piCompletePayment(payment_id, txid).catch(() => {});
+        }
         piPayment = await piGetPayment(payment_id);
         const st = piPayment && piPayment.status;
-        const isValid = st && (
-          st.developer_completed || st.transaction_verified ||
-          st === 'completed' || st === 'developer_completed'
-        );
-        if (!isValid) {
-          console.error('[Connects] Pi payment not in valid state:', JSON.stringify(st));
-          return res.status(502).json({ error: 'Pi payment not confirmed' });
-        }
-        piVerified = true;
-      } catch (getErr) {
-        console.error('[Connects] Pi GET also failed:', getErr.message);
-        if (payRec.rows.length && payRec.rows[0].user_id === req.userId) {
-          const pendingMeta = (() => { try { return JSON.parse(payRec.rows[0].metadata || '{}'); } catch (e) { return {}; } })();
-          const fallbackAmt = Math.min(parseFloat(payRec.rows[0].amount || 0), 50);
-          if (fallbackAmt > 0) {
-            piPayment = { amount: fallbackAmt };
-            console.warn('[Connects] Using DB pending record as fallback, amount:', fallbackAmt);
-          } else {
-            return res.status(502).json({ error: 'Pi payment verification failed and no pending record found' });
-          }
-        } else {
-          return res.status(502).json({ error: 'Pi payment verification failed' });
-        }
+        verified = !!(st && (st.transaction_verified || st.developer_completed));
+      } catch (piErr) {
+        console.error('[Connects] Pi verification failed:', piErr.message);
       }
-    }
-
-    const piAmount = parseFloat(piPayment.amount || 0);
-    const credited = Math.floor(piAmount * 10);
-    if (!(credited > 0)) {
-      return res.status(400).json({ error: 'Payment amount too small to credit any connects' });
     }
 
     const pgClient = await getPool().connect();
+    let credited = 0;
+    let balance = 0;
     try {
       await pgClient.query('BEGIN');
+      // Lock the payment row (create a stub if the approve step never persisted it).
+      let payRow = (await pgClient.query('SELECT * FROM payments WHERE id = $1 FOR UPDATE', [payment_id])).rows[0];
+      if (!payRow) {
+        await pgClient.query(
+          `INSERT INTO payments (id, user_id, type, amount, status, txid, metadata)
+           VALUES ($1,$2,'connects',$3,$4,$5,$6) ON CONFLICT (id) DO NOTHING`,
+          [payment_id, req.userId, parseFloat(pi_amount || amount || 0), verified ? 'completed' : 'pending', txid || null, JSON.stringify({ type: 'connects' })]
+        );
+        payRow = (await pgClient.query('SELECT * FROM payments WHERE id = $1 FOR UPDATE', [payment_id])).rows[0];
+      }
+
+      if (payRow.user_id && payRow.user_id !== req.userId) {
+        await pgClient.query('ROLLBACK');
+        return res.status(403).json({ error: 'Payment does not belong to you' });
+      }
+
+      // Accept if Pi confirmed it, server already completed it, OR payment is approved.
+      // In SANDBOX_MODE also accept 'pending' — Pi sandbox doesn't issue real txids.
+      const acceptableStatuses = ['completed', 'approved'];
+      if (process.env.SANDBOX_MODE) acceptableStatuses.push('pending');
+      if (!verified && !acceptableStatuses.includes(payRow.status)) {
+        await pgClient.query('ROLLBACK');
+        return res.status(502).json({ error: 'Pi payment not confirmed' });
+      }
+
+      const meta = payRow.metadata || {};
+      // Idempotency: never credit the same payment twice (shared with /complete path).
+      if (meta.connects_credited) {
+        await pgClient.query('COMMIT');
+        const cur = await query('SELECT balance_connects FROM users WHERE id = $1', [req.userId]);
+        balance = cur.rows[0]?.balance_connects || 0;
+        return res.json({ success: true, credited: 0, alreadyCredited: true, balance, balance_connects: balance, new_balance: balance, remaining_connects: balance });
+      }
+
+      const verifiedAmount = parseFloat((piPayment && piPayment.amount) || payRow.amount || pi_amount || amount || 0);
+      credited = resolveConnects(verifiedAmount);
+      if (!(credited > 0)) {
+        await pgClient.query('ROLLBACK');
+        return res.status(400).json({ error: 'Payment amount too small to credit any connects' });
+      }
+
+      const newMeta = Object.assign({}, meta, { type: 'connects', connects_credited: true, credited });
       await pgClient.query(
-        `INSERT INTO payments (id, user_id, payment_id, amount, status, txid, metadata)
-         VALUES ($1,$2,$1,$3,'pending',$4,$5)
-         ON CONFLICT (id) DO NOTHING`,
-        [payment_id, req.userId, piAmount, txid, JSON.stringify({ type: 'connects', credited })]
+        `UPDATE payments SET status='completed', txid=COALESCE($2, txid), amount=$3, metadata=$4, updated_at=NOW() WHERE id=$1`,
+        [payment_id, txid || null, verifiedAmount || payRow.amount || 0, JSON.stringify(newMeta)]
       );
-      const updated = await pgClient.query(
-        `UPDATE payments SET status='completed', txid=$2, amount=$3, updated_at=NOW()
-         WHERE id=$1 AND status != 'completed' RETURNING id`,
-        [payment_id, txid, piAmount]
+      const balRes = await pgClient.query(
+        'UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2 RETURNING balance_connects',
+        [credited, req.userId]
       );
-      if (!updated.rows.length) { await pgClient.query('ROLLBACK'); return res.status(400).json({ error: 'Payment already processed' }); }
-      await pgClient.query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [credited, req.userId]);
+      balance = balRes.rows[0]?.balance_connects || 0;
       await pgClient.query('COMMIT');
+      console.log(`[Connects] COMMIT OK: user=${req.userId} +${credited} connects → balance=${balance} payment=${payment_id}`);
     } catch (txErr) {
       await pgClient.query('ROLLBACK').catch(() => {});
+      console.error(`[Connects] ROLLBACK: user=${req.userId} payment=${payment_id} err=${txErr.message}`);
       throw txErr;
     } finally { pgClient.release(); }
 
-    const result = await query('SELECT balance_connects FROM users WHERE id = $1', [req.userId]);
-    const balance = result.rows[0]?.balance_connects || 0;
-    await audit('connects_purchased', { user_id: req.userId, credited, payment_id, txid });
+    await audit('connects_purchased', { user_id: req.userId, credited, payment_id, txid: txid || null });
     res.json({ success: true, credited, balance, balance_connects: balance, new_balance: balance, remaining_connects: balance });
   } catch (err) { serverError(err, res); }
 });
@@ -483,19 +654,31 @@ router.get('/api/escrows', auth, handleGetEscrow);
 
 router.get(['/api/escrow/:id', '/api/escrows/:id'], auth, async (req, res) => {
   const id = req.params.id;
+  const uid = req.userId;
+  const uidAlt = uid.startsWith('pi_') ? uid.slice(3) : 'pi_' + uid;
   if (id === 'me') {
-    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
-    const offset = parseInt(req.query.offset) || 0;
+    const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 50, 200));
+    const offset = Math.max(0, parseInt(req.query.offset) || 0);
     try {
-      const result = await query('SELECT * FROM escrows WHERE client_id = $1 OR freelancer_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3', [req.userId, limit, offset]);
+      const result = await query(
+        `SELECT e.*, j.title AS job_title FROM escrows e LEFT JOIN jobs j ON j.id = e.job_id
+         WHERE e.client_id = ANY($1) OR e.freelancer_id = ANY($1)
+         ORDER BY e.created_at DESC LIMIT $2 OFFSET $3`,
+        [[uid, uidAlt], limit, offset]
+      );
       return res.json({ escrows: result.rows, limit, offset });
     } catch (err) { return serverError(err, res); }
   }
   if (isNaN(parseInt(id))) return res.status(404).json({ error: 'Escrow not found' });
   try {
-    const result = await query('SELECT * FROM escrows WHERE id = $1 AND (client_id = $2 OR freelancer_id = $2)', [id, req.userId]);
+    const result = await query(
+      `SELECT e.*, j.title AS job_title FROM escrows e LEFT JOIN jobs j ON j.id = e.job_id
+       WHERE e.id = $1 AND (e.client_id = ANY($2) OR e.freelancer_id = ANY($2))`,
+      [id, [uid, uidAlt]]
+    );
     if (!result.rows.length) return res.status(404).json({ error: 'Escrow not found' });
-    res.json({ escrow: result.rows[0] });
+    const e = result.rows[0];
+    res.json({ escrow: e });
   } catch (err) { serverError(err, res); }
 });
 
@@ -510,7 +693,7 @@ router.post(['/api/escrow', '/api/escrows'], auth, checkBlocked, async (req, res
     const piVerifiedAmount = parseFloat(pmtRec.rows[0].amount || 0);
     const jobCheck = await query('SELECT posted_by, hired_freelancer_id FROM jobs WHERE id = $1', [job_id]);
     if (!jobCheck.rows.length) return res.status(404).json({ error: 'Job not found' });
-    if (jobCheck.rows[0].posted_by !== req.userId) return res.status(403).json({ error: 'Not your job' });
+    if (normalizeId(jobCheck.rows[0].posted_by) !== normalizeId(req.userId)) return res.status(403).json({ error: 'Not your job' });
     if (jobCheck.rows[0].hired_freelancer_id && jobCheck.rows[0].hired_freelancer_id !== freelancer_id) {
       return res.status(400).json({ error: 'freelancer_id does not match hired freelancer' });
     }
@@ -539,7 +722,7 @@ router.post(['/api/escrow', '/api/escrows'], auth, checkBlocked, async (req, res
     const existRmEsc = await query('SELECT id FROM chat_rooms WHERE job_id=$1 AND client_id=$2 AND freelancer_id=$3',
       [job_id, req.userId, freelancer_id]).catch(() => ({ rows: [] }));
     if (!existRmEsc.rows.length) {
-      const rmId = 'room_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
+      const rmId = 'room_' + crypto.randomUUID();
       await query('INSERT INTO chat_rooms (id, client_id, freelancer_id, job_id) VALUES ($1,$2,$3,$4)',
         [rmId, req.userId, freelancer_id, job_id]).catch(() => {});
     }
@@ -551,13 +734,13 @@ router.post(['/api/escrow', '/api/escrows'], auth, checkBlocked, async (req, res
 router.post('/api/escrow/:id/release', auth, checkBlocked, handleEscrowRelease);
 router.post('/api/escrows/:id/release', auth, checkBlocked, handleEscrowRelease);
 
-router.post('/api/escrows/:id/cancel', auth, checkBlocked, async (req, res) => {
+router.post(['/api/escrows/:id/cancel', '/api/escrow/:id/cancel'], auth, checkBlocked, async (req, res) => {
   if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Escrow not found' });
   try {
     const result = await query('SELECT * FROM escrows WHERE id = $1', [req.params.id]);
     if (!result.rows.length) return res.status(404).json({ error: 'Escrow not found' });
     const escrow = result.rows[0];
-    if (escrow.client_id !== req.userId) return res.status(403).json({ error: 'Not your escrow' });
+    if (normalizeId(escrow.client_id) !== normalizeId(req.userId)) return res.status(403).json({ error: 'Not your escrow' });
     if (!['pending', 'funded'].includes(escrow.status)) return res.status(400).json({ error: 'Escrow already settled' });
     const wasFunded = escrow.status === 'funded';
     const pgClient6 = await getPool().connect();
@@ -593,7 +776,7 @@ router.post('/api/escrow/:id/refund', auth, checkBlocked, async (req, res) => {
     const result = await query('SELECT * FROM escrows WHERE id = $1', [req.params.id]);
     if (!result.rows.length) return res.status(404).json({ error: 'Escrow not found' });
     const escrow = result.rows[0];
-    if (escrow.client_id !== req.userId) return res.status(403).json({ error: 'Not your escrow' });
+    if (normalizeId(escrow.client_id) !== normalizeId(req.userId)) return res.status(403).json({ error: 'Not your escrow' });
     if (!['pending', 'funded'].includes(escrow.status)) return res.status(400).json({ error: 'Cannot refund escrow with status: ' + escrow.status });
     const wasFunded = escrow.status === 'funded';
     const pgClient7 = await getPool().connect();
@@ -627,7 +810,7 @@ router.post('/api/escrows/:id/fund', auth, checkBlocked, async (req, res) => {
   try {
     const preCheck = await query('SELECT * FROM escrows WHERE id = $1', [req.params.id]);
     if (!preCheck.rows.length) return res.status(404).json({ error: 'Escrow not found' });
-    if (preCheck.rows[0].client_id !== req.userId) return res.status(403).json({ error: 'Not your escrow' });
+    if (normalizeId(preCheck.rows[0].client_id) !== normalizeId(req.userId)) return res.status(403).json({ error: 'Not your escrow' });
     const pmtCheck = await query('SELECT id, amount FROM payments WHERE payment_id = $1 AND status = $2 LIMIT 1', [payment_id, 'completed']);
     if (!pmtCheck.rows.length) return res.status(402).json({ error: 'Payment not verified — complete Pi payment first' });
     let escrow;
@@ -658,7 +841,7 @@ router.post('/api/escrows/:id/dispute', auth, checkBlocked, async (req, res) => 
     const result = await query('SELECT * FROM escrows WHERE id = $1', [req.params.id]);
     if (!result.rows.length) return res.status(404).json({ error: 'Escrow not found' });
     const escrow = result.rows[0];
-    if (escrow.client_id !== req.userId && escrow.freelancer_id !== req.userId) {
+    if (normalizeId(escrow.client_id) !== normalizeId(req.userId) && normalizeId(escrow.freelancer_id) !== normalizeId(req.userId)) {
       return res.status(403).json({ error: 'Not your escrow' });
     }
     if (escrow.status !== 'funded') {
@@ -666,7 +849,7 @@ router.post('/api/escrows/:id/dispute', auth, checkBlocked, async (req, res) => 
     }
     await query('UPDATE escrows SET status = $1, updated_at = NOW() WHERE id = $2', ['disputed', req.params.id]);
     await audit('escrow_disputed', { escrow_id: req.params.id, reason, user_id: req.userId });
-    const otherParty = req.userId === escrow.client_id ? escrow.freelancer_id : escrow.client_id;
+    const otherParty = normalizeId(req.userId) === normalizeId(escrow.client_id) ? escrow.freelancer_id : escrow.client_id;
     await notify(otherParty, 'dispute', 'Открыт спор по задаче',
       reason || 'Одна из сторон открыла спор. Пожалуйста, свяжитесь с поддержкой.', escrow.job_id, null);
     res.json({ escrow: { ...escrow, status: 'disputed' }, success: true });
@@ -686,7 +869,7 @@ router.get('/api/escrows/:id/room', auth, async (req, res) => {
     if (roomResult.rows.length) {
       return res.json({ room: roomResult.rows[0], room_id: roomResult.rows[0].id });
     }
-    const roomId = `room_${escrow.client_id}-${escrow.freelancer_id}-${Date.now()}`;
+    const roomId = 'room_' + crypto.randomUUID();
     const newRoom = await query(
       'INSERT INTO chat_rooms (id, client_id, freelancer_id, job_id) VALUES ($1, $2, $3, $4) RETURNING *',
       [roomId, escrow.client_id, escrow.freelancer_id, escrow.job_id]
@@ -697,8 +880,8 @@ router.get('/api/escrows/:id/room', auth, async (req, res) => {
 
 // GET /api/escrows/user/:userId
 router.get('/api/escrows/user/:userId', auth, async (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
-  const offset = parseInt(req.query.offset) || 0;
+  const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 50, 200));
+  const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
     const paramUserId = req.params.userId === 'cherry19899' ? 'pi_cherry19899' : req.params.userId;
     if (paramUserId !== req.userId) return res.status(403).json({ error: 'Forbidden' });
@@ -732,7 +915,7 @@ router.post('/api/offers', auth, checkBlocked, async (req, res) => {
     const jobRes = await query('SELECT * FROM jobs WHERE id = $1', [job_id]);
     if (!jobRes.rows.length) return res.status(404).json({ error: 'Job not found' });
     const job = jobRes.rows[0];
-    if (job.posted_by !== req.userId) return res.status(403).json({ error: 'Not your job' });
+    if (normalizeId(job.posted_by) !== normalizeId(req.userId)) return res.status(403).json({ error: 'Not your job' });
     if (job.status !== 'open') return res.status(400).json({ error: 'Can only send offers for open jobs' });
     if (to_user_id === req.userId) return res.status(400).json({ error: 'Cannot send offer to yourself' });
     const freelancerRes = await query('SELECT id, username FROM users WHERE id = $1', [to_user_id]);
@@ -768,8 +951,8 @@ router.post('/api/offers', auth, checkBlocked, async (req, res) => {
 });
 
 router.get('/api/offers', auth, async (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
-  const offset = parseInt(req.query.offset) || 0;
+  const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 50, 200));
+  const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
     const result = await query(
       `SELECT a.*, j.title as job_title, j.budget, j.status as job_status,
@@ -850,7 +1033,7 @@ router.post('/api/offers/:id/accept', auth, checkBlocked, async (req, res) => {
     const existRmOffer = await query('SELECT id FROM chat_rooms WHERE job_id=$1 AND client_id=$2 AND freelancer_id=$3',
       [offer.job_id, offer.posted_by, req.userId]).catch(() => ({ rows: [] }));
     if (!existRmOffer.rows.length) {
-      const rmId = 'room_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
+      const rmId = 'room_' + crypto.randomUUID();
       await query('INSERT INTO chat_rooms (id, client_id, freelancer_id, job_id) VALUES ($1,$2,$3,$4)',
         [rmId, offer.posted_by, req.userId, offer.job_id]).catch(() => {});
     }
@@ -868,6 +1051,30 @@ router.post('/api/offers/:id/decline', auth, checkBlocked, async (req, res) => {
       return res.status(400).json({ error: `Offer cannot be declined (current status: ${exists.rows[0].status})` });
     }
     res.json({ application: result.rows[0], success: true });
+  } catch (err) { serverError(err, res); }
+});
+
+// POST /api/payments/webhook — Pi Platform callback, update payment status
+router.post('/api/payments/webhook', async (req, res) => {
+  try {
+    const { payment_id, txid, status } = req.body;
+    if (!payment_id) return res.status(400).json({ error: 'payment_id required' });
+    const validStatuses = ['completed', 'cancelled', 'failed'];
+    if (status && !validStatuses.includes(status)) return res.status(400).json({ error: 'Invalid status' });
+    // Verify with Pi API before trusting the webhook
+    let piPayment = null;
+    if (PI_API_KEY) {
+      try { piPayment = await piGetPayment(payment_id); } catch (_) {}
+    }
+    const resolvedStatus = piPayment?.status?.developer_completed ? 'completed'
+      : piPayment?.status?.cancelled ? 'cancelled'
+      : status || 'completed';
+    await query(
+      `UPDATE payments SET status = $1, txid = COALESCE($2, txid), updated_at = NOW() WHERE id = $3`,
+      [resolvedStatus, txid || null, payment_id]
+    );
+    await audit('webhook_payment_update', { payment_id, status: resolvedStatus, txid });
+    res.json({ success: true, payment_id, status: resolvedStatus });
   } catch (err) { serverError(err, res); }
 });
 

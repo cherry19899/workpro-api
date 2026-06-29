@@ -2,14 +2,21 @@
  * routes/chat.js — /api/chat/*, /api/push/*
  */
 const router = require('express').Router();
+const crypto = require('crypto');
 const { query } = require('../src/db');
 const { notify, serverError } = require('../src/helpers');
 const { auth, softAuth, checkBlocked, messageLimiter } = require('../src/middleware');
+const multer = require('multer');
+const normalizeId = (id) => (id || '').toString().toLowerCase().replace(/^pi_/, '');
+// memoryStorage — NOT disk: Render's filesystem is ephemeral (wiped on every
+// restart/deploy), so 'uploads/' would lose files. We persist bytes in Postgres
+// (chat_attachments) so attachments survive restarts. 5 MB cap.
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
 
 // GET /api/chat/rooms
 router.get('/api/chat/rooms', auth, async (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
-  const offset = parseInt(req.query.offset) || 0;
+  const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 50, 200));
+  const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
     const [result, totalRes] = await Promise.all([
       query(
@@ -55,7 +62,7 @@ router.post('/api/chat/rooms', auth, checkBlocked, messageLimiter, async (req, r
       [job_id, cId, freelancer_id]
     );
     if (existing.rows.length) return res.json({ room: existing.rows[0] });
-    const roomId = 'room_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
+    const roomId = 'room_' + crypto.randomUUID();
     const result = await query(
       'INSERT INTO chat_rooms (id, client_id, freelancer_id, job_id) VALUES ($1, $2, $3, $4) RETURNING *',
       [roomId, cId, freelancer_id, job_id]
@@ -83,8 +90,8 @@ router.get('/api/chat/rooms/:id', auth, async (req, res) => {
 
 // GET /api/chat/rooms/:id/messages
 router.get('/api/chat/rooms/:id/messages', auth, async (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit) || 100, 200);
-  const offset = parseInt(req.query.offset) || 0;
+  const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 100, 200));
+  const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
     const room = await query('SELECT * FROM chat_rooms WHERE id = $1 AND (client_id = $2 OR freelancer_id = $2)', [req.params.id, req.userId]);
     if (!room.rows.length) return res.status(403).json({ error: 'Forbidden' });
@@ -112,7 +119,7 @@ router.post('/api/chat/rooms/:id/messages', auth, checkBlocked, messageLimiter, 
       [req.params.id, req.userId, senderName, message.trim()]
     );
     await query('UPDATE chat_rooms SET updated_at = NOW() WHERE id = $1', [req.params.id]);
-    const otherUserId = room.rows[0].client_id === req.userId ? room.rows[0].freelancer_id : room.rows[0].client_id;
+    const otherUserId = normalizeId(room.rows[0].client_id) === normalizeId(req.userId) ? room.rows[0].freelancer_id : room.rows[0].client_id;
     if (otherUserId) {
       await notify(otherUserId, 'message', `Новое сообщение от ${senderName}`, message.trim().substring(0, 100), null, req.params.id);
     }
@@ -132,7 +139,7 @@ router.post('/api/chat/start', auth, checkBlocked, messageLimiter, async (req, r
     if (jobId) {
       const jobCheck = await query('SELECT posted_by FROM jobs WHERE id = $1', [jobId]);
       if (!jobCheck.rows.length) return res.status(404).json({ error: 'Job not found' });
-      if (jobCheck.rows[0].posted_by !== req.userId) {
+      if (normalizeId(jobCheck.rows[0].posted_by) !== normalizeId(req.userId)) {
         const appCheck = await query('SELECT id FROM applications WHERE job_id = $1 AND freelancer_id = $2 LIMIT 1', [jobId, req.userId]);
         if (!appCheck.rows.length) return res.status(403).json({ error: 'You are not a participant in this job' });
       }
@@ -147,7 +154,7 @@ router.post('/api/chat/start', auth, checkBlocked, messageLimiter, async (req, r
           [req.userId, other_user_id]
         );
     if (existing.rows.length) return res.json({ conversation: existing.rows[0], id: existing.rows[0].id });
-    const roomId = 'room_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
+    const roomId = 'room_' + crypto.randomUUID();
     const result = await query('INSERT INTO chat_rooms (id, client_id, freelancer_id, job_id) VALUES ($1, $2, $3, $4) RETURNING *', [roomId, req.userId, other_user_id, jobId]);
     res.json({ conversation: result.rows[0], id: result.rows[0].id });
   } catch (err) { serverError(err, res); }
@@ -155,8 +162,8 @@ router.post('/api/chat/start', auth, checkBlocked, messageLimiter, async (req, r
 
 // GET /api/chat/conversations — alias for rooms
 router.get('/api/chat/conversations', auth, async (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
-  const offset = parseInt(req.query.offset) || 0;
+  const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 50, 200));
+  const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
     const [result, totalRes] = await Promise.all([
       query(
@@ -201,7 +208,7 @@ router.post('/api/chat/conversations', auth, checkBlocked, messageLimiter, async
     }
     const existing = await query('SELECT * FROM chat_rooms WHERE job_id = $1 AND ((client_id = $2 AND freelancer_id = $3) OR (client_id = $3 AND freelancer_id = $2))', [job_id, cId, fId]);
     if (existing.rows.length) return res.json({ conversation: existing.rows[0], room: existing.rows[0] });
-    const roomId = 'room_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
+    const roomId = 'room_' + crypto.randomUUID();
     const result = await query('INSERT INTO chat_rooms (id, client_id, freelancer_id, job_id) VALUES ($1, $2, $3, $4) RETURNING *', [roomId, cId, fId, job_id]);
     res.json({ conversation: result.rows[0], room: result.rows[0] });
   } catch (err) { serverError(err, res); }
@@ -209,8 +216,8 @@ router.post('/api/chat/conversations', auth, checkBlocked, messageLimiter, async
 
 // GET /api/chat/conversations/:id/messages
 router.get('/api/chat/conversations/:id/messages', auth, async (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit) || 100, 200);
-  const offset = parseInt(req.query.offset) || 0;
+  const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 100, 200));
+  const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
     const room = await query('SELECT * FROM chat_rooms WHERE id = $1 AND (client_id = $2 OR freelancer_id = $2)', [req.params.id, req.userId]);
     if (!room.rows.length) return res.status(403).json({ error: 'Forbidden' });
@@ -235,11 +242,27 @@ router.post('/api/chat/conversations/:id/messages', auth, checkBlocked, messageL
     const senderName = userResult.rows[0]?.username || req.userId;
     const result = await query('INSERT INTO chat_messages (room_id, sender_id, sender_name, message) VALUES ($1, $2, $3, $4) RETURNING *', [req.params.id, req.userId, senderName, msg.trim()]);
     await query('UPDATE chat_rooms SET updated_at = NOW() WHERE id = $1', [req.params.id]);
-    const otherUserId = room.rows[0].client_id === req.userId ? room.rows[0].freelancer_id : room.rows[0].client_id;
+    const otherUserId = normalizeId(room.rows[0].client_id) === normalizeId(req.userId) ? room.rows[0].freelancer_id : room.rows[0].client_id;
+    const newMsg = result.rows[0];
+    // Emit real-time event to all sockets in this room
+    const io = req.app.get('io');
+    if (io) io.to(req.params.id).emit('new_message', newMsg);
     if (otherUserId) {
       await notify(otherUserId, 'message', `Новое сообщение от ${senderName}`, msg.trim().substring(0, 100), null, req.params.id).catch(() => {});
+      // Web Push notification to recipient
+      const webpush = req.app.get('webpush');
+      if (webpush) {
+        const subRow = await query('SELECT endpoint, keys FROM push_subscriptions WHERE user_id = $1', [otherUserId]).catch(() => null);
+        if (subRow && subRow.rows.length) {
+          const sub = subRow.rows[0];
+          webpush.sendNotification(
+            { endpoint: sub.endpoint, keys: sub.keys },
+            JSON.stringify({ title: `Message from ${senderName}`, body: msg.trim().substring(0, 80), icon: '/icon-192.png' })
+          ).catch(() => {}); // fire-and-forget
+        }
+      }
     }
-    res.json({ message: result.rows[0] });
+    res.json({ message: newMsg });
   } catch (err) { serverError(err, res); }
 });
 
@@ -321,9 +344,24 @@ router.post('/api/chat/:roomId/messages', auth, messageLimiter, checkBlocked, as
       [req.params.roomId, req.userId, senderName, msg]
     );
     await query('UPDATE chat_rooms SET updated_at = NOW() WHERE id = $1', [req.params.roomId]);
-    const otherUserId2 = roomCheck.rows[0].client_id === req.userId ? roomCheck.rows[0].freelancer_id : roomCheck.rows[0].client_id;
+    // Real-time: broadcast to everyone in the room (this is the route the frontend actually uses).
+    const io = req.app.get('io');
+    if (io) io.to(req.params.roomId).emit('new_message', result.rows[0]);
+    const otherUserId2 = normalizeId(roomCheck.rows[0].client_id) === normalizeId(req.userId) ? roomCheck.rows[0].freelancer_id : roomCheck.rows[0].client_id;
     if (otherUserId2) {
       await notify(otherUserId2, 'message', `Новое сообщение от ${senderName}`, msg.substring(0, 100), null, req.params.roomId).catch(() => {});
+      // Web Push to recipient (same as the /conversations route — this is the route the frontend uses).
+      const webpush = req.app.get('webpush');
+      if (webpush) {
+        const subRow = await query('SELECT endpoint, keys FROM push_subscriptions WHERE user_id = $1', [otherUserId2]).catch(() => null);
+        if (subRow && subRow.rows.length) {
+          const sub = subRow.rows[0];
+          webpush.sendNotification(
+            { endpoint: sub.endpoint, keys: sub.keys },
+            JSON.stringify({ title: `Message from ${senderName}`, body: msg.substring(0, 80), icon: '/icon-192.png' })
+          ).catch(() => {}); // fire-and-forget
+        }
+      }
     }
     res.json({ message: result.rows[0], success: true });
   } catch (err) { serverError(err, res); }
@@ -331,8 +369,8 @@ router.post('/api/chat/:roomId/messages', auth, messageLimiter, checkBlocked, as
 
 // GET /api/chat/:roomId/messages — alias
 router.get('/api/chat/:roomId/messages', auth, async (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit) || 100, 200);
-  const offset = parseInt(req.query.offset) || 0;
+  const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 100, 200));
+  const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
     const roomCheck = await query(
       'SELECT id FROM chat_rooms WHERE id = $1 AND (client_id = $2 OR freelancer_id = $2)',
@@ -351,6 +389,63 @@ router.get('/api/chat/:roomId/messages', auth, async (req, res) => {
     );
     res.json({ messages: result.rows, limit, offset });
   } catch (err) { serverError(err, res); }
+});
+
+// POST /api/chat/rooms/:id/upload — upload a file attachment to a chat room.
+// File is stored in Postgres (durable across Render restarts), then posted as a
+// chat message whose body links to GET /api/chat/attachments/:attId.
+const uploadSingle = (req, res, next) => upload.single('file')(req, res, (err) => {
+  if (err) {
+    if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: 'File too large (max 5 MB)' });
+    return res.status(400).json({ error: err.message || 'Upload failed' });
+  }
+  next();
+});
+router.post('/api/chat/rooms/:id/upload', auth, checkBlocked, messageLimiter, uploadSingle, async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded (field name must be "file")' });
+    const roomCheck = await query('SELECT * FROM chat_rooms WHERE id = $1 AND (client_id = $2 OR freelancer_id = $2)', [req.params.id, req.userId]);
+    if (!roomCheck.rows.length) return res.status(403).json({ error: 'Not in this room' });
+    const attId = 'att_' + crypto.randomBytes(12).toString('hex');
+    await query(
+      'INSERT INTO chat_attachments (id, room_id, uploader_id, filename, mimetype, size, data) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+      [attId, req.params.id, req.userId, req.file.originalname, req.file.mimetype, req.file.size, req.file.buffer]
+    );
+    const userRes = await query('SELECT username FROM users WHERE id = $1', [req.userId]);
+    const senderName = userRes.rows[0]?.username || req.userId;
+    const body = `📎 ${req.file.originalname}|/api/chat/attachments/${attId}`;
+    const result = await query(
+      'INSERT INTO chat_messages (room_id, sender_id, sender_name, message) VALUES ($1,$2,$3,$4) RETURNING *',
+      [req.params.id, req.userId, senderName, body]
+    );
+    await query('UPDATE chat_rooms SET updated_at = NOW() WHERE id = $1', [req.params.id]);
+    const io = req.app.get('io');
+    if (io) io.to(req.params.id).emit('new_message', result.rows[0]);
+    const otherId = normalizeId(roomCheck.rows[0].client_id) === normalizeId(req.userId) ? roomCheck.rows[0].freelancer_id : roomCheck.rows[0].client_id;
+    if (otherId) await notify(otherId, 'message', `Файл от ${senderName}`, req.file.originalname, null, req.params.id).catch(() => {});
+    res.json({ success: true, attachment_id: attId, url: `/api/chat/attachments/${attId}`, message: result.rows[0] });
+  } catch (err) { serverError(err, res); }
+});
+
+// GET /api/chat/attachments/:attId — stream a stored attachment (room members only).
+router.get('/api/chat/attachments/:attId', auth, async (req, res) => {
+  try {
+    const r = await query('SELECT * FROM chat_attachments WHERE id = $1', [req.params.attId]);
+    if (!r.rows.length) return res.status(404).json({ error: 'Attachment not found' });
+    const att = r.rows[0];
+    const member = await query('SELECT id FROM chat_rooms WHERE id = $1 AND (client_id = $2 OR freelancer_id = $2)', [att.room_id, req.userId]);
+    if (!member.rows.length) return res.status(403).json({ error: 'Access denied' });
+    res.setHeader('Content-Type', att.mimetype || 'application/octet-stream');
+    res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(att.filename)}"`);
+    res.send(att.data);
+  } catch (err) { serverError(err, res); }
+});
+
+// GET /api/push/vapid-key — return the VAPID public key for the client
+router.get('/api/push/vapid-key', (req, res) => {
+  const key = process.env.VAPID_PUBLIC_KEY || null;
+  if (!key) return res.status(503).json({ error: 'Web Push not configured' });
+  res.json({ publicKey: key });
 });
 
 // POST /api/push/subscribe — Web Push notification subscription

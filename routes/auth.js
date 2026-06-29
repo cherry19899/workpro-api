@@ -3,9 +3,114 @@
  */
 const router = require('express').Router();
 const jwt = require('jsonwebtoken');
-const { query } = require('../src/db');
+const { query, getPool } = require('../src/db');
 const { piApiRequest, audit, serverError } = require('../src/helpers');
 const { auth, softAuth, checkBlocked, authLimiter, JWT_SECRET } = require('../src/middleware');
+
+// ─── UID normalisation ────────────────────────────────────────────────────────
+// Pi gives UIDs like "abc123" or (rarely) "pi_abc123".
+// The frontend historically prepended "pi_", creating "pi_abc123" or "pi_pi_abc123".
+// Canonical form: exactly one "pi_" prefix.
+function canonicalUid(uid) {
+  if (!uid) return uid;
+  return 'pi_' + uid.replace(/^(pi_)+/, '');
+}
+
+// At login: if the incoming uid is non-canonical, auto-merge the non-canonical
+// DB record (if any) into the canonical one, then proceed as canonical.
+// Returns the canonical uid to use for the session.
+async function normalizeLoginUid(incomingUid) {
+  const canonical = canonicalUid(incomingUid);
+  if (incomingUid === canonical) return canonical; // already clean
+
+  // Check whether both forms exist in the DB.
+  const [fromRow, toRow] = await Promise.all([
+    query('SELECT * FROM users WHERE id = $1', [incomingUid]),
+    query('SELECT * FROM users WHERE id = $1', [canonical]),
+  ]);
+  const fromExists = fromRow.rows.length > 0;
+  const toExists   = toRow.rows.length > 0;
+
+  if (!fromExists) return canonical; // nothing to migrate
+
+  if (!toExists) {
+    // Non-canonical exists, canonical doesn't — just rename the record.
+    await query('UPDATE users SET id = $1, updated_at = NOW() WHERE id = $2', [canonical, incomingUid]);
+    // Repoint all FK columns in one shot (best-effort; any failure is logged, not fatal)
+    const fkCols = [
+      ['jobs', 'posted_by'], ['jobs', 'hired_freelancer_id'],
+      ['applications', 'freelancer_id'], ['applications', 'client_id'],
+      ['escrows', 'client_id'], ['escrows', 'freelancer_id'],
+      ['payments', 'user_id'], ['ratings', 'from_user_id'], ['ratings', 'to_user_id'],
+      ['notifications', 'user_id'], ['chat_messages', 'sender_id'],
+      ['chat_rooms', 'client_id'], ['chat_rooms', 'freelancer_id'],
+      ['portfolios', 'user_id'], ['portfolio_items', 'user_id'],
+    ];
+    for (const [tbl, col] of fkCols) {
+      await query(`UPDATE ${tbl} SET ${col} = $1 WHERE ${col} = $2`, [canonical, incomingUid]).catch(() => {});
+    }
+    console.log(`[UID-norm] renamed ${incomingUid} → ${canonical}`);
+    return canonical;
+  }
+
+  // Both exist — full transactional merge: non-canonical (from) → canonical (to).
+  const from = fromRow.rows[0];
+  const to   = toRow.rows[0];
+  const pgM = await getPool().connect();
+  try {
+    await pgM.query('BEGIN');
+
+    // Merge balances and counters into canonical
+    await pgM.query(
+      `UPDATE users SET
+         balance_connects    = balance_connects + $1,
+         balance_pi          = COALESCE(balance_pi,0) + $2,
+         total_jobs_posted   = total_jobs_posted + $3,
+         total_jobs_completed= total_jobs_completed + $4,
+         bio     = COALESCE(NULLIF(bio,''), $5),
+         skills  = COALESCE(NULLIF(skills,''), $6),
+         avatar  = COALESCE(NULLIF(avatar,''), $7),
+         rating  = CASE WHEN rating = 0 THEN $8 ELSE rating END,
+         kyc_verified = (kyc_verified OR $9),
+         updated_at = NOW()
+       WHERE id = $10`,
+      [from.balance_connects||0, parseFloat(from.balance_pi||0),
+       from.total_jobs_posted||0, from.total_jobs_completed||0,
+       from.bio||'', from.skills||'', from.avatar||'',
+       parseFloat(from.rating||0), from.kyc_verified||false, canonical]
+    );
+
+    const safeUpd = async (tbl, col) => {
+      await pgM.query('SAVEPOINT sp');
+      try {
+        await pgM.query(`UPDATE ${tbl} SET ${col} = $1 WHERE ${col} = $2`, [canonical, incomingUid]);
+        await pgM.query('RELEASE SAVEPOINT sp');
+      } catch { await pgM.query('ROLLBACK TO SAVEPOINT sp'); }
+    };
+
+    const fkCols = [
+      ['jobs', 'posted_by'], ['jobs', 'hired_freelancer_id'],
+      ['applications', 'freelancer_id'], ['applications', 'client_id'],
+      ['escrows', 'client_id'], ['escrows', 'freelancer_id'],
+      ['payments', 'user_id'], ['ratings', 'from_user_id'], ['ratings', 'to_user_id'],
+      ['notifications', 'user_id'], ['chat_messages', 'sender_id'],
+      ['chat_rooms', 'client_id'], ['chat_rooms', 'freelancer_id'],
+      ['portfolios', 'user_id'], ['portfolio_items', 'user_id'],
+    ];
+    for (const [tbl, col] of fkCols) await safeUpd(tbl, col);
+
+    if (from.role === 'admin') await pgM.query("UPDATE users SET role='admin' WHERE id=$1", [canonical]);
+    await pgM.query('DELETE FROM users WHERE id = $1', [incomingUid]);
+    await pgM.query('COMMIT');
+    console.log(`[UID-norm] merged ${incomingUid} → ${canonical} (connects+${from.balance_connects||0})`);
+  } catch (e) {
+    await pgM.query('ROLLBACK').catch(() => {});
+    console.error('[UID-norm] merge error:', e.message);
+    // Fall back to canonical even if merge failed — canonical account still works
+  } finally { pgM.release(); }
+
+  return canonical;
+}
 
 // ─── Level helper (used by GET /api/me) ──────────────────────────────────────
 function computeLevel(completedJobs, rating) {
@@ -46,7 +151,15 @@ router.get('/api/me', auth, async (req, res) => {
   try {
     const result = await query('SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, is_blocked, status, created_at, updated_at FROM users WHERE id = $1', [req.userId]);
     if (!result.rows.length) return res.status(404).json({ error: 'User not found' });
-    const u = result.rows[0];
+    let u = result.rows[0];
+    // Owner self-heal on returning-user path (GET hit via stored JWT, never POST /api/me)
+    if (u.role !== 'admin' && (
+        (u.username && u.username.toLowerCase() === 'cherry19899') ||
+        u.id === 'pi_cherry19899' ||
+        u.id === 'pi_a2b617f7-f510-4502-a046-805facedcc29')) {
+      await query(`UPDATE users SET role = 'admin' WHERE id = $1`, [u.id]).catch(() => {});
+      u.role = 'admin';
+    }
     if (!Array.isArray(u.skills)) {
       u.skills = (typeof u.skills === 'string' && u.skills && u.skills !== '{}')
         ? u.skills.split(',').map(s => s.trim()).filter(Boolean) : [];
@@ -58,29 +171,43 @@ router.get('/api/me', auth, async (req, res) => {
 
 // POST /api/me — alias login endpoint used by Auth.js + bundle registration
 router.post('/api/me', authLimiter, async (req, res) => {
-  const { uid, username, accessToken } = req.body;
-  if (!uid) return res.status(400).json({ error: 'uid required' });
+  const { uid: rawUid, username, accessToken } = req.body;
+  if (!rawUid) return res.status(400).json({ error: 'uid required' });
   if (username && username.length > 50) return res.status(400).json({ error: 'Username too long (max 50)' });
   try {
-    if (accessToken) {
-      try {
-        const piUser = await piApiRequest('/v2/me', 'GET', null, accessToken);
-        const piUid = piUser && (piUser.uid || piUser.username);
-        if (!piUid) return res.status(403).json({ error: 'Pi identity verification failed: no uid returned' });
-        const normalizedPiUid = piUid.startsWith('pi_') ? piUid : 'pi_' + piUid;
-        if (normalizedPiUid !== uid && piUid !== uid) {
-          return res.status(403).json({ error: 'Token does not match uid' });
+    // SANDBOX_MODE (Pi Testnet): skip all Pi verification — Testnet accessTokens do not
+    // verify against the Mainnet /v2/me endpoint, so we trust the client identity here.
+    // Turn SANDBOX_MODE OFF when going to Mainnet to re-enable strict accessToken checks.
+    if (!process.env.SANDBOX_MODE) {
+      if (accessToken) {
+        try {
+          const piUser = await piApiRequest('/v2/me', 'GET', null, accessToken);
+          const piUid = piUser && (piUser.uid || piUser.username);
+          if (!piUid) return res.status(403).json({ error: 'Pi identity verification failed: no uid returned' });
+          const verifiedCanonical = canonicalUid(piUid);
+          const incomingCanonical = canonicalUid(rawUid);
+          if (verifiedCanonical !== incomingCanonical) {
+            return res.status(403).json({ error: 'Token does not match uid' });
+          }
+          // Persist payments_enabled from Pi so we can gate purchases later
+          if (piUser.payments_enabled !== undefined) {
+            await query(
+              'UPDATE users SET payments_enabled = $1, updated_at = NOW() WHERE id = $2',
+              [!!piUser.payments_enabled, verifiedCanonical]
+            ).catch(() => {});
+          }
+        } catch (e) {
+          return res.status(401).json({ error: 'Pi token verification failed. Please re-authenticate.' });
         }
-      } catch (e) {
-        return res.status(401).json({ error: 'Pi token verification failed. Please re-authenticate.' });
-      }
-    } else {
-      const existing = await query('SELECT id FROM users WHERE id = $1', [uid]);
-      if (!existing.rows.length) {
-        return res.status(401).json({ error: 'accessToken required for new account registration' });
+      } else {
+        return res.status(401).json({ error: 'accessToken required' });
       }
     }
+
+    // Normalise to canonical uid — auto-merges any non-canonical twin into canonical.
+    const uid = await normalizeLoginUid(rawUid);
     const uname = username || uid.replace(/^pi_/, '') || uid;
+
     if (accessToken) {
       await query(
         `INSERT INTO users (id, username, role, balance_connects, created_at, updated_at)
@@ -96,24 +223,18 @@ router.post('/api/me', authLimiter, async (req, res) => {
         [uid, uname]
       );
     }
-    // Migrate legacy 'cherry19899' records to 'pi_cherry19899' (idempotent, runs every login)
-    if (uid === 'pi_cherry19899') {
-      try {
-        await query(`UPDATE users SET role = 'admin' WHERE id = 'pi_cherry19899' AND role != 'admin'`).catch(() => {});
-        const r1 = await query(`UPDATE jobs SET posted_by = 'pi_cherry19899' WHERE posted_by = 'cherry19899'`);
-        const r2 = await query(`UPDATE applications SET freelancer_id = 'pi_cherry19899' WHERE freelancer_id = 'cherry19899'`);
-        await query(`UPDATE escrows SET client_id = 'pi_cherry19899' WHERE client_id = 'cherry19899'`);
-        await query(`UPDATE escrows SET freelancer_id = 'pi_cherry19899' WHERE freelancer_id = 'cherry19899'`);
-        const legacyUser = await query(`SELECT balance_connects, bio, skills FROM users WHERE id = 'cherry19899'`);
-        if (legacyUser.rows.length > 0) {
-          const old = legacyUser.rows[0];
-          await query(`UPDATE users SET balance_connects = GREATEST(balance_connects, $1), bio = COALESCE(NULLIF(bio,''), $2), skills = COALESCE(NULLIF(skills,''), $3) WHERE id = 'pi_cherry19899'`,
-            [old.balance_connects || 0, old.bio || '', old.skills || '']);
-          await query(`DELETE FROM users WHERE id = 'cherry19899'`);
-        }
-        await query(`UPDATE notifications SET user_id = 'pi_cherry19899' WHERE user_id = 'cherry19899'`);
-        if (r1.rowCount > 0 || r2.rowCount > 0) console.log(`[Migration] cherry19899→pi_cherry19899: jobs=${r1.rowCount} apps=${r2.rowCount}`);
-      } catch (mErr) { console.error('[Migration] error:', mErr.message); }
+    // SANDBOX: top up connects to 10 if balance is 0 so testing is never blocked
+    if (process.env.SANDBOX_MODE) {
+      await query(
+        `UPDATE users SET balance_connects = 10, updated_at = NOW() WHERE id = $1 AND balance_connects < 1`,
+        [uid]
+      ).catch(() => {});
+    }
+    // Owner self-heal: any uid whose username is cherry19899 (any case) always gets admin.
+    if ((uname && uname.toLowerCase() === 'cherry19899') ||
+        uid === 'pi_cherry19899' ||
+        uid === 'pi_a2b617f7-f510-4502-a046-805facedcc29') {
+      await query(`UPDATE users SET role = 'admin' WHERE id = $1 AND role != 'admin'`, [uid]).catch(() => {});
     }
     await query(`UPDATE users SET total_jobs_posted = (SELECT COUNT(*) FROM jobs WHERE posted_by = $1), updated_at = NOW() WHERE id = $1`, [uid]).catch(() => {});
     const user = await query('SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, is_blocked, status, created_at FROM users WHERE id = $1', [uid]);
@@ -121,9 +242,16 @@ router.post('/api/me', authLimiter, async (req, res) => {
     if (u && u.status === 'deleted') {
       return res.status(403).json({ error: 'Account has been deleted' });
     }
+    if (u && u.is_blocked) {
+      return res.status(403).json({ error: 'Account is blocked' });
+    }
     await audit('user_login', { user_id: uid });
     const token = jwt.sign({ id: uid, username: uname }, JWT_SECRET, { expiresIn: '30d' });
-    res.json({ ...u, uid: u.id, is_admin: u.role === 'admin', token });
+    const incompletePayments = await query(
+      "SELECT id, type, amount, status, created_at FROM payments WHERE user_id = $1 AND status = 'pending'",
+      [uid]
+    ).then(r => r.rows).catch(() => []);
+    res.json({ ...u, uid: u.id, is_admin: u.role === 'admin', token, incompletePayments });
   } catch (err) { serverError(err, res); }
 });
 
@@ -134,10 +262,17 @@ router.post('/api/auth/refresh', async (req, res) => {
   const token = authHeader.slice(7);
   try {
     const decoded = jwt.verify(token, JWT_SECRET, { ignoreExpiration: true });
-    const user = await query('SELECT id, username, role, status FROM users WHERE id = $1 LIMIT 1', [decoded.id]);
+    const jwtUsername = (decoded.username || '').toLowerCase();
+    // Look up by id OR by username — handles old JWTs where id='cherry19899' but DB has 'pi_cherry19899'
+    const user = await query(
+      `SELECT id, username, role, status, is_blocked FROM users
+       WHERE id = $1 OR id = $2 OR (LOWER(username) = $3 AND $3 <> '') LIMIT 1`,
+      [decoded.id, 'pi_' + decoded.id, jwtUsername]
+    );
     if (!user.rows.length) return res.status(401).json({ error: 'User not found' });
     const u = user.rows[0];
     if (u.status === 'deleted') return res.status(403).json({ error: 'Account has been deleted' });
+    if (u.is_blocked) return res.status(403).json({ error: 'Account is blocked' });
     const newToken = jwt.sign({ id: u.id, username: u.username }, JWT_SECRET, { expiresIn: '30d' });
     res.json({ token: newToken, is_admin: u.role === 'admin' });
   } catch (err) {
@@ -147,8 +282,8 @@ router.post('/api/auth/refresh', async (req, res) => {
 
 // POST /api/auth/login
 router.post('/api/auth/login', async (req, res) => {
-  const { userId, username, accessToken } = req.body;
-  if (!userId) return res.status(400).json({ error: 'userId required' });
+  const { userId: rawUserId, username, accessToken } = req.body;
+  if (!rawUserId) return res.status(400).json({ error: 'userId required' });
   if (username && username.length > 50) return res.status(400).json({ error: 'Username too long (max 50)' });
   try {
     let piUser = null;
@@ -160,17 +295,22 @@ router.post('/api/auth/login', async (req, res) => {
       }
       const piUid = piUser && (piUser.uid || piUser.username);
       if (!piUid) return res.status(403).json({ error: 'Pi identity verification failed: no uid returned' });
-      const normalizedPiUid = piUid.startsWith('pi_') ? piUid : 'pi_' + piUid;
-      if (normalizedPiUid !== userId && piUid !== userId) {
+      if (canonicalUid(piUid) !== canonicalUid(rawUserId)) {
         return res.status(403).json({ error: 'Token does not match userId' });
       }
     } else {
-      const existing = await query('SELECT id FROM users WHERE id = $1', [userId]);
+      if (!process.env.SANDBOX_MODE) {
+        return res.status(401).json({ error: 'accessToken required' });
+      }
+      // SANDBOX_MODE only — skip Pi verification for local/test environments
+      const existing = await query('SELECT id FROM users WHERE id IN ($1, $2)', [rawUserId, canonicalUid(rawUserId)]);
       if (!existing.rows.length) {
         return res.status(401).json({ error: 'accessToken required for new account registration' });
       }
     }
-    const uid = userId;
+
+    // Normalise to canonical uid — auto-merges any non-canonical twin.
+    const uid = await normalizeLoginUid(rawUserId);
     const uname = (piUser && piUser.username) || username || uid;
     const paymentsEnabled = piUser ? piUser.payments_enabled === true : false;
     const existing = await query('SELECT id, username, role FROM users WHERE id = $1', [uid]);
@@ -215,18 +355,22 @@ router.get('/api/auth/me', auth, async (req, res) => {
 router.get('/api/users/me', auth, async (req, res) => {
   try {
     const result = await query(
-      'SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, is_blocked, status, created_at, updated_at FROM users WHERE id = $1',
+      'SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, is_blocked, status, title, hourly_rate, location, website, created_at, updated_at FROM users WHERE id = $1',
       [req.userId]
     );
     if (!result.rows.length) return res.status(404).json({ error: 'User not found' });
     const u = result.rows[0];
+    if (!Array.isArray(u.skills)) {
+      u.skills = (typeof u.skills === 'string' && u.skills && u.skills !== '{}')
+        ? u.skills.split(',').map(s => s.trim()).filter(Boolean) : [];
+    }
     res.json({ ...u, uid: u.id, is_admin: u.role === 'admin' });
   } catch (err) { serverError(err, res); }
 });
 
 // PUT /api/users/me — update current user profile
 router.put('/api/users/me', auth, checkBlocked, async (req, res) => {
-  const { username, bio, skills, availability, avatar, email } = req.body;
+  const { username, bio, skills, availability, avatar, email, title, hourly_rate, location, website } = req.body;
   if (username && username.length > 50) return res.status(400).json({ error: 'Username too long (max 50)' });
   if (bio && bio.length > 1000) return res.status(400).json({ error: 'Bio too long (max 1000)' });
   const skillsStr = skills !== undefined ? (Array.isArray(skills) ? skills.join(',') : (skills || null)) : undefined;
@@ -249,11 +393,18 @@ router.put('/api/users/me', auth, checkBlocked, async (req, res) => {
     if (availability) { fields.push(`availability=$${i++}`); vals.push(availability); }
     if (avatar) { fields.push(`avatar=$${i++}`); vals.push(avatar); }
     if (email) { fields.push(`email=$${i++}`); vals.push(email); }
+    if (title !== undefined) { fields.push(`title=$${i++}`); vals.push(title || null); }
+    if (hourly_rate !== undefined) { fields.push(`hourly_rate=$${i++}`); vals.push(hourly_rate ? parseFloat(hourly_rate) : null); }
+    if (location !== undefined) { fields.push(`location=$${i++}`); vals.push(location || null); }
+    if (website !== undefined) {
+      if (website && !/^https?:\/\//i.test(website)) return res.status(400).json({ error: 'Website must start with http:// or https://' });
+      fields.push(`website=$${i++}`); vals.push(website || null);
+    }
     if (!fields.length) return res.status(400).json({ error: 'Nothing to update' });
     fields.push(`updated_at=NOW()`);
     vals.push(req.userId);
     await query(`UPDATE users SET ${fields.join(',')} WHERE id=$${i}`, vals);
-    const result = await query('SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, is_blocked, status, created_at, updated_at FROM users WHERE id = $1', [req.userId]);
+    const result = await query('SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, is_blocked, status, title, hourly_rate, location, website, created_at, updated_at FROM users WHERE id = $1', [req.userId]);
     const u = result.rows[0];
     if (!Array.isArray(u.skills)) {
       u.skills = (typeof u.skills === 'string' && u.skills && u.skills !== '{}')

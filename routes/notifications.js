@@ -6,8 +6,8 @@ const { query } = require('../src/db');
 const { serverError } = require('../src/helpers');
 const { auth } = require('../src/middleware');
 
-// GET /api/notifications/unread-count
-router.get('/api/notifications/unread-count', auth, async (req, res) => {
+// GET /api/notifications/unread-count (alias: /unread)
+router.get(['/api/notifications/unread-count', '/api/notifications/unread'], auth, async (req, res) => {
   try {
     const result = await query(
       'SELECT COUNT(*) FROM notifications WHERE user_id = $1 AND is_read = false',
@@ -23,8 +23,8 @@ router.get('/api/notifications/unread-count', auth, async (req, res) => {
 // GET /api/notifications
 router.get('/api/notifications', auth, async (req, res) => {
   try {
-    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
-    const offset = parseInt(req.query.offset) || 0;
+    const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 50, 200));
+    const offset = Math.max(0, parseInt(req.query.offset) || 0);
     const [result, totalRes, unreadRes] = await Promise.all([
       query('SELECT * FROM notifications WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3', [req.userId, limit, offset]),
       query('SELECT COUNT(*) FROM notifications WHERE user_id = $1', [req.userId]),
@@ -42,8 +42,8 @@ router.get('/api/notifications', auth, async (req, res) => {
   }
 });
 
-// POST /api/notifications/mark-read
-router.post('/api/notifications/mark-read', auth, async (req, res) => {
+// POST /api/notifications/mark-read (alias: /read-all)
+router.post(['/api/notifications/mark-read', '/api/notifications/read-all'], auth, async (req, res) => {
   try {
     await query('UPDATE notifications SET is_read = true WHERE user_id = $1 AND is_read = false', [req.userId]);
     res.json({ success: true });

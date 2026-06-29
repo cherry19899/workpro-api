@@ -19,29 +19,49 @@
 
 require('dotenv').config();
 const express = require('express');
+const compression = require('compression');
+const http = require('http');
+const { Server: SocketIOServer } = require('socket.io');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
 const crypto = require('crypto');
+const jwt = require('jsonwebtoken');
 const { query, initDb } = require('./db');
+const { PI_API_KEY: piKey } = require('./src/helpers');
 
 const app = express();
+const httpServer = http.createServer(app);
+
 // Render sits behind a proxy — needed so req.ip reflects the real client for rate limiting
 app.set('trust proxy', 1);
 const PORT = process.env.PORT || 3000;
 const NODE_ENV = process.env.NODE_ENV || 'production';
 
-// Warn if secrets are defaults — do this at startup before routes load
-if (!process.env.JWT_SECRET) {
-  console.warn('[SECURITY] JWT_SECRET env var is not set — using a random secret. All sessions will be invalidated on each restart.');
+// ── Pre-flight secret checks (fatal in production without SANDBOX escape hatch) ──
+const IS_SANDBOX = !!process.env.SANDBOX_MODE;
+if (NODE_ENV === 'production') {
+  if (IS_SANDBOX) {
+    console.warn('[WARN] SANDBOX_MODE is enabled — testnet mode active. Remove before switching to mainnet.');
+  }
+  if (!process.env.JWT_SECRET) {
+    console.error('[FATAL] JWT_SECRET env var is not set. Set a strong JWT_SECRET in Render env vars. Refusing to start.');
+    process.exit(1);
+  }
+  const _adminKey = process.env.ADMIN_API_KEY;
+  if (!_adminKey || _adminKey === 'admin-secret-key') {
+    console.error('[FATAL] ADMIN_API_KEY is missing or using the default value. Set a strong ADMIN_API_KEY in Render env vars. Refusing to start.');
+    process.exit(1);
+  }
 }
 const ADMIN_API_KEY = process.env.ADMIN_API_KEY || 'admin-secret-key';
-if (ADMIN_API_KEY === 'admin-secret-key') {
-  console.warn('[SECURITY] ADMIN_API_KEY is the default value — set a strong ADMIN_API_KEY env var, otherwise the admin panel is publicly accessible.');
-}
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://cherry19899.github.io';
 
+// ─── Helpers ─────────────────────────────────────────────────
+const normalizeId = (id) => (id || '').toString().toLowerCase().replace(/^pi_/, '');
+
 // ─── Core middleware ──────────────────────────────────────────────
+app.use(compression());
 app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
 app.use(express.json({ limit: '4mb' }));
 app.use(express.urlencoded({ extended: true, limit: '4mb' }));
@@ -53,10 +73,23 @@ app.use(cors({
 }));
 
 // Global rate limit (all endpoints except /api/health)
+const RATE_LIMIT_BYPASS_KEY = process.env.RATE_LIMIT_BYPASS_KEY || null;
+function _skipRateLimit(req) {
+  if (req.path === '/api/health') return true;
+  if (!RATE_LIMIT_BYPASS_KEY) return false;
+  const h = req.headers['x-rate-bypass'] || '';
+  try {
+    return h.length === RATE_LIMIT_BYPASS_KEY.length &&
+      require('crypto').timingSafeEqual(Buffer.from(h), Buffer.from(RATE_LIMIT_BYPASS_KEY));
+  } catch { return false; }
+}
+// Method-aware global limit: read-heavy GETs capped tighter than mutations.
+// SANDBOX_MODE relaxes 10× for automated testing.
+const _rateMult = process.env.SANDBOX_MODE ? 10 : 1;
 app.use(rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 500,
-  skip: (req) => req.path === '/api/health',
+  max: (req) => (req.method === 'GET' ? 100 : 500) * _rateMult,
+  skip: _skipRateLimit,
 }));
 
 // Import route-specific limiters from middleware so we can apply them globally here
@@ -65,13 +98,15 @@ app.use(rateLimit({
 const {
   authLimiter,
   adminLimiter,
+  adminStrictLimiter,
   connectsLimiter,
   messageLimiter,
 } = require('./src/middleware');
 
 app.use('/api/auth', authLimiter);
 // authLimiter applied directly to POST /api/me (login) inside routes/auth.js
-app.use('/api/admin', adminLimiter);
+app.use('/api/admin', adminStrictLimiter); // IP-level DDoS guard (50/15min)
+app.use('/api/admin', adminLimiter);       // Functional limit (100/15min per IP)
 app.use('/api/connects/purchase', connectsLimiter);
 app.use('/api/connects/buy', connectsLimiter);
 app.use('/api/payments', connectsLimiter);
@@ -82,22 +117,147 @@ app.use('/api/chat/conversations', (req, res, next) => { if (req.method === 'POS
 
 // ─── Static endpoints ──────────────────────────────────────────────
 app.get('/', (req, res) => {
-  res.json({ name: 'WorkPro API', version: '3.2.0', status: 'ok' });
+  res.json({ name: 'WorkPro API', version: '3.2.0', status: 'ok', docs: '/api/docs' });
+});
+
+// GET /api/docs — Swagger UI (CDN-hosted, no npm package needed)
+app.get('/api/docs', (req, res) => {
+  res.setHeader('Content-Type', 'text/html');
+  res.send(`<!DOCTYPE html>
+<html>
+<head><title>WorkPro API Docs</title>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css"/>
+</head>
+<body>
+<div id="swagger-ui"></div>
+<script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+<script>
+SwaggerUIBundle({
+  url: '/api/openapi.json',
+  dom_id: '#swagger-ui',
+  presets: [SwaggerUIBundle.presets.apis, SwaggerUIBundle.SwaggerUIStandalonePreset],
+  layout: 'BaseLayout',
+  deepLinking: true,
+});
+</script>
+</body>
+</html>`);
+});
+
+// GET /api/openapi.json — OpenAPI 3.0 spec
+app.get('/api/openapi.json', (req, res) => {
+  const base = process.env.API_BASE_URL || 'https://workpro-api.onrender.com';
+  res.json({
+    openapi: '3.0.3',
+    info: { title: 'WorkPro API', version: '3.2.0', description: 'Pi Network freelance marketplace API' },
+    servers: [{ url: base }],
+    components: {
+      securitySchemes: {
+        BearerAuth: { type: 'http', scheme: 'bearer', bearerFormat: 'JWT' },
+        AdminKey: { type: 'apiKey', in: 'header', name: 'x-admin-key' },
+      },
+    },
+    security: [{ BearerAuth: [] }],
+    paths: {
+      '/api/health': { get: { tags: ['System'], summary: 'Health check', security: [], responses: { '200': { description: 'OK' } } } },
+      '/api/me': { post: { tags: ['Auth'], summary: 'Login / register', security: [], requestBody: { content: { 'application/json': { schema: { type: 'object', properties: { uid: { type: 'string' }, username: { type: 'string' }, accessToken: { type: 'string' } }, required: ['uid', 'username'] } } } }, responses: { '200': { description: 'JWT token' } } } },
+      '/api/jobs': {
+        get: { tags: ['Jobs'], summary: 'List open jobs (cursor or page)', parameters: [ { name: 'cursor', in: 'query', schema: { type: 'string' } }, { name: 'page', in: 'query', schema: { type: 'integer' } }, { name: 'limit', in: 'query', schema: { type: 'integer' } }, { name: 'search', in: 'query', schema: { type: 'string' } }, { name: 'category', in: 'query', schema: { type: 'string' } }, { name: 'sort', in: 'query', schema: { type: 'string', enum: ['newest','oldest','budget_asc','budget_desc','popular'] } } ], security: [], responses: { '200': { description: 'Jobs list' } } },
+        post: { tags: ['Jobs'], summary: 'Create job', responses: { '201': { description: 'Created' } } },
+      },
+      '/api/jobs/search/autocomplete': { get: { tags: ['Jobs'], summary: 'Title autocomplete', parameters: [{ name: 'q', in: 'query', required: true, schema: { type: 'string' } }], security: [], responses: { '200': { description: 'Suggestions' } } } },
+      '/api/jobs/{id}': {
+        get: { tags: ['Jobs'], summary: 'Get job detail', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }], security: [], responses: { '200': { description: 'Job' } } },
+        put: { tags: ['Jobs'], summary: 'Update job', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }], responses: { '200': { description: 'Updated' } } },
+        delete: { tags: ['Jobs'], summary: 'Delete job', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }], responses: { '204': { description: 'Deleted' } } },
+      },
+      '/api/jobs/{id}/apply': { post: { tags: ['Jobs'], summary: 'Apply to job (costs connects)', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }], responses: { '200': { description: 'Applied' }, '409': { description: 'Already applied' } } } },
+      '/api/jobs/{id}/hire': { post: { tags: ['Jobs'], summary: 'Hire a freelancer', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }], responses: { '200': { description: 'Hired' } } } },
+      '/api/connects/balance': { get: { tags: ['Connects'], summary: 'Get connects balance', responses: { '200': { description: 'Balance' } } } },
+      '/api/connects/buy': { post: { tags: ['Connects'], summary: 'Buy connects via Pi payment', responses: { '200': { description: 'Credited' } } } },
+      '/api/payments/approve': { post: { tags: ['Payments'], summary: 'Approve Pi payment', responses: { '200': { description: 'Approved' } } } },
+      '/api/payments/complete': { post: { tags: ['Payments'], summary: 'Complete Pi payment', responses: { '200': { description: 'Completed' } } } },
+      '/api/escrow/{id}/release': { post: { tags: ['Escrow'], summary: 'Release escrow to freelancer', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }], responses: { '200': { description: 'Released' } } } },
+      '/api/chat/conversations': { get: { tags: ['Chat'], summary: 'List conversations', responses: { '200': { description: 'Conversations' } } } },
+      '/api/notifications': { get: { tags: ['Notifications'], summary: 'Get notifications', responses: { '200': { description: 'Notifications' } } } },
+      '/api/users/{id}': { get: { tags: ['Users'], summary: 'Get user profile', parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }], security: [], responses: { '200': { description: 'User' } } } },
+      '/api/admin/stats': { get: { tags: ['Admin'], summary: 'Platform stats', security: [{ AdminKey: [] }], responses: { '200': { description: 'Stats' } } } },
+      '/api/admin/analytics': { get: { tags: ['Admin'], summary: 'Analytics dashboard', security: [{ AdminKey: [] }], responses: { '200': { description: 'Analytics' } } } },
+      '/api/admin/settings': {
+        get: { tags: ['Admin'], summary: 'Get platform settings', security: [{ AdminKey: [] }], responses: { '200': { description: 'Settings' } } },
+        patch: { tags: ['Admin'], summary: 'Update platform setting', security: [{ AdminKey: [] }], requestBody: { content: { 'application/json': { schema: { type: 'object', properties: { key: { type: 'string' }, value: { type: 'number' } }, required: ['key','value'] } } } }, responses: { '200': { description: 'Updated' } } },
+      },
+      '/api/admin/rate-limits': { get: { tags: ['Admin'], summary: 'List rate-limited IPs', security: [{ AdminKey: [] }], responses: { '200': { description: 'Blocked IPs' } } } },
+      '/api/admin/rate-limits/unblock': { post: { tags: ['Admin'], summary: 'Unblock an IP', security: [{ AdminKey: [] }], requestBody: { content: { 'application/json': { schema: { type: 'object', properties: { ip: { type: 'string' } }, required: ['ip'] } } } }, responses: { '200': { description: 'Unblocked' } } } },
+    },
+  });
 });
 
 // Pi Network calls this to verify backend ownership
 app.get('/.well-known/pi-network', (req, res) => {
-  res.json({ app: 'workpro', backend: true, version: '3.2.0' });
+  res.json({
+    app: 'workpro',
+    backend: true,
+    version: '3.2.0',
+    app_identifier: process.env.PI_APP_IDENTIFIER || 'workpro',
+  });
 });
 
+const _serverStartTime = Date.now();
+let _lastError = null; // set by the global error handler
+let _piHealthCache = null; // { ts, reachable, latency_ms } — 60s TTL
+
 app.get('/api/health', async (req, res) => {
+  const result = {
+    status: 'ok',
+    version: '3.2.0',
+    timestamp: new Date().toISOString(),
+    uptime_seconds: Math.floor((Date.now() - _serverStartTime) / 1000),
+    memory_mb: parseFloat((process.memoryUsage().rss / 1024 / 1024).toFixed(1)),
+  };
+
+  // DB latency
+  const dbStart = Date.now();
   try {
+    const pool = require('./src/db').getPool();
+    result.db_connections = { total: pool.totalCount, idle: pool.idleCount, waiting: pool.waitingCount };
     await query('SELECT 1');
-    res.json({ status: 'ok', version: '3.2.0', database: 'connected', timestamp: new Date().toISOString() });
+    result.db_latency_ms = Date.now() - dbStart;
+    result.database = 'connected';
   } catch (err) {
     console.error('[Health] DB check failed:', err.message);
-    res.status(500).json({ status: 'error', database: 'disconnected' });
+    result.status = 'degraded';
+    result.database = 'disconnected';
+    result.db_latency_ms = null;
   }
+
+  result.pi_api = piKey ? 'configured' : 'missing';
+
+  // Pi API latency (only on deep=1 to avoid slowing every ping) — cached 60s
+  if (piKey && process.env.SANDBOX_MODE !== 'true' && req.query.deep === '1') {
+    const now = Date.now();
+    if (_piHealthCache && (now - _piHealthCache.ts) < 60000) {
+      result.pi_api_reachable = _piHealthCache.reachable;
+      result.pi_api_latency_ms = _piHealthCache.latency_ms;
+      result.pi_api_cached = true;
+    } else {
+      const piStart = now;
+      try {
+        const r = await fetch('https://api.minepi.com/v2/payments/health_check_nonexistent', {
+          headers: { Authorization: `Key ${piKey}` },
+        }).catch(() => null);
+        result.pi_api_reachable = r ? (r.status < 500 ? 'ok' : 'error') : 'unreachable';
+        result.pi_api_latency_ms = Date.now() - piStart;
+      } catch (_) { result.pi_api_reachable = 'unreachable'; result.pi_api_latency_ms = null; }
+      _piHealthCache = { ts: Date.now(), reachable: result.pi_api_reachable, latency_ms: result.pi_api_latency_ms };
+    }
+  }
+
+  if (_lastError) result.last_error = _lastError;
+
+  res.status(result.status === 'ok' ? 200 : 500).json(result);
 });
 
 // ─── Route modules ──────────────────────────────────────────────
@@ -119,6 +279,7 @@ app.use((req, res) => {
 
 app.use((err, req, res, next) => {
   console.error('[Error]', err);
+  _lastError = { message: err.message, path: req.path, time: new Date().toISOString() };
   res.status(500).json({ error: 'Internal server error' });
 });
 
@@ -137,6 +298,8 @@ async function ensureNotificationsTable() {
     created_at TIMESTAMPTZ DEFAULT NOW()
   )`, 'notifications table');
   await run(`CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, is_read, created_at DESC)`, 'idx_notifications_user');
+  await run(`CREATE INDEX IF NOT EXISTS idx_users_username_lower ON users(LOWER(username))`, 'idx_users_username_lower');
+  await run(`CREATE INDEX IF NOT EXISTS idx_users_id_lower ON users(LOWER(id))`, 'idx_users_id_lower');
   await run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_chat_read_at TIMESTAMPTZ`, 'users.last_chat_read_at');
   // Critical: must run before any UPDATE that references updated_at
   await run(`ALTER TABLE applications ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`, 'applications.updated_at');
@@ -182,22 +345,244 @@ async function ensureNotificationsTable() {
   await run(`CREATE INDEX IF NOT EXISTS idx_chat_messages_room_id ON chat_messages(room_id)`, 'idx_chat_messages_room_id');
   await run(`CREATE INDEX IF NOT EXISTS idx_payments_user_id ON payments(user_id)`, 'idx_payments_user_id');
   await run(`CREATE INDEX IF NOT EXISTS idx_ratings_to_user_id ON ratings(to_user_id)`, 'idx_ratings_to_user_id');
+  // ─── Data integrity ───────────────────────────────────────────────
+  // Unique pair per (client, freelancer, job) prevents duplicate chat rooms.
+  // job_id can be NULL so we use a partial index trick: two separate indexes.
+  await run(
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_rooms_pair_with_job
+     ON chat_rooms(client_id, freelancer_id, job_id)
+     WHERE job_id IS NOT NULL`,
+    'idx_chat_rooms_pair_with_job'
+  );
+  await run(
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_rooms_pair_no_job
+     ON chat_rooms(client_id, freelancer_id)
+     WHERE job_id IS NULL`,
+    'idx_chat_rooms_pair_no_job'
+  );
+  // FK-style index on chat_messages.room_id for join performance
+  await run(
+    `CREATE INDEX IF NOT EXISTS idx_chat_messages_room_id2 ON chat_messages(room_id, created_at DESC)`,
+    'idx_chat_messages_room_id2'
+  );
+  // Foreign key: chat_messages.room_id → chat_rooms.id
+  await run(
+    `DO $$ BEGIN
+       IF NOT EXISTS (
+         SELECT 1 FROM information_schema.table_constraints
+         WHERE constraint_name = 'fk_chat_messages_room_id' AND table_name = 'chat_messages'
+       ) THEN
+         ALTER TABLE chat_messages
+           ADD CONSTRAINT fk_chat_messages_room_id
+           FOREIGN KEY (room_id) REFERENCES chat_rooms(id) ON DELETE CASCADE NOT VALID;
+       END IF;
+     END $$`,
+    'fk_chat_messages_room_id'
+  );
+  // Foreign key: applications.job_id → jobs(id) ON DELETE CASCADE
+  await run(
+    `DO $$ BEGIN
+       IF NOT EXISTS (
+         SELECT 1 FROM information_schema.table_constraints
+         WHERE constraint_name = 'fk_applications_job_id' AND table_name = 'applications'
+       ) THEN
+         ALTER TABLE applications
+           ADD CONSTRAINT fk_applications_job_id
+           FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE NOT VALID;
+       END IF;
+     END $$`,
+    'fk_applications_job_id'
+  );
+  // Foreign key: escrows.job_id → jobs(id) ON DELETE CASCADE
+  await run(
+    `DO $$ BEGIN
+       IF NOT EXISTS (
+         SELECT 1 FROM information_schema.table_constraints
+         WHERE constraint_name = 'fk_escrows_job_id' AND table_name = 'escrows'
+       ) THEN
+         ALTER TABLE escrows
+           ADD CONSTRAINT fk_escrows_job_id
+           FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE NOT VALID;
+       END IF;
+     END $$`,
+    'fk_escrows_job_id'
+  );
+  // Backfill applications.updated_at for rows created before the column existed
+  await run(
+    `UPDATE applications SET updated_at = created_at WHERE updated_at IS NULL`,
+    'backfill applications.updated_at'
+  );
+  // Platform settings table — key/value store for runtime-configurable parameters
+  await run(`CREATE TABLE IF NOT EXISTS platform_settings (
+    key        VARCHAR(100) PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_by TEXT
+  )`, 'platform_settings table');
+  // Seed default platform fee (2%) — INSERT only if row doesn't already exist
+  await run(
+    `INSERT INTO platform_settings (key, value, updated_at)
+     VALUES ('platform_fee_percent', '2', NOW())
+     ON CONFLICT (key) DO NOTHING`,
+    'seed platform_fee_percent'
+  );
+  await run(
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS payments_enabled BOOLEAN DEFAULT NULL`,
+    'users.payments_enabled'
+  );
+  await run(
+    `INSERT INTO platform_settings (key, value, updated_at)
+     VALUES ('connect_price_base','0.1',NOW()),('min_job_budget','1',NOW()),('max_job_budget','10000',NOW())
+     ON CONFLICT (key) DO NOTHING`,
+    'seed connect_price_base, min/max_job_budget'
+  );
+  // Indexes for admin user search (LOWER() expressions used in ILIKE queries)
+  await run(`CREATE INDEX IF NOT EXISTS idx_users_lower_username ON users(LOWER(username))`, 'idx_users_lower_username');
+  await run(`CREATE INDEX IF NOT EXISTS idx_users_created_at ON users(created_at DESC)`, 'idx_users_created_at');
+  await run(`CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at DESC)`, 'idx_jobs_created_at');
+  await run(`CREATE INDEX IF NOT EXISTS idx_payments_created_at ON payments(created_at DESC)`, 'idx_payments_created_at');
 }
 
 // ─── Start ──────────────────────────────────────────────
 initDb().then(async () => {
   await ensureNotificationsTable();
-  // Ensure the canonical owner always has admin role
-  await query(`UPDATE users SET role = 'admin' WHERE id = 'pi_cherry19899' AND role != 'admin'`).catch(() => {});
+  // Ensure the canonical owner always has admin role (by uid AND by username, case-insensitive)
+  await query(`UPDATE users SET role = 'admin' WHERE id IN ('pi_cherry19899','pi_a2b617f7-f510-4502-a046-805facedcc29') AND role != 'admin'`).catch(() => {});
+  await query(`UPDATE users SET role = 'admin' WHERE LOWER(username) = 'cherry19899' AND role != 'admin'`).catch(() => {});
   // Fix double-prefix corruption from old registration bug (idempotent)
   await query(`UPDATE jobs SET posted_by = 'pi_cherry19899' WHERE posted_by = 'pi_pi_cherry19899'`).catch(() => {});
   await query(`UPDATE applications SET freelancer_id = 'pi_cherry19899' WHERE freelancer_id = 'pi_pi_cherry19899'`).catch(() => {});
   // Remove test clutter jobs (description='test', title contains 'test') — idempotent
   await query(`DELETE FROM applications WHERE job_id IN (SELECT id FROM jobs WHERE description = 'test' AND title ILIKE '%test%')`).catch(() => {});
   await query(`DELETE FROM jobs WHERE description = 'test' AND title ILIKE '%test%'`).catch(() => {});
-  app.listen(PORT, () => {
-    console.log(`[WorkPro API] v3.2.0 on port ${PORT} (${NODE_ENV})`);
+  // Pre-warm admin stats cache so the first admin load shows data instantly
+  // (avoids empty Statistics tab during Render free-tier cold start).
+  const _adminRouter = require('./routes/admin');
+  if (_adminRouter.warmStats) _adminRouter.warmStats().catch(() => {});
+  // ─── Socket.io setup ──────────────────────────────────────────────
+  const { JWT_SECRET: _jwtSecret } = require('./src/middleware');
+  const FRONTEND_ORIGIN = process.env.FRONTEND_URL || 'https://cherry19899.github.io';
+  const io = new SocketIOServer(httpServer, {
+    cors: {
+      origin: [FRONTEND_ORIGIN, 'https://cherry19899.github.io', 'http://localhost:3000', 'http://localhost:5173'],
+      methods: ['GET', 'POST'],
+      credentials: true,
+    },
+    transports: ['websocket', 'polling'],
   });
+
+  // Socket.io auth middleware — verify JWT token
+  io.use((socket, next) => {
+    const token = socket.handshake.auth.token;
+    if (!token) return next(new Error('Authentication required'));
+    try {
+      const decoded = jwt.verify(token, _jwtSecret);
+      socket.userId = decoded.id;
+      next();
+    } catch (err) {
+      next(new Error('Invalid token'));
+    }
+  });
+
+  io.on('connection', (socket) => {
+    const userId = socket.userId;
+
+    socket.on('join_room', async (roomId) => {
+      if (typeof roomId !== 'string' || roomId.length >= 200) return;
+      try {
+        const room = await query(
+          'SELECT client_id, freelancer_id FROM chat_rooms WHERE id = $1 LIMIT 1',
+          [roomId]
+        );
+        if (!room.rows.length) return;
+        const r = room.rows[0];
+        if (r.client_id === userId || r.freelancer_id === userId) {
+          socket.join(roomId);
+        }
+      } catch (_) {}
+    });
+
+    socket.on('leave_room', (roomId) => {
+      socket.leave(roomId);
+    });
+
+    socket.on('typing', ({ roomId, userId: uid }) => {
+      if (typeof roomId === 'string') {
+        socket.to(roomId).emit('typing', { userId: uid || userId });
+      }
+    });
+
+    socket.on('stop_typing', ({ roomId, userId: uid }) => {
+      if (typeof roomId === 'string') {
+        socket.to(roomId).emit('stop_typing', { userId: uid || userId });
+      }
+    });
+  });
+
+  // Export io for use in route handlers (push new messages to connected clients)
+  app.set('io', io);
+  console.log('[WorkPro API] Socket.io ready');
+
+  // ─── Web Push VAPID setup ──────────────────────────────────────────────
+  const webpush = require('web-push');
+  const VAPID_PUBLIC  = process.env.VAPID_PUBLIC_KEY  || null;
+  const VAPID_PRIVATE = process.env.VAPID_PRIVATE_KEY || null;
+  const VAPID_EMAIL   = process.env.VAPID_EMAIL || 'mailto:admin@workpro.app';
+  if (VAPID_PUBLIC && VAPID_PRIVATE) {
+    webpush.setVapidDetails(VAPID_EMAIL, VAPID_PUBLIC, VAPID_PRIVATE);
+    app.set('webpush', webpush);
+    console.log('[WorkPro API] Web Push VAPID configured');
+  } else {
+    console.warn('[WorkPro API] Web Push disabled — set VAPID_PUBLIC_KEY + VAPID_PRIVATE_KEY env vars');
+    // Generate keys and print them to logs (one-time helper)
+    if (process.env.GENERATE_VAPID === '1') {
+      const keys = webpush.generateVAPIDKeys();
+      console.log('[VAPID] Add these to Render env vars:');
+      console.log('  VAPID_PUBLIC_KEY =', keys.publicKey);
+      console.log('  VAPID_PRIVATE_KEY =', keys.privateKey);
+    }
+  }
+
+  const server = httpServer.listen(PORT, () => {
+    console.log(`[WorkPro API] v3.3.0 on port ${PORT} (${NODE_ENV})`);
+  });
+
+  // ─── Keep-alive self-ping ──────────────────────────────────────────────
+  // Render's free tier spins the instance down after ~15 min without inbound
+  // traffic. A cold start then takes 30-60s — which exceeds the Pi payment
+  // approval window (~60s) and makes admin requests time out. Pinging our own
+  // public URL through Render's load balancer every 10 min counts as inbound
+  // traffic and keeps the instance warm. (Requests to localhost would NOT count.)
+  const SELF_URL = process.env.RENDER_EXTERNAL_URL || 'https://workpro-api.onrender.com';
+  if (NODE_ENV === 'production') {
+    setInterval(() => {
+      fetch(`${SELF_URL}/api/health`, { method: 'GET' })
+        .then(r => console.log(`[keep-alive] self-ping ${r.status}`))
+        .catch(e => console.warn('[keep-alive] self-ping failed:', e.message));
+    }, 10 * 60 * 1000); // every 10 minutes
+  }
+
+  // Graceful shutdown — Render sends SIGTERM before killing the process
+  const shutdown = (signal) => {
+    console.log(`[WorkPro API] ${signal} received — graceful shutdown`);
+    io.close();
+    server.close(() => {
+      console.log('[WorkPro API] HTTP server closed');
+      // Use getPool() — db.js exports `pool` by value at load time (null then),
+      // so destructuring `{ pool }` would always be null. getPool() returns the live pool.
+      const { getPool } = require('./src/db');
+      const livePool = getPool && getPool();
+      if (livePool) livePool.end(() => {
+        console.log('[WorkPro API] DB pool closed');
+        process.exit(0);
+      });
+      else process.exit(0);
+    });
+    // Force-kill after 10s if connections don't drain
+    setTimeout(() => { console.error('[WorkPro API] Forced exit after timeout'); process.exit(1); }, 10000).unref();
+  };
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT',  () => shutdown('SIGINT'));
 }).catch(err => {
   console.error('[Server] Failed to start:', err);
   process.exit(1);

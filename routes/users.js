@@ -6,6 +6,8 @@ const { query } = require('../src/db');
 const { notify, serverError } = require('../src/helpers');
 const { auth, softAuth, checkBlocked } = require('../src/middleware');
 
+const normalizeId = (id) => (id || '').toString().toLowerCase().replace(/^pi_/, '');
+
 // ─── Level helper ──────────────────────────────────────────────
 function computeLevel(completedJobs, rating) {
   const r = parseFloat(rating) || 0;
@@ -20,8 +22,8 @@ function computeLevel(completedJobs, rating) {
 // GET /api/users — list users
 router.get('/api/users', softAuth, async (req, res) => {
   try {
-    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
-    const offset = parseInt(req.query.offset) || 0;
+    const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 50, 200));
+    const offset = Math.max(0, parseInt(req.query.offset) || 0);
     const result = await query(
       "SELECT id, username, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, created_at FROM users WHERE status != 'deleted' ORDER BY created_at DESC LIMIT $1 OFFSET $2",
       [limit, offset]
@@ -96,8 +98,8 @@ router.post('/api/users/:id', auth, checkBlocked, async (req, res) => {
 
 // GET /api/users/:id/ratings
 router.get('/api/users/:id/ratings', async (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
-  const offset = parseInt(req.query.offset) || 0;
+  const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 50, 200));
+  const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
     const result = await query('SELECT * FROM ratings WHERE to_user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3', [req.params.id, limit, offset]);
     const totalRes = await query('SELECT COUNT(*), AVG(rating) FROM ratings WHERE to_user_id = $1', [req.params.id]);
@@ -137,7 +139,10 @@ router.get('/api/users/:id/portfolio', async (req, res) => {
 // POST + PUT /api/users/:id/availability
 async function handleAvailability(req, res) {
   const { available, availability } = req.body;
-  if (req.params.id !== req.userId) return res.status(403).json({ error: 'Forbidden' });
+  // Always operate on the authenticated user (from the JWT). Never trust the
+  // client-supplied :id for a self-mutation — the stored user object can desync
+  // from the JWT after account migrations (e.g. cherry19899 -> pi_cherry19899),
+  // which previously caused a spurious 403 "Forbidden" -> "Failed to update".
   const ALLOWED_AVAILABILITY = ['available', 'busy', 'away', 'unavailable'];
   let newStatus;
   if (availability !== undefined) {
@@ -146,7 +151,7 @@ async function handleAvailability(req, res) {
   } else {
     newStatus = available ? 'available' : 'unavailable';
   }
-  const targetId = req.params.id;
+  const targetId = req.userId;
   try {
     await query(`UPDATE users SET availability = $1, updated_at = NOW() WHERE id = $2`, [newStatus, targetId]);
     const result = await query(
@@ -189,10 +194,10 @@ router.post('/api/ratings', auth, checkBlocked, async (req, res) => {
       const jobCheck = await query('SELECT posted_by, hired_freelancer_id, status FROM jobs WHERE id = $1', [job_id]);
       if (jobCheck.rows.length) {
         const job = jobCheck.rows[0];
-        const isParticipant = job.posted_by === req.userId || job.hired_freelancer_id === req.userId;
+        const isParticipant = normalizeId(job.posted_by) === normalizeId(req.userId) || normalizeId(job.hired_freelancer_id) === normalizeId(req.userId);
         if (!isParticipant) return res.status(403).json({ error: 'You were not a participant in this job' });
         if (job.status !== 'completed') return res.status(400).json({ error: 'Job must be completed before rating' });
-        const expectedTarget = job.posted_by === req.userId ? job.hired_freelancer_id : job.posted_by;
+        const expectedTarget = normalizeId(job.posted_by) === normalizeId(req.userId) ? job.hired_freelancer_id : job.posted_by;
         if (to_user_id !== expectedTarget) return res.status(403).json({ error: 'You can only rate the other participant of this job' });
       }
     } else {
@@ -237,10 +242,10 @@ router.post('/api/reviews', auth, checkBlocked, async (req, res) => {
       const jobCheck = await query('SELECT posted_by, hired_freelancer_id, status FROM jobs WHERE id = $1', [job_id]);
       if (jobCheck.rows.length) {
         const job = jobCheck.rows[0];
-        const isParticipant = job.posted_by === req.userId || job.hired_freelancer_id === req.userId;
+        const isParticipant = normalizeId(job.posted_by) === normalizeId(req.userId) || normalizeId(job.hired_freelancer_id) === normalizeId(req.userId);
         if (!isParticipant) return res.status(403).json({ error: 'You were not a participant in this job' });
         if (job.status !== 'completed') return res.status(400).json({ error: 'Job must be completed before rating' });
-        const expectedTargetR = job.posted_by === req.userId ? job.hired_freelancer_id : job.posted_by;
+        const expectedTargetR = normalizeId(job.posted_by) === normalizeId(req.userId) ? job.hired_freelancer_id : job.posted_by;
         if (toId !== expectedTargetR) return res.status(403).json({ error: 'You can only rate the other participant of this job' });
       }
     } else {
@@ -301,8 +306,8 @@ router.get('/api/reviews/stats/:userId', async (req, res) => {
 
 // GET /api/reviews/user/:userId
 router.get('/api/reviews/user/:userId', async (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
-  const offset = parseInt(req.query.offset) || 0;
+  const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 50, 200));
+  const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
     const result = await query('SELECT r.*, u.username as from_username FROM ratings r LEFT JOIN users u ON u.id = r.from_user_id WHERE r.to_user_id = $1 ORDER BY r.created_at DESC LIMIT $2 OFFSET $3', [req.params.userId, limit, offset]);
     const total = await query('SELECT COUNT(*) FROM ratings WHERE to_user_id = $1', [req.params.userId]);
@@ -312,10 +317,10 @@ router.get('/api/reviews/user/:userId', async (req, res) => {
 
 // GET /api/reviews — alias used by some frontend pages (?user_id=xxx)
 router.get('/api/reviews', async (req, res) => {
-  const userId = req.query.user_id || req.headers['x-user-id'];
+  const userId = req.query.user_id;
   if (!userId) return res.json({ reviews: [], ratings: [] });
-  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
-  const offset = parseInt(req.query.offset) || 0;
+  const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 50, 200));
+  const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
     const result = await query('SELECT r.*, u.username as from_username FROM ratings r LEFT JOIN users u ON u.id = r.from_user_id WHERE r.to_user_id = $1 ORDER BY r.created_at DESC LIMIT $2 OFFSET $3', [userId, limit, offset]);
     const total = await query('SELECT COUNT(*) FROM ratings WHERE to_user_id = $1', [userId]);
@@ -336,8 +341,8 @@ router.get('/api/reviews/:id', async (req, res) => {
       if (!result.rows.length) return res.status(404).json({ error: 'Review not found' });
       res.json({ review: result.rows[0] });
     } else {
-      const limit2 = Math.min(parseInt(req.query.limit) || 50, 200);
-      const offset2 = parseInt(req.query.offset) || 0;
+      const limit2 = Math.max(1, Math.min(parseInt(req.query.limit) || 50, 200));
+      const offset2 = Math.max(0, parseInt(req.query.offset) || 0);
       const result = await query(
         'SELECT r.*, u.username as from_username FROM ratings r LEFT JOIN users u ON u.id = r.from_user_id WHERE r.to_user_id = $1 ORDER BY r.created_at DESC LIMIT $2 OFFSET $3',
         [id, limit2, offset2]

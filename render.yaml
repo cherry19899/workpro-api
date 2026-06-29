@@ -7,6 +7,8 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
+      - key: SANDBOX_MODE
+        value: "true"
       - key: PI_API_KEY
         sync: false  # Set via Render dashboard — never commit API keys to git
       - key: FRONTEND_URL

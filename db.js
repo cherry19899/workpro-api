@@ -25,9 +25,21 @@ async function loadJsonDb() {
 async function saveJsonDb() {
   try {
     await fs.mkdir(DATA_DIR, { recursive: true });
-    await fs.writeFile(DB_FILE, JSON.stringify(db, null, 2));
+    const tmpFile = DB_FILE + '.tmp';
+    await fs.writeFile(tmpFile, JSON.stringify(db, null, 2));
+    await fs.rename(tmpFile, DB_FILE);
   } catch (e) {
     console.error('[DB] JSON save error:', e.message);
+  }
+}
+
+async function healthCheck() {
+  if (!usePg) return { ok: true, mode: 'json' };
+  try {
+    await pool.query('SELECT 1');
+    return { ok: true, mode: 'pg' };
+  } catch (e) {
+    return { ok: false, error: e.message };
   }
 }
 
@@ -47,6 +59,20 @@ async function query(text, params) {
   return result;
 }
 
+const MAX_RETRIES = 3;
+async function queryWithRetry(text, params, retries = MAX_RETRIES) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      return await query(text, params);
+    } catch (err) {
+      // Only retry on transient connection errors, not logic/constraint errors
+      const transient = err.code === 'ECONNRESET' || err.code === '57P01' || err.message.includes('Connection terminated');
+      if (!transient || attempt === retries) throw err;
+      await new Promise(r => setTimeout(r, 200 * attempt));
+    }
+  }
+}
+
 async function initDb() {
   if (!usePg) {
     await loadJsonDb();
@@ -57,7 +83,10 @@ async function initDb() {
   const { Pool } = require('pg');
   pool = new Pool({
     connectionString: process.env.DATABASE_URL,
-    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+    max: 8,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 5000,
   });
 
   try {
@@ -77,8 +106,11 @@ async function initDb() {
       skills TEXT, images TEXT, deadline TIMESTAMP, status VARCHAR(50) DEFAULT 'open',
       posted_by VARCHAR(255), posted_by_name VARCHAR(255), applications INTEGER DEFAULT 0,
       connects_spent INTEGER DEFAULT 1, apply_cost INTEGER DEFAULT 1,
+      featured BOOLEAN DEFAULT false,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )`);
+    // Add featured column to existing tables (idempotent — ALTER TABLE ADD COLUMN IF NOT EXISTS)
+    await query(`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS featured BOOLEAN DEFAULT false`).catch(() => {});
     await query(`CREATE TABLE IF NOT EXISTS applications (
       id SERIAL PRIMARY KEY, job_id INTEGER, job_title VARCHAR(500),
       freelancer_id VARCHAR(255), freelancer_name VARCHAR(255), message TEXT,
@@ -101,6 +133,11 @@ async function initDb() {
     await query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS txid VARCHAR(255)`).catch(() => {});
     await query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS payment_id VARCHAR(255)`).catch(() => {});
     await query(`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS hired_freelancer_id VARCHAR(255)`).catch(() => {});
+    // Profile extended fields
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS title VARCHAR(255)`).catch(() => {});
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS hourly_rate DECIMAL(10,2)`).catch(() => {});
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS location VARCHAR(255)`).catch(() => {});
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS website VARCHAR(500)`).catch(() => {});
     await query(`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS hired_freelancer_name VARCHAR(255)`).catch(() => {});
     await query(`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS escrow_id INTEGER`).catch(() => {});
     await query(`ALTER TABLE applications ADD COLUMN IF NOT EXISTS bid_amount DECIMAL(10,2)`).catch(() => {});
@@ -119,6 +156,11 @@ async function initDb() {
       id SERIAL PRIMARY KEY, room_id VARCHAR(255), sender_id VARCHAR(255),
       sender_name VARCHAR(255), message TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )`);
+    await query(`CREATE TABLE IF NOT EXISTS chat_attachments (
+      id VARCHAR(255) PRIMARY KEY, room_id VARCHAR(255), uploader_id VARCHAR(255),
+      filename VARCHAR(500), mimetype VARCHAR(255), size INTEGER, data BYTEA,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`);
     await query(`CREATE TABLE IF NOT EXISTS audit_logs (
       id SERIAL PRIMARY KEY, action VARCHAR(255) NOT NULL, data JSONB DEFAULT '{}',
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -132,4 +174,4 @@ async function initDb() {
 }
 
 function getPool() { return pool; }
-module.exports = { query, initDb, pool, getPool, usePg, db, saveJsonDb };
+module.exports = { query, queryWithRetry, initDb, pool, getPool, usePg, db, saveJsonDb, healthCheck };
