@@ -60,6 +60,38 @@ function serverError(err, res) {
   return res.status(500).json({ error: 'Internal server error' });
 }
 
+// ─── Platform & Developer Fee ──────────────────────────────────────────────
+const FEE_MIN = 0; const FEE_MAX = 0.1;
+const FEE_DEFAULT_PCT = parseFloat(process.env.PLATFORM_FEE_PERCENT || '2');
+const FEE_DEFAULT = Math.min(Math.max(FEE_DEFAULT_PCT / 100, FEE_MIN), FEE_MAX);
+const DEV_FEE_MIN = 0; const DEV_FEE_MAX = 0.2;
+const DEV_FEE_DEFAULT_PCT = parseFloat(process.env.DEVELOPER_FEE_PERCENT || '0');
+const DEV_FEE_DEFAULT = Math.min(Math.max(DEV_FEE_DEFAULT_PCT / 100, DEV_FEE_MIN), DEV_FEE_MAX);
+let _feeCache = null; let _devFeeCache = null;
+const FEE_CACHE_TTL = 60000;
+
+async function getPlatformFee() {
+  if (_feeCache && Date.now() - _feeCache.time < FEE_CACHE_TTL) return _feeCache.value;
+  try {
+    const r = await query("SELECT value FROM platform_settings WHERE key = 'platform_fee_percent' LIMIT 1");
+    const pct = r.rows.length ? parseFloat(r.rows[0].value) : FEE_DEFAULT_PCT;
+    _feeCache = { value: Math.min(Math.max(pct / 100, FEE_MIN), FEE_MAX), time: Date.now() };
+  } catch { _feeCache = { value: FEE_DEFAULT, time: Date.now() }; }
+  return _feeCache.value;
+}
+
+async function getDeveloperFee() {
+  if (_devFeeCache && Date.now() - _devFeeCache.time < FEE_CACHE_TTL) return _devFeeCache.value;
+  try {
+    const r = await query("SELECT value FROM platform_settings WHERE key = 'developer_fee_percent' LIMIT 1");
+    const pct = r.rows.length ? parseFloat(r.rows[0].value) : DEV_FEE_DEFAULT_PCT;
+    _devFeeCache = { value: Math.min(Math.max(pct / 100, DEV_FEE_MIN), DEV_FEE_MAX), time: Date.now() };
+  } catch { _devFeeCache = { value: DEV_FEE_DEFAULT, time: Date.now() }; }
+  return _devFeeCache.value;
+}
+
+function invalidatePlatformFeeCache() { _feeCache = null; _devFeeCache = null; }
+
 module.exports = {
   piApiRequest,
   piApprovePayment,
@@ -69,4 +101,9 @@ module.exports = {
   audit,
   serverError,
   PI_API_KEY,
+  getPlatformFee,
+  getDeveloperFee,
+  invalidatePlatformFeeCache,
+  FEE_MAX,
+  DEV_FEE_MAX,
 };

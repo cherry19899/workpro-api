@@ -5,7 +5,7 @@ const router = require('express').Router();
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const { query, getPool } = require('../src/db');
-const { notify, audit, serverError } = require('../src/helpers');
+const { notify, audit, serverError, getDeveloperFee, DEV_FEE_MAX, invalidatePlatformFeeCache } = require('../src/helpers');
 const { adminAuth, JWT_SECRET, ADMIN_API_KEY } = require('../src/middleware');
 
 // GET /api/admin/stats
@@ -29,6 +29,12 @@ router.get('/api/admin/stats', adminAuth, async (req, res) => {
     const e = parseInt(escrows.rows[0].count);
     const ae = parseInt(activeEscrows.rows[0].count);
     const rev = parseFloat(revenue.rows[0].total);
+    const [platformFeeRow, devFeeRow] = await Promise.all([
+      query("SELECT value FROM platform_settings WHERE key = 'platform_fee_percent' LIMIT 1").catch(() => ({ rows: [] })),
+      query("SELECT value FROM platform_settings WHERE key = 'developer_fee_percent' LIMIT 1").catch(() => ({ rows: [] })),
+    ]);
+    const platformFeePercent = platformFeeRow.rows.length ? parseFloat(platformFeeRow.rows[0].value) : 2;
+    const developerFeePercent = devFeeRow.rows.length ? parseFloat(devFeeRow.rows[0].value) : 0;
     res.json({
       total_users: u, users: u,
       total_jobs: j, jobs: j,
@@ -40,6 +46,8 @@ router.get('/api/admin/stats', adminAuth, async (req, res) => {
       ratings: parseInt(ratings.rows[0].count),
       chats: parseInt(chats.rows[0].count),
       pending_moderation: parseInt(disputes.rows[0].count),
+      platformFeePercent,
+      developerFeePercent,
     });
   } catch (err) { serverError(err, res); }
 });
@@ -281,6 +289,35 @@ router.get('/api/admin/earnings', adminAuth, async (req, res) => {
         average_transaction: txCount > 0 ? Math.round(total_earnings / txCount * 100) / 100 : 0,
       }
     });
+  } catch (err) { serverError(err, res); }
+});
+
+// ─── Developer fee ──────────────────────────────────────────────
+// GET /api/admin/developer-fee
+router.get('/api/admin/developer-fee', adminAuth, async (req, res) => {
+  try {
+    const r = await query("SELECT value FROM platform_settings WHERE key = 'developer_fee_percent' LIMIT 1");
+    const current = r.rows.length ? parseFloat(r.rows[0].value) : 0;
+    res.json({ developerFeePercent: current, maxPercent: DEV_FEE_MAX * 100 });
+  } catch (err) { serverError(err, res); }
+});
+
+// PATCH /api/admin/developer-fee
+router.patch('/api/admin/developer-fee', adminAuth, async (req, res) => {
+  const pct = parseFloat(req.body.percent);
+  if (isNaN(pct) || pct < 0 || pct > DEV_FEE_MAX * 100) {
+    return res.status(400).json({ error: `percent must be between 0 and ${DEV_FEE_MAX * 100}` });
+  }
+  try {
+    await query(
+      `INSERT INTO platform_settings (key, value, updated_at)
+       VALUES ('developer_fee_percent', $1, NOW())
+       ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()`,
+      [String(pct)]
+    );
+    invalidatePlatformFeeCache();
+    await audit('admin_developer_fee_updated', { percent: pct, by: req.userId });
+    res.json({ success: true, developerFeePercent: pct });
   } catch (err) { serverError(err, res); }
 });
 
