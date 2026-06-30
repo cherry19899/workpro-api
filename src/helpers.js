@@ -15,7 +15,7 @@ const PI_API_BASE = 'https://api.minepi.com';
 // ─── Platform fee ──────────────────────────────────────────────
 // Hard limits — no matter what's in the DB or env, fee is capped at 10%.
 const FEE_MIN = 0;
-const FEE_MAX = 0.1;
+const FEE_MAX = 0.2;
 const FEE_DEFAULT_PCT = parseFloat(process.env.PLATFORM_FEE_PERCENT || '2');
 const FEE_DEFAULT = Math.min(Math.max(FEE_DEFAULT_PCT / 100, FEE_MIN), FEE_MAX);
 
