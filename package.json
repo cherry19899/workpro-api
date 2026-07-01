@@ -6,7 +6,9 @@
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js",
-    "db:init": "node -e \"require('./db').initDb()\""
+    "db:init": "node -e \"require('./db').initDb()\"",
+    "test": "jest --testEnvironment node --runInBand",
+    "test:watch": "jest --watch"
   },
   "dependencies": {
     "compression": "^1.8.1",
@@ -23,7 +25,13 @@
     "web-push": "^3.6.7"
   },
   "devDependencies": {
+    "jest": "^29.7.0",
+    "supertest": "^6.3.4",
     "nodemon": "^2.0.22"
+  },
+  "jest": {
+    "testMatch": ["**/tests/**/*.test.js"],
+    "testEnvironment": "node"
   },
   "engines": {
     "node": ">=18.0.0"

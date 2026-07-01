@@ -1000,5 +1000,125 @@ router.post('/api/admin/users/bulk-unblock', adminAuth, async (req, res) => {
   } catch (err) { serverError(err, res); }
 });
 
+// ─── Analytics: daily signups / revenue / jobs over time ─────────────────────
+
+// GET /api/admin/analytics/signups?days=30
+router.get('/api/admin/analytics/signups', adminAuth, async (req, res) => {
+  const days = Math.min(365, Math.max(7, parseInt(req.query.days) || 30));
+  try {
+    const r = await query(`
+      SELECT DATE(created_at) AS date, COUNT(*) AS count
+      FROM users
+      WHERE created_at >= NOW() - INTERVAL '${days} days'
+      GROUP BY DATE(created_at)
+      ORDER BY date ASC
+    `);
+    res.json({ data: r.rows, days });
+  } catch (err) { serverError(err, res); }
+});
+
+// GET /api/admin/analytics/revenue?days=30
+router.get('/api/admin/analytics/revenue', adminAuth, async (req, res) => {
+  const days = Math.min(365, Math.max(7, parseInt(req.query.days) || 30));
+  try {
+    const [daily, byCategory] = await Promise.all([
+      query(`
+        SELECT DATE(created_at) AS date, COALESCE(SUM(amount),0) AS amount, COUNT(*) AS count
+        FROM payments WHERE status='completed' AND created_at >= NOW() - INTERVAL '${days} days'
+        GROUP BY DATE(created_at) ORDER BY date ASC
+      `),
+      query(`
+        SELECT j.category, COUNT(e.id) AS count, COALESCE(SUM(e.amount),0) AS volume
+        FROM escrows e LEFT JOIN jobs j ON j.id=e.job_id
+        WHERE e.status IN ('released','completed')
+        GROUP BY j.category ORDER BY volume DESC
+      `),
+    ]);
+    res.json({ daily: daily.rows, by_category: byCategory.rows, days });
+  } catch (err) { serverError(err, res); }
+});
+
+// GET /api/admin/analytics/jobs?days=30
+router.get('/api/admin/analytics/jobs', adminAuth, async (req, res) => {
+  const days = Math.min(365, Math.max(7, parseInt(req.query.days) || 30));
+  try {
+    const [daily, byCategory, funnel] = await Promise.all([
+      query(`SELECT DATE(created_at) AS date, COUNT(*) AS count FROM jobs WHERE created_at >= NOW() - INTERVAL '${days} days' GROUP BY DATE(created_at) ORDER BY date ASC`),
+      query(`SELECT category, COUNT(*) AS count FROM jobs GROUP BY category ORDER BY count DESC`),
+      query(`
+        SELECT
+          (SELECT COUNT(*) FROM users) AS total_users,
+          (SELECT COUNT(*) FROM jobs) AS total_jobs,
+          (SELECT COUNT(*) FROM applications) AS total_applications,
+          (SELECT COUNT(*) FROM escrows WHERE status != 'pending') AS total_hires,
+          (SELECT COUNT(*) FROM escrows WHERE status IN ('released','completed')) AS total_completed,
+          (SELECT COUNT(*) FROM ratings) AS total_reviews
+      `),
+    ]);
+    res.json({ daily: daily.rows, by_category: byCategory.rows, funnel: funnel.rows[0], days });
+  } catch (err) { serverError(err, res); }
+});
+
+// GET /api/admin/analytics/retention
+router.get('/api/admin/analytics/retention', adminAuth, async (req, res) => {
+  try {
+    const r = await query(`
+      SELECT
+        COUNT(CASE WHEN last_active >= NOW()-INTERVAL '1 day'  THEN 1 END)  AS dau,
+        COUNT(CASE WHEN last_active >= NOW()-INTERVAL '7 days' THEN 1 END)  AS wau,
+        COUNT(CASE WHEN last_active >= NOW()-INTERVAL '30 days' THEN 1 END) AS mau,
+        COUNT(CASE WHEN last_active < NOW()-INTERVAL '30 days' THEN 1 END)  AS churned,
+        COUNT(*) AS total
+      FROM users WHERE status != 'deleted'
+    `).catch(() => ({ rows: [{}] }));
+    res.json(r.rows[0] || {});
+  } catch (err) { serverError(err, res); }
+});
+
+// ─── CSV Export ───────────────────────────────────────────────────────────────
+
+function toCSV(rows) {
+  if (!rows || !rows.length) return '';
+  const headers = Object.keys(rows[0]);
+  const escape = v => {
+    if (v == null) return '';
+    const s = String(v).replace(/"/g, '""');
+    return s.includes(',') || s.includes('"') || s.includes('\n') ? `"${s}"` : s;
+  };
+  return [
+    headers.join(','),
+    ...rows.map(r => headers.map(h => escape(r[h])).join(',')),
+  ].join('\n');
+}
+
+// GET /api/admin/export/:table — CSV export
+router.get('/api/admin/export/:table', adminAuth, async (req, res) => {
+  const ALLOWED = { users: 'users', jobs: 'jobs', escrows: 'escrows', payments: 'payments', reviews: 'ratings', applications: 'applications' };
+  const table = ALLOWED[req.params.table];
+  if (!table) return res.status(400).json({ error: `Unknown table. Allowed: ${Object.keys(ALLOWED).join(', ')}` });
+  try {
+    const limit = Math.min(10000, parseInt(req.query.limit) || 1000);
+    const r = await query(`SELECT * FROM ${table} ORDER BY created_at DESC LIMIT $1`, [limit]);
+    const csv = toCSV(r.rows);
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="${table}_export_${new Date().toISOString().slice(0,10)}.csv"`);
+    res.send(csv);
+  } catch (err) { serverError(err, res); }
+});
+
+// GET /api/admin/realtime — live counts for dashboard WebSocket (polling fallback)
+router.get('/api/admin/realtime', adminAuth, async (req, res) => {
+  try {
+    const r = await query(`
+      SELECT
+        (SELECT COUNT(*) FROM users WHERE last_active >= NOW()-INTERVAL '5 minutes') AS online_now,
+        (SELECT COUNT(*) FROM jobs WHERE created_at >= NOW()-INTERVAL '1 hour') AS jobs_last_hour,
+        (SELECT COALESCE(SUM(amount),0) FROM payments WHERE status='completed' AND created_at >= NOW()-INTERVAL '24 hours') AS revenue_24h,
+        (SELECT COUNT(*) FROM escrows WHERE status IN ('funded','active')) AS active_escrows
+    `).catch(() => ({ rows: [{ online_now: 0, jobs_last_hour: 0, revenue_24h: 0, active_escrows: 0 }] }));
+    res.json(r.rows[0]);
+  } catch (err) { serverError(err, res); }
+});
+
 router.warmStats = warmStats;
 module.exports = router;

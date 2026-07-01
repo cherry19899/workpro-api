@@ -1078,4 +1078,203 @@ router.post('/api/payments/webhook', async (req, res) => {
   } catch (err) { serverError(err, res); }
 });
 
+// ─── Escrow Milestones ────────────────────────────────────────────────────────
+
+// GET /api/escrows/:id/milestones
+router.get('/api/escrows/:id/milestones', auth, async (req, res) => {
+  const escrowId = parseInt(req.params.id);
+  try {
+    const esc = await query('SELECT * FROM escrows WHERE id=$1', [escrowId]);
+    if (!esc.rows.length) return res.status(404).json({ error: 'Escrow not found' });
+    const e = esc.rows[0];
+    if (e.client_id !== req.userId && e.freelancer_id !== req.userId) {
+      return res.status(403).json({ error: 'Not your escrow' });
+    }
+    const [milestones, txns] = await Promise.all([
+      query('SELECT * FROM escrow_milestones WHERE escrow_id=$1 ORDER BY milestone_index', [escrowId]),
+      query('SELECT * FROM escrow_transactions WHERE escrow_id=$1 ORDER BY created_at', [escrowId]),
+    ]);
+    res.json({ escrow: e, milestones: milestones.rows, transactions: txns.rows });
+  } catch (err) { serverError(err, res); }
+});
+
+// POST /api/escrows/:id/milestones — create milestones (on fund, auto-created)
+router.post('/api/escrows/:id/milestones', auth, async (req, res) => {
+  const escrowId = parseInt(req.params.id);
+  const { milestones } = req.body; // [{ title, percent }]
+  if (!milestones || !Array.isArray(milestones)) return res.status(400).json({ error: 'milestones array required' });
+  const totalPct = milestones.reduce((s, m) => s + (parseInt(m.percent) || 0), 0);
+  if (totalPct !== 100) return res.status(400).json({ error: 'Milestone percents must sum to 100' });
+  if (milestones.length < 1 || milestones.length > 10) return res.status(400).json({ error: '1-10 milestones allowed' });
+  try {
+    const esc = await query('SELECT * FROM escrows WHERE id=$1', [escrowId]);
+    if (!esc.rows.length) return res.status(404).json({ error: 'Escrow not found' });
+    const e = esc.rows[0];
+    if (e.client_id !== req.userId) return res.status(403).json({ error: 'Only client can set milestones' });
+    if (!['funded', 'active'].includes(e.status)) return res.status(400).json({ error: 'Escrow must be funded first' });
+    // Delete existing pending milestones
+    await query('DELETE FROM escrow_milestones WHERE escrow_id=$1 AND status=$2', [escrowId, 'pending']);
+    const totalAmt = parseFloat(e.amount);
+    const created = [];
+    for (let i = 0; i < milestones.length; i++) {
+      const m = milestones[i];
+      const pct = parseInt(m.percent);
+      const amt = parseFloat((totalAmt * pct / 100).toFixed(2));
+      const r = await query(
+        `INSERT INTO escrow_milestones (escrow_id, milestone_index, title, percent, amount)
+         VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+        [escrowId, i, m.title || `Milestone ${i + 1}`, pct, amt]
+      );
+      created.push(r.rows[0]);
+    }
+    await query('UPDATE escrows SET milestone_count=$1, updated_at=NOW() WHERE id=$2', [milestones.length, escrowId]);
+    res.json({ milestones: created, success: true });
+  } catch (err) { serverError(err, res); }
+});
+
+// POST /api/escrows/:id/milestone/:milestoneId/request — freelancer requests release
+router.post('/api/escrows/:id/milestone/:milestoneId/request', auth, checkBlocked, async (req, res) => {
+  const escrowId = parseInt(req.params.id);
+  const milestoneId = parseInt(req.params.milestoneId);
+  try {
+    const esc = await query('SELECT * FROM escrows WHERE id=$1', [escrowId]);
+    if (!esc.rows.length) return res.status(404).json({ error: 'Escrow not found' });
+    const e = esc.rows[0];
+    if (e.freelancer_id !== req.userId) return res.status(403).json({ error: 'Only freelancer can request release' });
+    if (!['funded', 'active'].includes(e.status)) return res.status(400).json({ error: 'Escrow not active' });
+    const ms = await query('SELECT * FROM escrow_milestones WHERE id=$1 AND escrow_id=$2', [milestoneId, escrowId]);
+    if (!ms.rows.length) return res.status(404).json({ error: 'Milestone not found' });
+    const m = ms.rows[0];
+    if (m.status !== 'pending') return res.status(400).json({ error: 'Milestone already processed' });
+    // Auto-release in 14 days if client doesn't respond
+    const autoReleaseAt = new Date(Date.now() + 14 * 24 * 60 * 60 * 1000);
+    await query(
+      'UPDATE escrow_milestones SET freelancer_requested=TRUE, requested_at=NOW(), auto_release_at=$1 WHERE id=$2',
+      [autoReleaseAt, milestoneId]
+    );
+    // Notify client
+    notify(e.client_id, 'milestone_requested', 'Milestone completion requested',
+      `Freelancer requested release of milestone ${m.milestone_index + 1}`, { escrow_id: escrowId, milestone_id: milestoneId }).catch(() => {});
+    res.json({ success: true, auto_release_at: autoReleaseAt });
+  } catch (err) { serverError(err, res); }
+});
+
+// POST /api/escrows/:id/milestone/:milestoneId/approve — client approves, releases funds
+router.post('/api/escrows/:id/milestone/:milestoneId/approve', auth, checkBlocked, async (req, res) => {
+  const escrowId = parseInt(req.params.id);
+  const milestoneId = parseInt(req.params.milestoneId);
+  const pool = getPool();
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const escRow = await client.query('SELECT * FROM escrows WHERE id=$1 FOR UPDATE', [escrowId]);
+    if (!escRow.rows.length) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Escrow not found' }); }
+    const e = escRow.rows[0];
+    if (e.client_id !== req.userId) { await client.query('ROLLBACK'); return res.status(403).json({ error: 'Only client can approve' }); }
+    const msRow = await client.query('SELECT * FROM escrow_milestones WHERE id=$1 AND escrow_id=$2 FOR UPDATE', [milestoneId, escrowId]);
+    if (!msRow.rows.length) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Milestone not found' }); }
+    const m = msRow.rows[0];
+    if (m.status !== 'pending') { await client.query('ROLLBACK'); return res.status(400).json({ error: 'Already processed' }); }
+
+    const releaseAmt = parseFloat(m.amount);
+    const fee = await getPlatformFee();
+    const platformFee = parseFloat((releaseAmt * fee).toFixed(2));
+    const freelancerAmt = parseFloat((releaseAmt - platformFee).toFixed(2));
+
+    // Update milestone
+    await client.query('UPDATE escrow_milestones SET status=$1, client_approved=TRUE, approved_at=NOW() WHERE id=$2',
+      ['released', milestoneId]);
+    // Credit freelancer balance
+    await client.query('UPDATE users SET balance_pi=balance_pi+$1, total_earned=total_earned+$1, updated_at=NOW() WHERE id=$2',
+      [freelancerAmt, e.freelancer_id]);
+    // Record transaction
+    await client.query('INSERT INTO escrow_transactions (escrow_id, milestone_id, type, amount, note) VALUES ($1,$2,$3,$4,$5)',
+      [escrowId, milestoneId, 'release', releaseAmt, `Milestone ${m.milestone_index + 1} approved`]);
+    await client.query('INSERT INTO escrow_transactions (escrow_id, milestone_id, type, amount, note) VALUES ($1,$2,$3,$4,$5)',
+      [escrowId, milestoneId, 'fee', platformFee, 'Platform fee']);
+    // Check if all milestones completed
+    const remaining = await client.query("SELECT COUNT(*) FROM escrow_milestones WHERE escrow_id=$1 AND status='pending'", [escrowId]);
+    const allDone = parseInt(remaining.rows[0].count) === 0;
+    if (allDone) {
+      await client.query("UPDATE escrows SET status='completed', updated_at=NOW() WHERE id=$1", [escrowId]);
+    }
+    await client.query('COMMIT');
+    // Notify freelancer
+    notify(e.freelancer_id, 'milestone_approved', 'Milestone payment received!',
+      `${freelancerAmt} π released for milestone ${m.milestone_index + 1}`, { escrow_id: escrowId }).catch(() => {});
+    res.json({ success: true, released: freelancerAmt, fee: platformFee, all_completed: allDone });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    serverError(err, res);
+  } finally { client.release(); }
+});
+
+// ─── Saved searches: daily alert check (called by cron) ──────────────────────
+// POST /api/saved-searches/check-alerts (internal — requires admin key)
+router.post('/api/saved-searches/check-alerts', async (req, res) => {
+  const key = req.headers['x-admin-key'] || '';
+  const { ADMIN_API_KEY } = require('../src/middleware');
+  if (!key || key !== ADMIN_API_KEY) return res.status(403).json({ error: 'Forbidden' });
+  try {
+    const searches = await query("SELECT * FROM saved_searches WHERE alert_enabled=TRUE AND (last_alerted_at IS NULL OR last_alerted_at < NOW() - INTERVAL '1 day')");
+    let alerted = 0;
+    for (const s of searches.rows) {
+      const params = s.query_params || {};
+      const q = params.q || params.search || '';
+      const cat = params.category || '';
+      let conditions = ["status='open'"];
+      const qParams = [];
+      let idx = 1;
+      if (q) { conditions.push(`search_vector @@ plainto_tsquery('english',$${idx++})`); qParams.push(q); }
+      if (cat && cat !== 'all') { conditions.push(`category ILIKE $${idx++}`); qParams.push(cat); }
+      conditions.push(`created_at > COALESCE((SELECT last_alerted_at FROM saved_searches WHERE id=$${idx++}), NOW()-INTERVAL '1 day')`);
+      qParams.push(s.id);
+      const newJobs = await query(`SELECT id, title, budget FROM jobs WHERE ${conditions.join(' AND ')} LIMIT 5`, qParams);
+      if (newJobs.rows.length > 0) {
+        notify(s.user_id, 'saved_search_alert', 'New jobs matching your saved search',
+          `${newJobs.rows.length} new job${newJobs.rows.length > 1 ? 's' : ''} for "${s.name}"`,
+          { jobs: newJobs.rows, search_id: s.id }).catch(() => {});
+        await query('UPDATE saved_searches SET last_alerted_at=NOW() WHERE id=$1', [s.id]);
+        alerted++;
+      }
+    }
+    res.json({ alerted, total: searches.rows.length });
+  } catch (err) { serverError(err, res); }
+});
+
+// ─── Full-text search endpoint ────────────────────────────────────────────────
+router.get('/api/jobs/search/fulltext', async (req, res) => {
+  const { q, category, min_budget, max_budget, urgent, sort = 'relevance', page = 1, limit: lim = 20 } = req.query;
+  const pageNum = Math.max(1, parseInt(page));
+  const limitNum = Math.max(1, Math.min(50, parseInt(lim)));
+  const offset = (pageNum - 1) * limitNum;
+  try {
+    const conditions = ["j.status='open'"];
+    const params = [];
+    let idx = 1;
+    if (q && q.trim()) {
+      conditions.push(`(j.search_vector @@ plainto_tsquery('english',$${idx}) OR j.title ILIKE $${idx+1})`);
+      params.push(q.trim(), `%${q.trim()}%`);
+      idx += 2;
+    }
+    if (category && category !== 'all') { conditions.push(`j.category ILIKE $${idx++}`); params.push(category); }
+    if (min_budget) { conditions.push(`j.budget >= $${idx++}`); params.push(parseFloat(min_budget)); }
+    if (max_budget) { conditions.push(`j.budget <= $${idx++}`); params.push(parseFloat(max_budget)); }
+    if (urgent === 'true') { conditions.push('j.is_urgent = TRUE'); }
+    const orderBy = {
+      relevance: q ? `ts_rank(j.search_vector, plainto_tsquery('english', '${q.replace(/'/g,"''")}')) DESC, j.created_at DESC` : 'j.created_at DESC',
+      newest: 'j.created_at DESC',
+      budget_high: 'j.budget DESC',
+      budget_low: 'j.budget ASC',
+      popular: 'j.applications DESC',
+    }[sort] || 'j.created_at DESC';
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+    const [rows, total] = await Promise.all([
+      query(`SELECT j.*, u.username AS posted_by_name, u.rating AS client_rating FROM jobs j LEFT JOIN users u ON u.id=j.posted_by ${where} ORDER BY ${orderBy} LIMIT $${idx} OFFSET $${idx+1}`, [...params, limitNum, offset]),
+      query(`SELECT COUNT(*) FROM jobs j ${where}`, params),
+    ]);
+    res.json({ jobs: rows.rows, total: parseInt(total.rows[0].count), page: pageNum, limit: limitNum });
+  } catch (err) { serverError(err, res); }
+});
+
 module.exports = router;

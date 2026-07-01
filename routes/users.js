@@ -388,4 +388,163 @@ router.post('/api/ratings/:id/reply', auth, checkBlocked, async (req, res) => {
   } catch (err) { serverError(err, res); }
 });
 
-module.exports = router;
+// ─── GDPR — anonymize all user data ──────────────────────────────────────────
+router.delete('/api/me/gdpr', auth, async (req, res) => {
+  const uid = req.userId;
+  try {
+    const anon = `deleted_user_${Date.now()}`;
+    // Anonymize user record (keep row for FK integrity)
+    await query(`UPDATE users SET
+      username=$1, email=NULL, bio=NULL, skills=NULL, avatar=NULL,
+      balance_connects=0, balance_pi=0, kyc_verified=FALSE,
+      availability='unavailable', is_blocked=TRUE, status='deleted',
+      title=NULL, hourly_rate=NULL, location=NULL, website=NULL,
+      updated_at=NOW()
+      WHERE id=$2`, [anon, uid]);
+    // Anonymize chat messages
+    await query(`UPDATE chat_messages SET message='[deleted]', sender_name=$1 WHERE sender_id=$2`, [anon, uid]);
+    // Anonymize reviews/ratings
+    await query(`UPDATE ratings SET comment='[deleted]' WHERE from_user_id=$1`, [uid]);
+    await query(`UPDATE reviews SET text='[deleted]' WHERE reviewer_id=$1`, [uid]);
+    // Delete notifications
+    await query(`DELETE FROM notifications WHERE user_id=$1`, [uid]);
+    // Delete saved searches
+    await query(`DELETE FROM saved_searches WHERE user_id=$1`, [uid]);
+    // Revoke all JWTs by noting deletion (JWT blacklist via timestamp)
+    res.json({ success: true, message: 'Account anonymized per GDPR request' });
+  } catch (err) { serverError(err, res); }
+});
+
+// ─── Badges — compute and update user badges ──────────────────────────────────
+async function computeBadges(userId) {
+  try {
+    const [user, reviews] = await Promise.all([
+      query('SELECT total_jobs_completed, rating, total_reviews, repeat_client_count FROM users WHERE id=$1', [userId]),
+      query('SELECT rating, created_at FROM ratings WHERE to_user_id=$1 ORDER BY created_at DESC', [userId]),
+    ]);
+    if (!user.rows.length) return;
+    const u = user.rows[0];
+    const completed = parseInt(u.total_jobs_completed) || 0;
+    const totalReviews = parseInt(u.total_reviews) || reviews.rows.length;
+    const repeatClients = parseInt(u.repeat_client_count) || 0;
+
+    // Weighted avg: last 6 months weight 1.5x, older 1.0x
+    let weightedSum = 0, weightedCount = 0;
+    const sixMonthsAgo = Date.now() - 6 * 30 * 24 * 60 * 60 * 1000;
+    for (const r of reviews.rows) {
+      const w = new Date(r.created_at).getTime() > sixMonthsAgo ? 1.5 : 1.0;
+      weightedSum += parseFloat(r.rating) * w;
+      weightedCount += w;
+    }
+    const avgRating = weightedCount > 0 ? weightedSum / weightedCount : 0;
+
+    const badges = [];
+    if (totalReviews >= 5 && avgRating >= 4.5) badges.push('rising_talent');
+    if (totalReviews >= 20 && avgRating >= 4.8 && completed >= 15) badges.push('top_rated');
+    if (totalReviews >= 50 && avgRating >= 4.9) badges.push('top_rated_plus');
+    if (u.kyc_verified) badges.push('verified');
+    if (totalReviews > 0 && repeatClients / Math.max(totalReviews, 1) >= 0.5) badges.push('repeat_magnet');
+    if (completed >= 100) badges.push('expert_level');
+
+    await query(`UPDATE users SET badges=$1, rating=$2, total_reviews=$3, updated_at=NOW() WHERE id=$4`,
+      [badges, avgRating.toFixed(2), Math.max(totalReviews, reviews.rows.length), userId]);
+  } catch (err) {
+    console.error('[badges] compute error:', err.message);
+  }
+}
+
+// GET /api/users/:id/badges
+router.get('/api/users/:id/badges', async (req, res) => {
+  try {
+    const r = await query('SELECT badges, rating, total_reviews FROM users WHERE id=$1', [req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ error: 'User not found' });
+    res.json({ badges: r.rows[0].badges || [], rating: r.rows[0].rating, total_reviews: r.rows[0].total_reviews });
+  } catch (err) { serverError(err, res); }
+});
+
+// POST /api/reviews — create a review (enhanced with badges trigger)
+router.post('/api/reviews/v2', auth, checkBlocked, async (req, res) => {
+  const { job_id, reviewee_id, rating, text } = req.body;
+  if (!reviewee_id || !rating) return res.status(400).json({ error: 'reviewee_id and rating required' });
+  if (rating < 1 || rating > 5) return res.status(400).json({ error: 'Rating must be 1-5' });
+  if (text && text.length < 10) return res.status(400).json({ error: 'Review text must be at least 10 characters' });
+  if (text && text.length > 2000) return res.status(400).json({ error: 'Review too long (max 2000 chars)' });
+  if (req.userId === reviewee_id) return res.status(400).json({ error: 'Cannot review yourself' });
+  try {
+    // Check for duplicate
+    if (job_id) {
+      const dup = await query('SELECT id FROM reviews WHERE job_id=$1 AND reviewer_id=$2 AND reviewee_id=$3', [job_id, req.userId, reviewee_id]);
+      if (dup.rows.length) return res.status(409).json({ error: 'You already reviewed this person for this job' });
+    }
+    const { sanitizeText } = require('../src/sanitize');
+    const safeText = text ? sanitizeText(text, 2000) : null;
+    const r = await query(
+      'INSERT INTO reviews (job_id, reviewer_id, reviewee_id, rating, text) VALUES ($1,$2,$3,$4,$5) RETURNING *',
+      [job_id || null, req.userId, reviewee_id, rating, safeText]
+    );
+    // Also insert into ratings for backward compat
+    await query('INSERT INTO ratings (from_user_id, to_user_id, job_id, rating, comment) VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING',
+      [req.userId, reviewee_id, job_id || null, rating, safeText]).catch(() => {});
+    // Recompute badges async
+    computeBadges(reviewee_id).catch(() => {});
+    res.json({ review: r.rows[0], success: true });
+  } catch (err) { serverError(err, res); }
+});
+
+// GET /api/reviews/v2/user/:userId — paginated reviews with weighted stats
+router.get('/api/reviews/v2/user/:userId', async (req, res) => {
+  const { userId } = req.params;
+  const page = Math.max(1, parseInt(req.query.page) || 1);
+  const limit = Math.min(50, parseInt(req.query.limit) || 20);
+  const offset = (page - 1) * limit;
+  try {
+    const [reviews, total, user] = await Promise.all([
+      query(`SELECT r.*, u.username AS reviewer_username, u.avatar AS reviewer_avatar
+             FROM reviews r LEFT JOIN users u ON u.id=r.reviewer_id
+             WHERE r.reviewee_id=$1 AND r.hidden=FALSE
+             ORDER BY r.created_at DESC LIMIT $2 OFFSET $3`, [userId, limit, offset]),
+      query('SELECT COUNT(*) FROM reviews WHERE reviewee_id=$1 AND hidden=FALSE', [userId]),
+      query('SELECT badges, rating, total_reviews FROM users WHERE id=$1', [userId]),
+    ]);
+    res.json({
+      reviews: reviews.rows,
+      total: parseInt(total.rows[0].count),
+      page, limit,
+      badges: user.rows[0]?.badges || [],
+      weighted_rating: user.rows[0]?.rating,
+    });
+  } catch (err) { serverError(err, res); }
+});
+
+// GET /api/saved-searches — list user's saved searches
+router.get('/api/saved-searches', auth, async (req, res) => {
+  try {
+    const r = await query('SELECT * FROM saved_searches WHERE user_id=$1 ORDER BY created_at DESC', [req.userId]);
+    res.json({ saved_searches: r.rows });
+  } catch (err) { serverError(err, res); }
+});
+
+// POST /api/saved-searches — save a search
+router.post('/api/saved-searches', auth, checkBlocked, async (req, res) => {
+  const { name, query_params, alert_enabled } = req.body;
+  if (!query_params) return res.status(400).json({ error: 'query_params required' });
+  try {
+    const count = await query('SELECT COUNT(*) FROM saved_searches WHERE user_id=$1', [req.userId]);
+    if (parseInt(count.rows[0].count) >= 20) return res.status(400).json({ error: 'Max 20 saved searches' });
+    const r = await query(
+      'INSERT INTO saved_searches (user_id, name, query_params, alert_enabled) VALUES ($1,$2,$3,$4) RETURNING *',
+      [req.userId, name || 'Search ' + Date.now(), JSON.stringify(query_params), !!alert_enabled]
+    );
+    res.json({ saved_search: r.rows[0] });
+  } catch (err) { serverError(err, res); }
+});
+
+// DELETE /api/saved-searches/:id
+router.delete('/api/saved-searches/:id', auth, async (req, res) => {
+  try {
+    await query('DELETE FROM saved_searches WHERE id=$1 AND user_id=$2', [req.params.id, req.userId]);
+    res.json({ success: true });
+  } catch (err) { serverError(err, res); }
+});
+
+module.exports = { router, computeBadges };

@@ -62,7 +62,27 @@ const normalizeId = (id) => (id || '').toString().toLowerCase().replace(/^pi_/, 
 
 // ─── Core middleware ──────────────────────────────────────────────
 app.use(compression());
-app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", "'unsafe-inline'", 'cdn.minepi.com', 'sdk.minepi.com'],
+      connectSrc: ["'self'", 'api.minepi.com', 'api.testnet.minepi.com', 'workpro-api.onrender.com'],
+      imgSrc: ["'self'", 'data:', 'https:'],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      fontSrc: ["'self'", 'data:'],
+      frameSrc: ['cdn.minepi.com'],
+      objectSrc: ["'none'"],
+      upgradeInsecureRequests: NODE_ENV === 'production' ? [] : null,
+    },
+  },
+  crossOriginEmbedderPolicy: false,
+  hsts: NODE_ENV === 'production' ? { maxAge: 63072000, includeSubDomains: true, preload: true } : false,
+  referrerPolicy: { policy: 'strict-origin-when-cross-origin' },
+  xssFilter: true,
+  noSniff: true,
+  frameguard: { action: 'deny' },
+}));
 app.use(express.json({ limit: '4mb' }));
 app.use(express.urlencoded({ extended: true, limit: '4mb' }));
 app.use(cors({
@@ -270,7 +290,7 @@ app.use(require('./routes/admin'));         // /api/admin/*
 app.use(require('./routes/chat'));          // /api/chat/*, /api/push/*
 app.use(require('./routes/payments'));      // /api/payments/*, /api/connects/*, /api/escrows/*, /api/escrow/*, /api/offers/*
 app.use(require('./routes/jobs'));          // /api/jobs/*, /api/applications/*
-app.use(require('./routes/users'));         // /api/users/:id, /api/reviews/*, /api/ratings/*
+app.use(require('./routes/users').router);  // /api/users/:id, /api/reviews/*, /api/ratings/*
 
 // ─── 404 & error handler ──────────────────────────────────────────────
 app.use((req, res) => {
