@@ -66,7 +66,7 @@ router.get('/api/jobs/search/autocomplete', async (req, res) => {
 
 // GET /api/jobs
 router.get('/api/jobs', async (req, res) => {
-  const { status, category, posted_by, client_uid, search, min_budget, max_budget, sort, cursor } = req.query;
+  const { status, category, posted_by, client_uid, search, min_budget, max_budget, urgent, sort, cursor } = req.query;
   if (search && search.length > 200) return res.status(400).json({ error: 'Search query too long (max 200 chars)' });
   if (min_budget !== undefined && isNaN(parseFloat(min_budget))) return res.status(400).json({ error: 'Invalid min_budget' });
   if (max_budget !== undefined && isNaN(parseFloat(max_budget))) return res.status(400).json({ error: 'Invalid max_budget' });
@@ -98,6 +98,7 @@ router.get('/api/jobs', async (req, res) => {
     if (search) { conditions.push(`(title ILIKE $${idx} OR description ILIKE $${idx})`); params.push(`%${search}%`); idx++; }
     if (min_budget) { conditions.push(`budget >= $${idx++}`); params.push(parseFloat(min_budget)); }
     if (max_budget) { conditions.push(`budget <= $${idx++}`); params.push(parseFloat(max_budget)); }
+    if (urgent === '1' || urgent === 'true') { conditions.push(`is_urgent = TRUE`); }
     if (req.query.featured === 'true') { conditions.push(`featured = true`); }
 
     // Decode cursor and add keyset condition (created_at DESC: fetch rows older than cursor)
@@ -205,9 +206,10 @@ router.post('/api/jobs', auth, checkBlocked, jobPostLimiter, async (req, res) =>
         await pgClientPost.query('ROLLBACK');
         return res.status(400).json({ error: 'Not enough connects to post a job (costs 1 connect)' });
       }
+      const isUrgent = req.body.is_urgent === true || req.body.is_urgent === 'true';
       const jobRes = await pgClientPost.query(
-        'INSERT INTO jobs (title, description, category, budget, skills, images, deadline, posted_by, posted_by_name, apply_cost, connects_spent) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10) RETURNING *',
-        [title, description, (category || 'other').toLowerCase(), budgetNum, skills || null, serializeImages(images), deadline || null, req.userId, username, applyCost]
+        'INSERT INTO jobs (title, description, category, budget, skills, images, deadline, posted_by, posted_by_name, apply_cost, connects_spent, is_urgent) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10, $11) RETURNING *',
+        [title, description, (category || 'other').toLowerCase(), budgetNum, skills || null, serializeImages(images), deadline || null, req.userId, username, applyCost, isUrgent]
       );
       await pgClientPost.query('UPDATE users SET total_jobs_posted = total_jobs_posted + 1, updated_at = NOW() WHERE id = $1', [req.userId]);
       await pgClientPost.query('COMMIT');
