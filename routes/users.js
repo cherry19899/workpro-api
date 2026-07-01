@@ -1,3 +1,4 @@
+const logger = require('../src/logger');
 /**
  * routes/users.js — /api/users/:id, ratings, level, portfolio, availability, connects, /api/reviews/*
  */
@@ -449,7 +450,7 @@ async function computeBadges(userId) {
     await query(`UPDATE users SET badges=$1, rating=$2, total_reviews=$3, updated_at=NOW() WHERE id=$4`,
       [badges, avgRating.toFixed(2), Math.max(totalReviews, reviews.rows.length), userId]);
   } catch (err) {
-    console.error('[badges] compute error:', err.message);
+    logger.error('[badges] compute error:', err.message);
   }
 }
 

@@ -1,3 +1,4 @@
+const logger = require('../src/logger');
 /**
  * routes/admin.js — /api/admin/*
  */
@@ -58,9 +59,9 @@ async function warmStats() {
     const data = await computeStats();
     _statsCache = data;
     _statsCacheTs = Date.now();
-    console.log('[admin/stats] cache warmed on startup');
+    logger.info('[admin/stats] cache warmed on startup');
   } catch (err) {
-    console.error('[admin/stats] warm failed:', err.message);
+    logger.error('[admin/stats] warm failed:', err.message);
   }
 }
 
@@ -72,7 +73,7 @@ router.get('/api/admin/stats', adminAuth, async (req, res) => {
   }
   // 8-second timeout fallback — return stale/empty rather than error.
   const timeout = new Promise(resolve => setTimeout(() => resolve(null), 8000));
-  const work = computeStats().catch(err => { console.error('[admin/stats]', err.message); return null; });
+  const work = computeStats().catch(err => { logger.error('[admin/stats]', err.message); return null; });
   const data = await Promise.race([work, timeout]);
   if (data) {
     _statsCache = data;
@@ -429,7 +430,7 @@ router.get('/api/admin/earnings', adminAuth, async (req, res) => {
           average_transaction: txCount > 0 ? Math.round(total_earnings / txCount * 100) / 100 : 0,
         }
       };
-    } catch (err) { console.error('[admin/earnings]', err.message); return null; }
+    } catch (err) { logger.error('[admin/earnings]', err.message); return null; }
   })();
   const data = await Promise.race([work, timeout]);
   if (data) return res.json(data);
@@ -900,7 +901,7 @@ router.get('/api/admin/analytics', adminAuth, async (req, res) => {
           new_jobs: parseInt(newJobs7d.rows[0].count),
         },
       };
-    } catch (err) { console.error('[admin/analytics]', err.message); return null; }
+    } catch (err) { logger.error('[admin/analytics]', err.message); return null; }
   })();
   const data = await Promise.race([work, timeout]);
   if (data) {
@@ -920,7 +921,7 @@ router.post('/api/admin/backup/trigger', adminAuth, async (req, res) => {
     await audit('backup_triggered', { ...result, by: req.userId });
     res.json({ success: true, ...result });
   } catch (err) {
-    console.error('[backup] trigger error:', err.message);
+    logger.error('[backup] trigger error:', err.message);
     await audit('backup_failed', { error: err.message, by: req.userId }).catch(() => {});
     res.status(500).json({ error: 'Backup failed', detail: err.message });
   }

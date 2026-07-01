@@ -1,3 +1,4 @@
+const logger = require('../src/logger');
 /**
  * routes/auth.js — /api/me, /api/auth/*, /api/users/me routes
  */
@@ -49,7 +50,7 @@ async function normalizeLoginUid(incomingUid) {
     for (const [tbl, col] of fkCols) {
       await query(`UPDATE ${tbl} SET ${col} = $1 WHERE ${col} = $2`, [canonical, incomingUid]).catch(() => {});
     }
-    console.log(`[UID-norm] renamed ${incomingUid} → ${canonical}`);
+    logger.info(`[UID-norm] renamed ${incomingUid} → ${canonical}`);
     return canonical;
   }
 
@@ -102,10 +103,10 @@ async function normalizeLoginUid(incomingUid) {
     if (from.role === 'admin') await pgM.query("UPDATE users SET role='admin' WHERE id=$1", [canonical]);
     await pgM.query('DELETE FROM users WHERE id = $1', [incomingUid]);
     await pgM.query('COMMIT');
-    console.log(`[UID-norm] merged ${incomingUid} → ${canonical} (connects+${from.balance_connects||0})`);
+    logger.info(`[UID-norm] merged ${incomingUid} → ${canonical} (connects+${from.balance_connects||0})`);
   } catch (e) {
     await pgM.query('ROLLBACK').catch(() => {});
-    console.error('[UID-norm] merge error:', e.message);
+    logger.error('[UID-norm] merge error:', e.message);
     // Fall back to canonical even if merge failed — canonical account still works
   } finally { pgM.release(); }
 

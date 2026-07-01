@@ -18,6 +18,7 @@
  */
 
 require('dotenv').config();
+const logger = require('./src/logger');
 const express = require('express');
 const compression = require('compression');
 const http = require('http');
@@ -42,15 +43,15 @@ const NODE_ENV = process.env.NODE_ENV || 'production';
 const IS_SANDBOX = !!process.env.SANDBOX_MODE;
 if (NODE_ENV === 'production') {
   if (IS_SANDBOX) {
-    console.warn('[WARN] SANDBOX_MODE is enabled — testnet mode active. Remove before switching to mainnet.');
+    logger.warn('[WARN] SANDBOX_MODE is enabled — testnet mode active. Remove before switching to mainnet.');
   }
   if (!process.env.JWT_SECRET) {
-    console.error('[FATAL] JWT_SECRET env var is not set. Set a strong JWT_SECRET in Render env vars. Refusing to start.');
+    logger.error('[FATAL] JWT_SECRET env var is not set. Set a strong JWT_SECRET in Render env vars. Refusing to start.');
     process.exit(1);
   }
   const _adminKey = process.env.ADMIN_API_KEY;
   if (!_adminKey || _adminKey === 'admin-secret-key') {
-    console.error('[FATAL] ADMIN_API_KEY is missing or using the default value. Set a strong ADMIN_API_KEY in Render env vars. Refusing to start.');
+    logger.error('[FATAL] ADMIN_API_KEY is missing or using the default value. Set a strong ADMIN_API_KEY in Render env vars. Refusing to start.');
     process.exit(1);
   }
 }
@@ -86,7 +87,11 @@ app.use(helmet({
 app.use(express.json({ limit: '4mb' }));
 app.use(express.urlencoded({ extended: true, limit: '4mb' }));
 app.use(cors({
-  origin: [FRONTEND_URL, 'https://cherry19899.github.io', 'http://localhost:3000', 'http://localhost:5173', 'http://localhost:3001'],
+  origin: [
+    FRONTEND_URL,
+    'https://cherry19899.github.io',
+    ...(process.env.NODE_ENV !== 'production' ? ['http://localhost:3000', 'http://localhost:5173', 'http://localhost:3001'] : []),
+  ],
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
   allowedHeaders: ['Content-Type', 'Authorization', 'x-user-id', 'x-pi-token', 'x-admin-key', 'x-username'],
   credentials: true,
@@ -247,7 +252,7 @@ app.get('/api/health', async (req, res) => {
     result.db_latency_ms = Date.now() - dbStart;
     result.database = 'connected';
   } catch (err) {
-    console.error('[Health] DB check failed:', err.message);
+    logger.error('[Health] DB check failed:', err.message);
     result.status = 'degraded';
     result.database = 'disconnected';
     result.db_latency_ms = null;
@@ -298,14 +303,14 @@ app.use((req, res) => {
 });
 
 app.use((err, req, res, next) => {
-  console.error('[Error]', err);
+  logger.error('[Error]', err);
   _lastError = { message: err.message, path: req.path, time: new Date().toISOString() };
   res.status(500).json({ error: 'Internal server error' });
 });
 
 // ─── Schema migrations run on startup ──────────────────────────────────────────────
 async function ensureNotificationsTable() {
-  const run = (sql, tag) => query(sql).catch(e => console.error(`[Migration] ${tag}:`, e.message));
+  const run = (sql, tag) => query(sql).catch(e => logger.error(`[Migration] ${tag}:`, e.message));
   await run(`CREATE TABLE IF NOT EXISTS notifications (
     id SERIAL PRIMARY KEY,
     user_id TEXT NOT NULL,
@@ -484,7 +489,11 @@ initDb().then(async () => {
   const FRONTEND_ORIGIN = process.env.FRONTEND_URL || 'https://cherry19899.github.io';
   const io = new SocketIOServer(httpServer, {
     cors: {
-      origin: [FRONTEND_ORIGIN, 'https://cherry19899.github.io', 'http://localhost:3000', 'http://localhost:5173'],
+      origin: [
+        FRONTEND_ORIGIN,
+        'https://cherry19899.github.io',
+        ...(process.env.NODE_ENV !== 'production' ? ['http://localhost:3000', 'http://localhost:5173'] : []),
+      ],
       methods: ['GET', 'POST'],
       credentials: true,
     },
@@ -541,7 +550,7 @@ initDb().then(async () => {
 
   // Export io for use in route handlers (push new messages to connected clients)
   app.set('io', io);
-  console.log('[WorkPro API] Socket.io ready');
+  logger.info('[WorkPro API] Socket.io ready');
 
   // ─── Web Push VAPID setup ──────────────────────────────────────────────
   const webpush = require('web-push');
@@ -551,20 +560,20 @@ initDb().then(async () => {
   if (VAPID_PUBLIC && VAPID_PRIVATE) {
     webpush.setVapidDetails(VAPID_EMAIL, VAPID_PUBLIC, VAPID_PRIVATE);
     app.set('webpush', webpush);
-    console.log('[WorkPro API] Web Push VAPID configured');
+    logger.info('[WorkPro API] Web Push VAPID configured');
   } else {
-    console.warn('[WorkPro API] Web Push disabled — set VAPID_PUBLIC_KEY + VAPID_PRIVATE_KEY env vars');
+    logger.warn('[WorkPro API] Web Push disabled — set VAPID_PUBLIC_KEY + VAPID_PRIVATE_KEY env vars');
     // Generate keys and print them to logs (one-time helper)
     if (process.env.GENERATE_VAPID === '1') {
       const keys = webpush.generateVAPIDKeys();
-      console.log('[VAPID] Add these to Render env vars:');
-      console.log('  VAPID_PUBLIC_KEY =', keys.publicKey);
-      console.log('  VAPID_PRIVATE_KEY =', keys.privateKey);
+      logger.info('[VAPID] Add these to Render env vars:');
+      logger.info('  VAPID_PUBLIC_KEY =', keys.publicKey);
+      logger.info('  VAPID_PRIVATE_KEY =', keys.privateKey);
     }
   }
 
   const server = httpServer.listen(PORT, () => {
-    console.log(`[WorkPro API] v3.3.0 on port ${PORT} (${NODE_ENV})`);
+    logger.info(`[WorkPro API] v3.3.0 on port ${PORT} (${NODE_ENV})`);
   });
 
   // ─── Keep-alive self-ping ──────────────────────────────────────────────
@@ -577,34 +586,34 @@ initDb().then(async () => {
   if (NODE_ENV === 'production') {
     setInterval(() => {
       fetch(`${SELF_URL}/api/health`, { method: 'GET' })
-        .then(r => console.log(`[keep-alive] self-ping ${r.status}`))
-        .catch(e => console.warn('[keep-alive] self-ping failed:', e.message));
+        .then(r => logger.info(`[keep-alive] self-ping ${r.status}`))
+        .catch(e => logger.warn('[keep-alive] self-ping failed:', e.message));
     }, 10 * 60 * 1000); // every 10 minutes
   }
 
   // Graceful shutdown — Render sends SIGTERM before killing the process
   const shutdown = (signal) => {
-    console.log(`[WorkPro API] ${signal} received — graceful shutdown`);
+    logger.info(`[WorkPro API] ${signal} received — graceful shutdown`);
     io.close();
     server.close(() => {
-      console.log('[WorkPro API] HTTP server closed');
+      logger.info('[WorkPro API] HTTP server closed');
       // Use getPool() — db.js exports `pool` by value at load time (null then),
       // so destructuring `{ pool }` would always be null. getPool() returns the live pool.
       const { getPool } = require('./src/db');
       const livePool = getPool && getPool();
       if (livePool) livePool.end(() => {
-        console.log('[WorkPro API] DB pool closed');
+        logger.info('[WorkPro API] DB pool closed');
         process.exit(0);
       });
       else process.exit(0);
     });
     // Force-kill after 10s if connections don't drain
-    setTimeout(() => { console.error('[WorkPro API] Forced exit after timeout'); process.exit(1); }, 10000).unref();
+    setTimeout(() => { logger.error('[WorkPro API] Forced exit after timeout'); process.exit(1); }, 10000).unref();
   };
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT',  () => shutdown('SIGINT'));
 }).catch(err => {
-  console.error('[Server] Failed to start:', err);
+  logger.error('[Server] Failed to start:', err);
   process.exit(1);
 });
 

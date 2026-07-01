@@ -1,3 +1,4 @@
+const logger = require('../src/logger');
 /**
  * routes/payments.js — /api/payments/*, /api/connects/*, /api/escrows/*, /api/escrow/*, /api/offers/*
  */
@@ -58,8 +59,8 @@ async function handlePaymentApprove(paymentId, metadata, userId, res, paymentsEn
     // Async: call Pi API /approve (unlocks the Pi wallet), then persist approved state.
     (PI_API_KEY
       ? piApprovePayment(paymentId)
-          .then(p => { console.log('[Payment] Pi /approve OK | paymentId:', paymentId); return p; })
-          .catch(err => { console.error('[Payment] Pi /approve FAILED:', err.message, '| paymentId:', paymentId); return { amount: 0 }; })
+          .then(p => { logger.info('[Payment] Pi /approve OK | paymentId:', paymentId); return p; })
+          .catch(err => { logger.error('[Payment] Pi /approve FAILED:', err.message, '| paymentId:', paymentId); return { amount: 0 }; })
       : Promise.resolve({ amount: 0 })
     ).then(piPayment => query(
       `INSERT INTO payments (id, user_id, type, amount, metadata, status, payment_id)
@@ -67,9 +68,9 @@ async function handlePaymentApprove(paymentId, metadata, userId, res, paymentsEn
        ON CONFLICT (id) DO UPDATE SET status='approved', amount=EXCLUDED.amount, updated_at=NOW()`,
       [paymentId, userId, metadata?.type || 'payment', piPayment.amount || 0, JSON.stringify(metadata || {})]
     ).then(() => audit('payment_approved', { payment_id: paymentId, user_id: userId, amount: piPayment.amount }).catch(() => {}))
-    ).catch(err => console.error('[Payment] async approve post-processing failed:', err.message));
+    ).catch(err => logger.error('[Payment] async approve post-processing failed:', err.message));
   } catch (err) {
-    console.error('[Payment] Approve error:', err.message);
+    logger.error('[Payment] Approve error:', err.message);
     if (!res.headersSent) serverError(err, res);
   }
 }
@@ -91,7 +92,7 @@ async function handlePaymentComplete(paymentId, txid, metadata, userId, res) {
         // the Pi blockchain confirmed the payment (client received txid), so we
         // still mark it completed on our side and credit connects. /api/connects/buy
         // will do additional idempotency check.
-        console.error('[Payment] Pi complete failed (continuing):', piErr.message);
+        logger.error('[Payment] Pi complete failed (continuing):', piErr.message);
       }
     }
     const pgPmtC = await getPool().connect();
@@ -133,7 +134,7 @@ async function handlePaymentComplete(paymentId, txid, metadata, userId, res) {
         const storedAmount = parseFloat(markDone.amount || 0);
         if (PI_API_KEY && piPayment.amount && storedAmount > 0 && piAmountPaid < storedAmount - 0.001) {
           await pgPmtC.query('ROLLBACK');
-          console.error(`[Payment] Amount mismatch: Pi returned ${piAmountPaid}, DB stored ${storedAmount}`);
+          logger.error(`[Payment] Amount mismatch: Pi returned ${piAmountPaid}, DB stored ${storedAmount}`);
           return res.status(400).json({ error: 'Payment amount mismatch — contact support' });
         }
         const amount = resolveConnects(piAmountPaid);
@@ -141,7 +142,7 @@ async function handlePaymentComplete(paymentId, txid, metadata, userId, res) {
         await pgPmtC.query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [amount, paymentOwner]);
         await pgPmtC.query("UPDATE payments SET metadata = jsonb_set(COALESCE(metadata,'{}'::jsonb), '{connects_credited}', 'true') WHERE id = $1", [paymentId]);
         const newBal = await pgPmtC.query('SELECT balance_connects FROM users WHERE id = $1', [paymentOwner]);
-        console.log(`[Payment] COMMIT connects +${amount} → user ${paymentOwner} new balance=${newBal.rows[0]?.balance_connects}`);
+        logger.info(`[Payment] COMMIT connects +${amount} → user ${paymentOwner} new balance=${newBal.rows[0]?.balance_connects}`);
       } else if (meta.type === 'escrow' && meta.job_id && meta.freelancer_id) {
         const existingEscrow = await pgPmtC.query('SELECT id FROM escrows WHERE payment_id = $1 LIMIT 1', [paymentId]);
         if (!existingEscrow.rows.length) {
@@ -154,7 +155,7 @@ async function handlePaymentComplete(paymentId, txid, metadata, userId, res) {
             const jobBudget = parseFloat(jobCheck.rows[0].budget || 0);
             if (jobBudget > 0 && escrowAmount > jobBudget * 1.01) {
               await pgPmtC.query('ROLLBACK');
-              console.error(`[Payment] Escrow amount ${escrowAmount} exceeds job budget ${jobBudget}`);
+              logger.error(`[Payment] Escrow amount ${escrowAmount} exceeds job budget ${jobBudget}`);
               return res.status(400).json({ error: 'Payment amount exceeds job budget' });
             }
             await pgPmtC.query(
@@ -170,7 +171,7 @@ async function handlePaymentComplete(paymentId, txid, metadata, userId, res) {
     await audit('payment_completed', { payment_id: paymentId, txid, user_id: userId });
     res.json({ success: true, payment: piPayment });
   } catch (err) {
-    console.error('[Payment] Complete error:', err.message);
+    logger.error('[Payment] Complete error:', err.message);
     serverError(err, res);
   }
 }
@@ -573,7 +574,7 @@ router.post('/api/connects/buy', auth, checkBlocked, async (req, res) => {
         const st = piPayment && piPayment.status;
         verified = !!(st && (st.transaction_verified || st.developer_completed));
       } catch (piErr) {
-        console.error('[Connects] Pi verification failed:', piErr.message);
+        logger.error('[Connects] Pi verification failed:', piErr.message);
       }
     }
 
@@ -634,10 +635,10 @@ router.post('/api/connects/buy', auth, checkBlocked, async (req, res) => {
       );
       balance = balRes.rows[0]?.balance_connects || 0;
       await pgClient.query('COMMIT');
-      console.log(`[Connects] COMMIT OK: user=${req.userId} +${credited} connects → balance=${balance} payment=${payment_id}`);
+      logger.info(`[Connects] COMMIT OK: user=${req.userId} +${credited} connects → balance=${balance} payment=${payment_id}`);
     } catch (txErr) {
       await pgClient.query('ROLLBACK').catch(() => {});
-      console.error(`[Connects] ROLLBACK: user=${req.userId} payment=${payment_id} err=${txErr.message}`);
+      logger.error(`[Connects] ROLLBACK: user=${req.userId} payment=${payment_id} err=${txErr.message}`);
       throw txErr;
     } finally { pgClient.release(); }
 

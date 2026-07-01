@@ -1,3 +1,4 @@
+const logger = require('./src/logger');
 const fs = require('fs').promises;
 const path = require('path');
 
@@ -15,9 +16,9 @@ async function loadJsonDb() {
     await fs.mkdir(DATA_DIR, { recursive: true });
     const data = await fs.readFile(DB_FILE, 'utf8');
     db = JSON.parse(data);
-    console.log('[DB] JSON loaded');
+    logger.info('[DB] JSON loaded');
   } catch (e) {
-    console.log('[DB] Starting fresh JSON');
+    logger.info('[DB] Starting fresh JSON');
     await saveJsonDb();
   }
 }
@@ -29,7 +30,7 @@ async function saveJsonDb() {
     await fs.writeFile(tmpFile, JSON.stringify(db, null, 2));
     await fs.rename(tmpFile, DB_FILE);
   } catch (e) {
-    console.error('[DB] JSON save error:', e.message);
+    logger.error('[DB] JSON save error:', e.message);
   }
 }
 
@@ -43,7 +44,9 @@ async function healthCheck() {
   }
 }
 
-setInterval(saveJsonDb, 30000);
+const _saveInterval = setInterval(saveJsonDb, 30000);
+process.on('SIGTERM', () => clearInterval(_saveInterval));
+process.on('SIGINT',  () => clearInterval(_saveInterval));
 
 // ─── PostgreSQL or JSON ─────────────────────────────────────────
 const usePg = !!process.env.DATABASE_URL;
@@ -54,7 +57,7 @@ async function query(text, params) {
   const start = Date.now();
   const result = await pool.query(text, params);
   if (process.env.NODE_ENV !== 'production') {
-    console.log('PG query', { text: text.substring(0, 50), duration: Date.now() - start, rows: result.rowCount });
+    logger.info('PG query', { text: text.substring(0, 50), duration: Date.now() - start, rows: result.rowCount });
   }
   return result;
 }
@@ -76,7 +79,7 @@ async function queryWithRetry(text, params, retries = MAX_RETRIES) {
 async function initDb() {
   if (!usePg) {
     await loadJsonDb();
-    console.log('[DB] JSON fallback mode');
+    logger.info('[DB] JSON fallback mode');
     return;
   }
 
@@ -269,9 +272,9 @@ async function initDb() {
     `).catch(() => {});
 
     await query(`INSERT INTO users (id, username, role, kyc_verified, status) VALUES ('pi_cherry19899', 'cherry19899', 'admin', true, 'active') ON CONFLICT (id) DO NOTHING`);
-    console.log('[DB] PostgreSQL initialized');
+    logger.info('[DB] PostgreSQL initialized');
   } catch (err) {
-    console.error('[DB] PostgreSQL init error:', err.message);
+    logger.error('[DB] PostgreSQL init error:', err.message);
     throw err;
   }
 }
