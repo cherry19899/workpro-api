@@ -1036,7 +1036,7 @@ router.post('/api/applications/:id/withdraw', auth, checkBlocked, async (req, re
       await pgWith.query('BEGIN');
       const wResult = await pgWith.query("UPDATE applications SET status = 'withdrawn', updated_at = NOW() WHERE id = $1 AND status = 'pending' RETURNING *", [req.params.id]);
       if (!wResult.rows.length) { await pgWith.query('ROLLBACK'); return res.status(400).json({ error: 'Can only withdraw pending applications' }); }
-      await pgWith.query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [app_.apply_cost || 1, req.userId]);
+      /* connects are non-refundable — spent on apply, no refund even on self-withdraw */
       await pgWith.query('COMMIT');
       withdrawnApp = wResult.rows[0];
     } catch (txErr) { await pgWith.query('ROLLBACK').catch(() => {}); throw txErr; }
