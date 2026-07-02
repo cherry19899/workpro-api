@@ -598,8 +598,14 @@ initDb().then(async () => {
   const { getPlatformFee: arGetFee, notify: arNotify, audit: arAudit } = require('./src/helpers');
   async function autoReleaseExpiredEscrows() {
     try {
+      // Only auto-release when the freelancer actually SUBMITTED the work and the
+      // client failed to review it within 14 days. Funded-but-not-submitted escrows
+      // are never auto-paid (protects the client from a freelancer who did nothing).
       const due = await arQuery(
-        "SELECT * FROM escrows WHERE status = 'funded' AND created_at < NOW() - INTERVAL '14 days'"
+        `SELECT e.* FROM escrows e
+         JOIN jobs j ON j.id = e.job_id
+         WHERE e.status = 'funded' AND j.status = 'submitted'
+           AND j.updated_at < NOW() - INTERVAL '14 days'`
       );
       if (!due.rows.length) return;
       const fee = await arGetFee();
