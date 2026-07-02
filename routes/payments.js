@@ -14,8 +14,8 @@ const normalizeId = (id) => (id || '').toString().toLowerCase().replace(/^pi_/, 
 // Server-side package catalog — mirrors frontend packages. Never trust client-supplied quantity.
 const CONNECT_PACKAGES = [
   { connects: 10,  price: 1 },
-  { connects: 50,  price: 4.5 },
-  { connects: 100, price: 8 },
+  { connects: 50,  price: 5 },
+  { connects: 100, price: 7 },
 ];
 
 // Resolve connects to credit for a given Pi amount.
