@@ -486,11 +486,42 @@ router.post('/api/jobs/:id/apply', auth, checkBlocked, async (req, res) => {
       await pgClient.query('ROLLBACK').catch(() => {});
       throw txErr;
     } finally { pgClient.release(); }
+
+    // ── Create chat room and send proposal as first message ──
+    let roomId = null;
+    try {
+      const existingRoom = await query(
+        'SELECT id FROM chat_rooms WHERE job_id = $1 AND ((client_id = $2 AND freelancer_id = $3) OR (client_id = $3 AND freelancer_id = $2))',
+        [req.params.id, job.posted_by, req.userId]
+      );
+      if (existingRoom.rows.length) {
+        roomId = existingRoom.rows[0].id;
+      } else {
+        roomId = 'room_' + crypto.randomUUID();
+        await query(
+          'INSERT INTO chat_rooms (id, client_id, freelancer_id, job_id) VALUES ($1, $2, $3, $4)',
+          [roomId, job.posted_by, req.userId, req.params.id]
+        );
+      }
+      // Send proposal as first message in chat
+      const proposalMsg = req.body.message || '';
+      if (proposalMsg.trim()) {
+        await query(
+          'INSERT INTO chat_messages (room_id, sender_id, sender_name, message) VALUES ($1, $2, $3, $4)',
+          [roomId, req.userId, user.username || req.userId, proposalMsg.trim()]
+        );
+        await query('UPDATE chat_rooms SET updated_at = NOW() WHERE id = $1', [roomId]);
+      }
+    } catch (chatErr) {
+      // Non-fatal: chat creation failure should not break the apply flow
+      console.error('[Apply] Chat creation failed:', chatErr.message);
+    }
+
     await audit('job_applied', { job_id: req.params.id, user_id: req.userId });
     await notify(job.posted_by, 'application', `Новый отклик на задачу "${job.title}"`,
-      `${user.username || 'Фрилансер'} откликнулся на вашу задачу`, parseInt(req.params.id), null).catch(() => {});
+      `${user.username || 'Фрилансер'} откликнулся на вашу задачу`, parseInt(req.params.id), roomId).catch(() => {});
     const newBalance = (user.balance_connects || 0) - lockedCost;
-    res.json({ application: appResult.rows[0], success: true, remaining_connects: newBalance, new_balance: newBalance });
+    res.json({ application: appResult.rows[0], success: true, remaining_connects: newBalance, new_balance: newBalance, room_id: roomId });
   } catch (err) { serverError(err, res); }
 });
 
