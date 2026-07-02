@@ -25,7 +25,8 @@ router.get('/api/chat/rooms', auth, async (req, res) => {
           (SELECT created_at FROM chat_messages WHERE room_id = r.id ORDER BY created_at DESC LIMIT 1) as last_message_at,
           j.title as job_title,
           CASE WHEN r.client_id = $1 THEN r.freelancer_id ELSE r.client_id END as other_user_id,
-          CASE WHEN r.client_id = $1 THEN uf.username ELSE uc.username END as other_user_name
+          CASE WHEN r.client_id = $1 THEN uf.username ELSE uc.username END as other_user_name,
+          CASE WHEN r.client_id = $1 THEN uf.avatar ELSE uc.avatar END as other_user_avatar
          FROM chat_rooms r
          LEFT JOIN jobs j ON j.id = r.job_id
          LEFT JOIN users uc ON uc.id = r.client_id
@@ -76,7 +77,8 @@ router.get('/api/chat/rooms/:id', auth, async (req, res) => {
   try {
     const result = await query(
       `SELECT cr.*,
-              u1.username as client_username, u2.username as freelancer_username
+              u1.username as client_username, u2.username as freelancer_username,
+              u1.avatar as client_avatar, u2.avatar as freelancer_avatar
        FROM chat_rooms cr
        LEFT JOIN users u1 ON u1.id = cr.client_id
        LEFT JOIN users u2 ON u2.id = cr.freelancer_id
@@ -172,7 +174,8 @@ router.get('/api/chat/conversations', auth, async (req, res) => {
           (SELECT created_at FROM chat_messages WHERE room_id = r.id ORDER BY created_at DESC LIMIT 1) as last_message_at,
           j.title as job_title,
           CASE WHEN r.client_id = $1 THEN r.freelancer_id ELSE r.client_id END as other_user_id,
-          CASE WHEN r.client_id = $1 THEN uf.username ELSE uc.username END as other_user_name
+          CASE WHEN r.client_id = $1 THEN uf.username ELSE uc.username END as other_user_name,
+          CASE WHEN r.client_id = $1 THEN uf.avatar ELSE uc.avatar END as other_user_avatar
          FROM chat_rooms r
          LEFT JOIN jobs j ON j.id = r.job_id
          LEFT JOIN users uc ON uc.id = r.client_id
