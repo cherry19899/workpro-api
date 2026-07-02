@@ -580,7 +580,7 @@ router.post('/api/jobs/:id/hire', auth, checkBlocked, async (req, res) => {
       await pgClientJ.query('UPDATE applications SET status = $1, updated_at = NOW() WHERE job_id = $2 AND id != $3 AND status = $4', ['rejected', req.params.id, application_id, 'pending']);
       const refundCostJ = job.apply_cost || 1;
       for (const r of toRejectJ.rows) {
-        await pgClientJ.query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [refundCostJ, r.freelancer_id]);
+        /* connects are non-refundable — spent on apply/post, no refund on reject/delete */
       }
       if (!existingEsc.rows.length) {
         const escRes = await pgClientJ.query(
@@ -665,12 +665,9 @@ router.delete('/api/jobs/:id', auth, checkBlocked, async (req, res) => {
     const pgClientDel = await getPool().connect();
     try {
       await pgClientDel.query('BEGIN');
-      await pgClientDel.query('UPDATE users SET balance_connects = balance_connects + 1, updated_at = NOW() WHERE id = $1', [job.posted_by]);
+      /* connects are non-refundable — spent on apply/post, no refund on reject/delete */
       for (const row of applicants.rows) {
-        await pgClientDel.query(
-          'UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2',
-          [applyRefundCost, row.freelancer_id]
-        );
+        /* connects are non-refundable — spent on apply/post, no refund on reject/delete */
       }
       await pgClientDel.query('DELETE FROM applications WHERE job_id = $1', [req.params.id]);
       await pgClientDel.query('DELETE FROM jobs WHERE id = $1', [req.params.id]);
@@ -869,7 +866,7 @@ router.patch('/api/applications/:id', auth, checkBlocked, async (req, res) => {
     try {
       await pgPatch.query('BEGIN');
       if (status === 'rejected' && app_.status === 'pending') {
-        await pgPatch.query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [app_.apply_cost || 1, app_.freelancer_id]);
+        /* connects are non-refundable — spent on apply/post, no refund on reject/delete */
       }
       const result = await pgPatch.query('UPDATE applications SET status = $1, updated_at = NOW() WHERE id = $2 RETURNING *', [status, req.params.id]);
       patchedApp = result.rows[0];
@@ -881,7 +878,7 @@ router.patch('/api/applications/:id', auth, checkBlocked, async (req, res) => {
         if (toRejectPatch.rows.length) {
           await pgPatch.query("UPDATE applications SET status = 'rejected', updated_at = NOW() WHERE job_id = $1 AND id != $2 AND status = 'pending'", [app_.job_id, req.params.id]);
           for (const r of toRejectPatch.rows) {
-            await pgPatch.query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [app_.apply_cost || 1, r.freelancer_id]);
+            /* connects are non-refundable — spent on apply/post, no refund on reject/delete */
           }
         }
         if (app_.freelancer_id) {
@@ -954,7 +951,7 @@ router.post('/api/applications/:id/accept', auth, checkBlocked, async (req, res)
       if (toReject.rows.length) {
         await pgClientAccept.query("UPDATE applications SET status = 'rejected', updated_at = NOW() WHERE job_id = $1 AND id != $2 AND status = 'pending'", [app_.job_id, req.params.id]);
         for (const r of toReject.rows) {
-          await pgClientAccept.query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [refundCost, r.freelancer_id]);
+          /* connects are non-refundable — spent on apply/post, no refund on reject/delete */
         }
       }
       if (freelancerId) {
@@ -1014,7 +1011,7 @@ router.post('/api/applications/:id/reject', auth, checkBlocked, async (req, res)
         return res.status(400).json({ error: 'Application already rejected' });
       }
       if (app_.status === 'pending') {
-        await pgRej.query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [app_.apply_cost || 1, app_.freelancer_id]);
+        /* connects are non-refundable — spent on apply/post, no refund on reject/delete */
       }
       await pgRej.query('COMMIT');
       rejectedApp = rejRes.rows[0];
@@ -1064,7 +1061,7 @@ router.put('/api/applications/:id/status', auth, checkBlocked, async (req, res) 
     try {
       await pgStatusClient.query('BEGIN');
       if (status === 'rejected' && app_.status === 'pending') {
-        await pgStatusClient.query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [app_.apply_cost || 1, app_.freelancer_id]);
+        /* connects are non-refundable — spent on apply/post, no refund on reject/delete */
       }
       const result = await pgStatusClient.query('UPDATE applications SET status = $1, updated_at = NOW() WHERE id = $2 RETURNING *', [status, req.params.id]);
       updatedApp = result.rows[0];
@@ -1076,7 +1073,7 @@ router.put('/api/applications/:id/status', auth, checkBlocked, async (req, res) 
         if (toRejectStatus.rows.length) {
           await pgStatusClient.query("UPDATE applications SET status = 'rejected', updated_at = NOW() WHERE job_id = $1 AND id != $2 AND status = 'pending'", [app_.job_id, req.params.id]);
           for (const r of toRejectStatus.rows) {
-            await pgStatusClient.query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [app_.apply_cost || 1, r.freelancer_id]);
+            /* connects are non-refundable — spent on apply/post, no refund on reject/delete */
           }
         }
         const escrowAmt = app_.bid_amount || app_.job_budget || 0;
@@ -1168,10 +1165,7 @@ router.post('/api/applications/:id/hire', auth, checkBlocked, async (req, res) =
       );
       const refundCostHire = app_.apply_cost || 1;
       for (const r of toRejectHire.rows) {
-        await pgClientHire.query(
-          'UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2',
-          [refundCostHire, r.freelancer_id]
-        );
+        /* connects are non-refundable — spent on apply/post, no refund on reject/delete */
       }
       await pgClientHire.query(
         "UPDATE jobs SET status='in_progress', hired_freelancer_id=$1, hired_freelancer_name=$2, updated_at=NOW() WHERE id=$3",
