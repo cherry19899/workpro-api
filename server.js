@@ -598,6 +598,7 @@ initDb().then(async () => {
   // auto-release the funds to the freelancer and notify both parties.
   const { query: arQuery, getPool: arGetPool } = require('./src/db');
   const { getPlatformFee: arGetFee, notify: arNotify, audit: arAudit } = require('./src/helpers');
+  const { a2uEnabled: arA2uEnabled, sendA2U: arSendA2U } = require('./src/pi-a2u');
   async function autoReleaseExpiredEscrows() {
     try {
       // Only auto-release when the freelancer actually SUBMITTED the work and the
@@ -631,10 +632,20 @@ initDb().then(async () => {
           continue;
         }
         client.release();
-        await arNotify(escrow.freelancer_id, 'payment', 'Авто-выплата эскроу', `${net}π зачислено автоматически (14 дней без спора).`, escrow.job_id, null).catch(() => {});
+        // Real A2U payout (same as manual release)
+        let arTxid = null;
+        if (arA2uEnabled()) {
+          try {
+            const r = await arSendA2U(escrow.freelancer_id, net, 'WorkPro payment', { type: 'escrow_auto_release', escrow_id: escrow.id, job_id: escrow.job_id });
+            arTxid = r.txid;
+            await arQuery('UPDATE users SET balance_pi = GREATEST(COALESCE(balance_pi,0) - $1, 0), updated_at = NOW() WHERE id = $2', [net, escrow.freelancer_id]).catch(() => {});
+            await arQuery('UPDATE escrows SET payout_txid = $1, updated_at = NOW() WHERE id = $2', [arTxid, escrow.id]).catch(() => {});
+          } catch (e) { logger.warn(`[a2u] auto-release payout failed for escrow ${escrow.id}: ${e.message}`); }
+        }
+        await arNotify(escrow.freelancer_id, 'payment', 'Авто-выплата эскроу', arTxid ? `${net}π отправлено на ваш Pi-кошелёк (14 дней без спора).` : `${net}π зачислено автоматически (14 дней без спора).`, escrow.job_id, null).catch(() => {});
         await arNotify(escrow.client_id, 'escrow', 'Эскроу авто-выплачен', 'Средства по задаче автоматически переведены фрилансеру через 14 дней.', escrow.job_id, null).catch(() => {});
-        await arAudit('escrow_auto_released', { escrow_id: escrow.id, freelancer_id: escrow.freelancer_id, net_paid: net }).catch(() => {});
-        logger.info(`[auto-release] escrow ${escrow.id} released (${net}π)`);
+        await arAudit('escrow_auto_released', { escrow_id: escrow.id, freelancer_id: escrow.freelancer_id, net_paid: net, payout_txid: arTxid }).catch(() => {});
+        logger.info(`[auto-release] escrow ${escrow.id} released (${net}π)${arTxid ? ' + A2U ' + arTxid : ''}`);
       }
     } catch (e) { logger.warn('[auto-release] sweep error:', e.message); }
   }

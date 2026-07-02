@@ -8,6 +8,7 @@ const fetch = require('node-fetch');
 const { query, getPool } = require('../src/db');
 const { piApprovePayment, piCompletePayment, piGetPayment, notify, audit, serverError, PI_API_KEY, PI_API_BASE, getPlatformFee } = require('../src/helpers');
 const { auth, softAuth, checkBlocked } = require('../src/middleware');
+const { a2uEnabled, sendA2U } = require('../src/pi-a2u');
 
 const normalizeId = (id) => (id || '').toString().toLowerCase().replace(/^pi_/, '');
 
@@ -203,9 +204,28 @@ async function handleEscrowRelease(req, res) {
       await pgClient3.query('COMMIT');
     } catch (txErr) { await pgClient3.query('ROLLBACK').catch(() => {}); throw txErr; }
     finally { pgClient3.release(); }
-    await notify(escrow.freelancer_id, 'payment', 'Оплата получена', `${net}π зачислено на ваш счёт после завершения задачи.`, escrow.job_id, null).catch(() => {});
-    await audit('escrow_released', { escrow_id: req.params.id, freelancer_id: escrow.freelancer_id, amount: escrow.amount, net_paid: net });
-    res.json({ success: true, escrow: { ...escrow, status: 'released' } });
+    // Send REAL Pi to the freelancer's wallet via A2U (if the app wallet seed is
+    // configured). On success, deduct the just-credited balance_pi so the ledger
+    // reflects "paid out". On failure/not-configured, balance_pi remains as an
+    // amount still owed (retryable), so the money is never lost.
+    let payoutTxid = null;
+    if (a2uEnabled()) {
+      try {
+        const { txid } = await sendA2U(escrow.freelancer_id, net, 'WorkPro payment',
+          { type: 'escrow_release', escrow_id: escrow.id, job_id: escrow.job_id });
+        payoutTxid = txid;
+        await query('UPDATE users SET balance_pi = GREATEST(COALESCE(balance_pi,0) - $1, 0), updated_at = NOW() WHERE id = $2', [net, escrow.freelancer_id]).catch(() => {});
+        await query('UPDATE escrows SET payout_txid = $1, updated_at = NOW() WHERE id = $2', [txid, escrow.id]).catch(() => {});
+        await audit('escrow_payout_a2u', { escrow_id: escrow.id, freelancer_id: escrow.freelancer_id, net_paid: net, txid });
+      } catch (e) {
+        logger.warn(`[a2u] payout failed for escrow ${escrow.id}: ${e.message} — kept as balance_pi`);
+      }
+    }
+    await notify(escrow.freelancer_id, 'payment', 'Оплата получена',
+      payoutTxid ? `${net}π отправлено на ваш Pi-кошелёк.` : `${net}π зачислено на ваш счёт после завершения задачи.`,
+      escrow.job_id, null).catch(() => {});
+    await audit('escrow_released', { escrow_id: req.params.id, freelancer_id: escrow.freelancer_id, amount: escrow.amount, net_paid: net, payout_txid: payoutTxid });
+    res.json({ success: true, payout_txid: payoutTxid, escrow: { ...escrow, status: 'released' } });
   } catch (err) { serverError(err, res); }
 }
 

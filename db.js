@@ -245,6 +245,7 @@ async function initDb() {
     await query(`ALTER TABLE escrows ADD COLUMN IF NOT EXISTS client_username VARCHAR(255)`).catch(() => {});
     await query(`ALTER TABLE escrows ADD COLUMN IF NOT EXISTS freelancer_username VARCHAR(255)`).catch(() => {});
     await query(`ALTER TABLE escrows ADD COLUMN IF NOT EXISTS job_title VARCHAR(500)`).catch(() => {});
+    await query(`ALTER TABLE escrows ADD COLUMN IF NOT EXISTS payout_txid VARCHAR(255)`).catch(() => {});
     await query(`ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS read_by TEXT[] DEFAULT '{}'`).catch(() => {});
     await query(`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS is_urgent BOOLEAN DEFAULT FALSE`).catch(() => {});
     await query(`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS search_vector tsvector`).catch(() => {});
