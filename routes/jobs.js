@@ -691,7 +691,12 @@ router.get('/api/jobs/:id/applications', auth, async (req, res) => {
       || (posted_by_name && callerUsername && posted_by_name.toLowerCase() === callerUsername.toLowerCase());
     if (!isOwner) return res.status(403).json({ error: 'Forbidden' });
     const [result, totalRes] = await Promise.all([
-      query('SELECT * FROM applications WHERE job_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3', [req.params.id, limit, offset]),
+      query(
+        `SELECT a.*, u.username AS freelancer_username, u.avatar AS freelancer_avatar, u.rating AS applicant_rating
+         FROM applications a LEFT JOIN users u ON u.id = a.freelancer_id
+         WHERE a.job_id = $1 ORDER BY a.created_at DESC LIMIT $2 OFFSET $3`,
+        [req.params.id, limit, offset]
+      ),
       query('SELECT COUNT(*) FROM applications WHERE job_id = $1', [req.params.id]),
     ]);
     res.json({ applications: result.rows, total: parseInt(totalRes.rows[0].count), limit, offset });
