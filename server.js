@@ -591,6 +591,50 @@ initDb().then(async () => {
     }, 10 * 60 * 1000); // every 10 minutes
   }
 
+  // ─── Auto-release escrow after 14 days ─────────────────────────────────
+  // If a funded escrow sits untouched for 14 days (no release, no dispute),
+  // auto-release the funds to the freelancer and notify both parties.
+  const { query: arQuery, getPool: arGetPool } = require('./src/db');
+  const { getPlatformFee: arGetFee, notify: arNotify, audit: arAudit } = require('./src/helpers');
+  async function autoReleaseExpiredEscrows() {
+    try {
+      const due = await arQuery(
+        "SELECT * FROM escrows WHERE status = 'funded' AND created_at < NOW() - INTERVAL '14 days'"
+      );
+      if (!due.rows.length) return;
+      const fee = await arGetFee();
+      for (const escrow of due.rows) {
+        const net = parseFloat((escrow.amount * (1 - fee)).toFixed(8));
+        const client = await arGetPool().connect();
+        try {
+          await client.query('BEGIN');
+          const upd = await client.query(
+            "UPDATE escrows SET status='released', updated_at=NOW() WHERE id=$1 AND status='funded' RETURNING id",
+            [escrow.id]
+          );
+          if (!upd.rows.length) { await client.query('ROLLBACK'); client.release(); continue; }
+          await client.query('UPDATE users SET balance_pi = COALESCE(balance_pi,0) + $1, total_jobs_completed = total_jobs_completed + 1, updated_at = NOW() WHERE id = $2', [net, escrow.freelancer_id]);
+          await client.query("UPDATE jobs SET status='completed', updated_at=NOW() WHERE id=$1", [escrow.job_id]);
+          await client.query('COMMIT');
+        } catch (e) {
+          await client.query('ROLLBACK').catch(() => {});
+          client.release();
+          logger.warn(`[auto-release] escrow ${escrow.id} failed:`, e.message);
+          continue;
+        }
+        client.release();
+        await arNotify(escrow.freelancer_id, 'payment', 'Авто-выплата эскроу', `${net}π зачислено автоматически (14 дней без спора).`, escrow.job_id, null).catch(() => {});
+        await arNotify(escrow.client_id, 'escrow', 'Эскроу авто-выплачен', 'Средства по задаче автоматически переведены фрилансеру через 14 дней.', escrow.job_id, null).catch(() => {});
+        await arAudit('escrow_auto_released', { escrow_id: escrow.id, freelancer_id: escrow.freelancer_id, net_paid: net }).catch(() => {});
+        logger.info(`[auto-release] escrow ${escrow.id} released (${net}π)`);
+      }
+    } catch (e) { logger.warn('[auto-release] sweep error:', e.message); }
+  }
+  if (NODE_ENV === 'production') {
+    setInterval(autoReleaseExpiredEscrows, 60 * 60 * 1000); // hourly sweep
+    setTimeout(autoReleaseExpiredEscrows, 30 * 1000);       // once shortly after boot
+  }
+
   // Graceful shutdown — Render sends SIGTERM before killing the process
   const shutdown = (signal) => {
     logger.info(`[WorkPro API] ${signal} received — graceful shutdown`);
