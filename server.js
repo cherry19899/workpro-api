@@ -328,7 +328,9 @@ async function ensureNotificationsTable() {
   await run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_chat_read_at TIMESTAMPTZ`, 'users.last_chat_read_at');
   // Critical: must run before any UPDATE that references updated_at
   await run(`ALTER TABLE applications ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`, 'applications.updated_at');
-  await run(`ALTER TABLE offers ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`, 'offers.updated_at');
+  // NOTE: there is no separate "offers" table — offers are stored in `applications`
+  // with status='offer'. The old ALTER TABLE offers migration referenced a
+  // non-existent relation and logged an error on every boot; removed.
   // Unique indexes — may fail if duplicate rows exist in DB; logged but non-fatal
   await run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_applications_unique_apply ON applications(job_id, freelancer_id)`, 'idx_applications_unique_apply');
   await run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_escrows_payment ON escrows(payment_id)`, 'idx_escrows_payment');
