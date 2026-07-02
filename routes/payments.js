@@ -219,9 +219,12 @@ async function handleGetEscrow(req, res) {
   try {
     const [result, totalRes] = await Promise.all([
       query(
-        `SELECT e.*, j.title AS job_title
+        `SELECT e.*, j.title AS job_title,
+                uc.username AS client_username, uf.username AS freelancer_username
          FROM escrows e
          LEFT JOIN jobs j ON j.id = e.job_id
+         LEFT JOIN users uc ON uc.id = e.client_id
+         LEFT JOIN users uf ON uf.id = e.freelancer_id
          WHERE e.client_id = ANY($1) OR e.freelancer_id = ANY($1)
          ORDER BY e.created_at DESC LIMIT $2 OFFSET $3`,
         [[uid, uidAlt], limit, offset]
