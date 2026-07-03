@@ -141,8 +141,15 @@ async function audit(action, data) {
 }
 
 // ─── Generic server error responder ──────────────────────────────────────────────
+let _last500 = { error: null, stack: null, at: null };
+function last500() { return _last500; }
 function serverError(err, res) {
   console.error('[Error]', err);
+  _last500 = {
+    error: (err && (err.message || String(err))) || 'unknown',
+    stack: err && err.stack ? String(err.stack).split('\n').slice(0, 4).join(' | ') : null,
+    at: new Date().toISOString(),
+  };
   return res.status(500).json({ error: 'Internal server error' });
 }
 
@@ -164,6 +171,7 @@ module.exports = {
   notify,
   audit,
   serverError,
+  last500,
   PI_API_KEY,
   PI_API_BASE,
   getPlatformFee,
