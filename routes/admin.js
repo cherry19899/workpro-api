@@ -368,15 +368,19 @@ router.post('/api/admin/escrows/:id/resolve', adminAuth, async (req, res) => {
     const result = await query('SELECT * FROM escrows WHERE id = $1', [req.params.id]);
     if (!result.rows.length) return res.status(404).json({ error: 'Escrow not found' });
     const escrow = result.rows[0];
-    if (escrow.status !== 'disputed') return res.status(400).json({ error: `Escrow is not disputed (status: ${escrow.status})` });
+    // Admin can resolve both disputed escrows AND funded ones (the admin panel shows
+    // Release/Refund on funded escrows too). Reject only already-settled/pending ones.
+    if (!['disputed', 'funded'].includes(escrow.status)) {
+      return res.status(400).json({ error: `Escrow cannot be resolved (status: ${escrow.status})` });
+    }
     const pgC = await getPool().connect();
     try {
       await pgC.query('BEGIN');
       const guard = await pgC.query(
-        "UPDATE escrows SET status=$1, updated_at=NOW() WHERE id=$2 AND status='disputed' RETURNING id",
-        [action === 'release_to_freelancer' ? 'released' : 'refunded', req.params.id]
+        "UPDATE escrows SET status=$1, updated_at=NOW() WHERE id=$2 AND status = ANY($3) RETURNING id",
+        [action === 'release_to_freelancer' ? 'released' : 'refunded', req.params.id, ['disputed', 'funded']]
       );
-      if (!guard.rows.length) { await pgC.query('ROLLBACK'); return res.status(409).json({ error: 'Escrow no longer disputed' }); }
+      if (!guard.rows.length) { await pgC.query('ROLLBACK'); return res.status(409).json({ error: 'Escrow already settled' }); }
       let net = null;
       if (action === 'release_to_freelancer') {
         const fee = await getPlatformFee();
@@ -400,9 +404,12 @@ router.post('/api/admin/escrows/:id/resolve', adminAuth, async (req, res) => {
         await query('UPDATE escrows SET payout_txid = $1, updated_at = NOW() WHERE id = $2', [payoutTxid, escrow.id]).catch(() => {});
       } catch (e) { logger.warn(`[a2u] dispute payout failed for escrow ${escrow.id}: ${e.message}`); }
     }
-    await audit('admin_dispute_resolved', { escrow_id: req.params.id, action, reason: reason || null, by: req.userId, payout_txid: payoutTxid });
-    await notify(escrow.client_id, 'dispute', 'Спор разрешён администратором', reason || `Решение: ${action}`, escrow.job_id, null).catch(() => {});
-    await notify(escrow.freelancer_id, 'dispute', 'Спор разрешён администратором', reason || `Решение: ${action}`, escrow.job_id, null).catch(() => {});
+    await audit(escrow.status === 'disputed' ? 'admin_dispute_resolved' : 'admin_escrow_resolved', { escrow_id: req.params.id, action, reason: reason || null, by: req.userId, payout_txid: payoutTxid });
+    const notifTitle = escrow.status === 'disputed' ? 'Спор разрешён администратором'
+      : (action === 'release_to_freelancer' ? 'Средства выплачены фрилансеру' : 'Средства возвращены заказчику');
+    const notifBody = reason || (action === 'release_to_freelancer' ? 'Эскроу выплачен.' : 'Эскроу возвращён заказчику.');
+    await notify(escrow.client_id, 'escrow', notifTitle, notifBody, escrow.job_id, null).catch(() => {});
+    await notify(escrow.freelancer_id, 'escrow', notifTitle, notifBody, escrow.job_id, null).catch(() => {});
     res.json({ success: true, action, payout_txid: payoutTxid });
   } catch (err) { serverError(err, res); }
 });
