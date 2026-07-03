@@ -8,6 +8,7 @@ const jwt = require('jsonwebtoken');
 const { query, getPool } = require('../src/db');
 const { notify, audit, serverError, getPlatformFee, getDeveloperFee, invalidatePlatformFeeCache, FEE_MAX, DEV_FEE_MAX } = require('../src/helpers');
 const { adminAuth, twinId, JWT_SECRET, ADMIN_API_KEY, _rlBlocks } = require('../src/middleware');
+const { a2uEnabled, sendA2U } = require('../src/pi-a2u');
 
 // In-memory cache for stats (5-minute TTL)
 let _statsCache = null;
@@ -376,9 +377,10 @@ router.post('/api/admin/escrows/:id/resolve', adminAuth, async (req, res) => {
         [action === 'release_to_freelancer' ? 'released' : 'refunded', req.params.id]
       );
       if (!guard.rows.length) { await pgC.query('ROLLBACK'); return res.status(409).json({ error: 'Escrow no longer disputed' }); }
+      let net = null;
       if (action === 'release_to_freelancer') {
         const fee = await getPlatformFee();
-        const net = parseFloat((escrow.amount * (1 - fee)).toFixed(8));
+        net = parseFloat((escrow.amount * (1 - fee)).toFixed(8));
         await pgC.query('UPDATE users SET balance_pi = COALESCE(balance_pi,0) + $1, total_jobs_completed = total_jobs_completed + 1, updated_at=NOW() WHERE id=$2', [net, escrow.freelancer_id]);
         await pgC.query("UPDATE jobs SET status='completed', updated_at=NOW() WHERE id=$1", [escrow.job_id]);
       } else {
@@ -388,10 +390,20 @@ router.post('/api/admin/escrows/:id/resolve', adminAuth, async (req, res) => {
       await pgC.query('COMMIT');
     } catch (txErr) { await pgC.query('ROLLBACK').catch(() => {}); throw txErr; }
     finally { pgC.release(); }
-    await audit('admin_dispute_resolved', { escrow_id: req.params.id, action, reason: reason || null, by: req.userId });
+    // Real A2U payout when the dispute is resolved in the freelancer's favor.
+    let payoutTxid = null;
+    if (action === 'release_to_freelancer' && net > 0 && a2uEnabled()) {
+      try {
+        const r = await sendA2U(escrow.freelancer_id, net, 'WorkPro dispute resolution', { type: 'dispute_release', escrow_id: escrow.id, job_id: escrow.job_id });
+        payoutTxid = r.txid;
+        await query('UPDATE users SET balance_pi = GREATEST(COALESCE(balance_pi,0) - $1, 0), updated_at = NOW() WHERE id = $2', [net, escrow.freelancer_id]).catch(() => {});
+        await query('UPDATE escrows SET payout_txid = $1, updated_at = NOW() WHERE id = $2', [payoutTxid, escrow.id]).catch(() => {});
+      } catch (e) { logger.warn(`[a2u] dispute payout failed for escrow ${escrow.id}: ${e.message}`); }
+    }
+    await audit('admin_dispute_resolved', { escrow_id: req.params.id, action, reason: reason || null, by: req.userId, payout_txid: payoutTxid });
     await notify(escrow.client_id, 'dispute', 'Спор разрешён администратором', reason || `Решение: ${action}`, escrow.job_id, null).catch(() => {});
     await notify(escrow.freelancer_id, 'dispute', 'Спор разрешён администратором', reason || `Решение: ${action}`, escrow.job_id, null).catch(() => {});
-    res.json({ success: true, action });
+    res.json({ success: true, action, payout_txid: payoutTxid });
   } catch (err) { serverError(err, res); }
 });
 
