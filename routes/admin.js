@@ -373,6 +373,9 @@ router.post('/api/admin/escrows/:id/resolve', adminAuth, async (req, res) => {
     if (!['disputed', 'funded'].includes(escrow.status)) {
       return res.status(400).json({ error: `Escrow cannot be resolved (status: ${escrow.status})` });
     }
+    // Declared outside the transaction block so it's still in scope for the A2U
+    // payout below (a block-scoped `let net` inside try threw "net is not defined").
+    let net = null;
     const pgC = await getPool().connect();
     try {
       await pgC.query('BEGIN');
@@ -381,7 +384,6 @@ router.post('/api/admin/escrows/:id/resolve', adminAuth, async (req, res) => {
         [action === 'release_to_freelancer' ? 'released' : 'refunded', req.params.id, ['disputed', 'funded']]
       );
       if (!guard.rows.length) { await pgC.query('ROLLBACK'); return res.status(409).json({ error: 'Escrow already settled' }); }
-      let net = null;
       if (action === 'release_to_freelancer') {
         const fee = await getPlatformFee();
         net = parseFloat((escrow.amount * (1 - fee)).toFixed(8));
