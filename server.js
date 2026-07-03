@@ -259,6 +259,8 @@ app.get('/api/health', async (req, res) => {
   }
 
   result.pi_api = piKey ? 'configured' : 'missing';
+  // A2U (real payout to freelancer) requires both the API key and the wallet seed.
+  result.a2u = (piKey && process.env.PI_WALLET_PRIVATE_SEED) ? 'configured' : 'missing';
 
   // Pi API latency (only on deep=1 to avoid slowing every ping) — cached 60s
   if (piKey && process.env.SANDBOX_MODE !== 'true' && req.query.deep === '1') {
