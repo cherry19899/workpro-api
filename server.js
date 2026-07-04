@@ -605,6 +605,17 @@ initDb().then(async () => {
   const { a2uEnabled: arA2uEnabled, sendA2U: arSendA2U } = require('./src/pi-a2u');
   async function autoReleaseExpiredEscrows() {
     try {
+      // Sweep zombie escrows: 'pending' means the Pi payment was never completed,
+      // so there is no money in them — after 7 days they only clutter the Active
+      // tab (the client has no button to remove them). Cancel them silently.
+      const zombie = await arQuery(
+        `UPDATE escrows SET status='cancelled', updated_at=NOW()
+         WHERE status='pending' AND created_at < NOW() - INTERVAL '7 days'
+         RETURNING id`
+      ).catch(() => ({ rows: [] }));
+      if (zombie.rows.length) {
+        logger.info(`[auto-release] cancelled ${zombie.rows.length} stale pending escrow(s): ${zombie.rows.map(r => r.id).join(', ')}`);
+      }
       // Only auto-release when the freelancer actually SUBMITTED the work and the
       // client failed to review it within 14 days. Funded-but-not-submitted escrows
       // are never auto-paid (protects the client from a freelancer who did nothing).
