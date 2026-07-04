@@ -33,8 +33,11 @@ async function sendA2U(uid, amount, memo, metadata = {}) {
     if (!pi) throw new Error('A2U not configured (PI_WALLET_PRIVATE_SEED missing)');
     const amt = Number(parseFloat(amount).toFixed(7));
     if (!(amt > 0)) throw new Error('A2U amount must be > 0');
+    // Our DB stores user ids as "pi_<uid>", but the Pi Platform API expects the
+    // bare uid (otherwise: user_not_found).
+    const piUid = String(uid).replace(/^pi_/, '');
     stage = 'createPayment';
-    const paymentId = await pi.createPayment({ amount: amt, memo, metadata, uid });
+    const paymentId = await pi.createPayment({ amount: amt, memo, metadata, uid: piUid });
     logger.info(`[a2u] created payment ${paymentId} → ${uid} (${amt}π)`);
     stage = 'submitPayment';
     const txid = await pi.submitPayment(paymentId);

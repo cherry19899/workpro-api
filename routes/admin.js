@@ -416,6 +416,30 @@ router.post('/api/admin/escrows/:id/resolve', adminAuth, async (req, res) => {
   } catch (err) { serverError(err, res); }
 });
 
+// POST /api/admin/users/:id/payout-owed — send the user's accumulated balance_pi
+// (amounts owed from releases where the real A2U transfer failed) as one real
+// A2U payment, then deduct it. Safe to retry: deducts only what was paid.
+router.post('/api/admin/users/:id/payout-owed', adminAuth, async (req, res) => {
+  try {
+    if (!a2uEnabled()) return res.status(400).json({ error: 'A2U is not configured (PI_WALLET_PRIVATE_SEED missing)' });
+    const userRes = await query('SELECT id, username, balance_pi FROM users WHERE id = $1', [req.params.id]);
+    if (!userRes.rows.length) return res.status(404).json({ error: 'User not found' });
+    const owed = parseFloat(userRes.rows[0].balance_pi || 0);
+    if (!(owed > 0)) return res.status(400).json({ error: 'Nothing to pay out (balance_pi is 0)' });
+    const { txid, paymentId } = await sendA2U(req.params.id, owed, 'WorkPro payout',
+      { type: 'owed_payout', by: req.userId });
+    await query('UPDATE users SET balance_pi = GREATEST(COALESCE(balance_pi,0) - $1, 0), updated_at = NOW() WHERE id = $2', [owed, req.params.id]);
+    await audit('admin_owed_payout', { user_id: req.params.id, amount: owed, txid, payment_id: paymentId, by: req.userId });
+    await notify(req.params.id, 'payment', 'Выплата получена', `${owed}π отправлено на ваш Pi-кошелёк.`, null, null).catch(() => {});
+    res.json({ success: true, paid: owed, txid });
+  } catch (err) {
+    // Surface the real A2U error to the admin instead of a generic 500.
+    const msg = (err && (err.response?.data?.error_message || err.message)) || 'Payout failed';
+    logger.warn(`[a2u] owed payout failed for ${req.params.id}: ${msg}`);
+    res.status(502).json({ error: `A2U payout failed: ${msg}` });
+  }
+});
+
 // GET /api/admin/earnings
 router.get('/api/admin/earnings', adminAuth, async (req, res) => {
   const timeout = new Promise(resolve => setTimeout(() => resolve(null), 12000));
