@@ -787,6 +787,7 @@ router.get('/api/applications/my', auth, async (req, res) => {
   try {
     const result = await query(
       `SELECT a.*, j.posted_by_name as client_name, j.posted_by as client_id,
+              j.title AS job_title, j.budget AS job_budget, j.status AS job_status,
               COALESCE(u.username, j.posted_by_name) as client_username
        FROM applications a LEFT JOIN jobs j ON j.id = a.job_id
        LEFT JOIN users u ON u.id = j.posted_by
@@ -805,6 +806,7 @@ router.get('/api/applications/me', auth, async (req, res) => {
   try {
     const result = await query(
       `SELECT a.*, j.posted_by_name as client_name, j.posted_by as client_id,
+              j.title AS job_title, j.budget AS job_budget, j.status AS job_status,
               COALESCE(u.username, j.posted_by_name) as client_username
        FROM applications a LEFT JOIN jobs j ON j.id = a.job_id
        LEFT JOIN users u ON u.id = j.posted_by
