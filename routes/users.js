@@ -137,6 +137,55 @@ router.get('/api/users/:id/portfolio', async (req, res) => {
   } catch (err) { serverError(err, res); }
 });
 
+// PUT /api/users/me/portfolio — upsert own portfolio header (headline/summary/links)
+router.put('/api/users/me/portfolio', auth, checkBlocked, async (req, res) => {
+  const { headline = '', summary = '', experience_years = 0, website = '', github = '', linkedin = '' } = req.body || {};
+  if (String(headline).length > 200) return res.status(400).json({ error: 'Headline too long (max 200)' });
+  if (String(summary).length > 2000) return res.status(400).json({ error: 'Summary too long (max 2000)' });
+  const years = parseInt(experience_years) || 0;
+  if (years < 0 || years > 80) return res.status(400).json({ error: 'Invalid experience_years' });
+  try {
+    const result = await query(
+      `INSERT INTO portfolios (user_id, headline, summary, experience_years, website, github, linkedin)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)
+       ON CONFLICT (user_id) DO UPDATE SET
+         headline=$2, summary=$3, experience_years=$4, website=$5, github=$6, linkedin=$7, updated_at=NOW()
+       RETURNING *`,
+      [req.userId, headline, summary, years, website, github, linkedin]
+    );
+    res.json({ portfolio: result.rows[0], success: true });
+  } catch (err) { serverError(err, res); }
+});
+
+// POST /api/users/me/portfolio/items — add a work item
+router.post('/api/users/me/portfolio/items', auth, checkBlocked, async (req, res) => {
+  const { title, description = '', image_url = '', category = '', tags = '' } = req.body || {};
+  if (!title || !String(title).trim()) return res.status(400).json({ error: 'Title required' });
+  if (String(title).length > 500) return res.status(400).json({ error: 'Title too long (max 500)' });
+  if (String(description).length > 3000) return res.status(400).json({ error: 'Description too long (max 3000)' });
+  try {
+    const count = await query('SELECT COUNT(*) FROM portfolio_items WHERE user_id = $1', [req.userId]);
+    if (parseInt(count.rows[0].count) >= 20) return res.status(400).json({ error: 'Portfolio limit reached (max 20 items)' });
+    const result = await query(
+      `INSERT INTO portfolio_items (user_id, title, description, image_url, category, tags)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [req.userId, String(title).trim(), description, image_url, category, tags]
+    );
+    res.json({ item: result.rows[0], success: true });
+  } catch (err) { serverError(err, res); }
+});
+
+// DELETE /api/users/me/portfolio/items/:itemId — remove own work item
+router.delete('/api/users/me/portfolio/items/:itemId', auth, async (req, res) => {
+  const itemId = parseInt(req.params.itemId);
+  if (isNaN(itemId)) return res.status(400).json({ error: 'Invalid item id' });
+  try {
+    const result = await query('DELETE FROM portfolio_items WHERE id = $1 AND user_id = $2 RETURNING id', [itemId, req.userId]);
+    if (!result.rows.length) return res.status(404).json({ error: 'Item not found' });
+    res.json({ success: true });
+  } catch (err) { serverError(err, res); }
+});
+
 // POST + PUT /api/users/:id/availability
 async function handleAvailability(req, res) {
   const { available, availability } = req.body;
