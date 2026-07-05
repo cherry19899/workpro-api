@@ -1074,7 +1074,13 @@ router.post('/api/offers/:id/decline', auth, checkBlocked, async (req, res) => {
       if (!exists.rows.length) return res.status(404).json({ error: 'Offer not found' });
       return res.status(400).json({ error: `Offer cannot be declined (current status: ${exists.rows[0].status})` });
     }
-    res.json({ application: result.rows[0], success: true });
+    const app_ = result.rows[0];
+    const jobRow = await query('SELECT posted_by, title FROM jobs WHERE id = $1', [app_.job_id]).catch(() => ({ rows: [] }));
+    if (jobRow.rows.length) {
+      await notify(jobRow.rows[0].posted_by, 'offer', `Предложение отклонено`,
+        `Фрилансер отклонил ваше предложение по задаче "${jobRow.rows[0].title}"`, app_.job_id, null).catch(() => {});
+    }
+    res.json({ application: app_, success: true });
   } catch (err) { serverError(err, res); }
 });
 
