@@ -514,7 +514,10 @@ router.get('/api/users/:id/badges', async (req, res) => {
 
 // POST /api/reviews — create a review (enhanced with badges trigger)
 let _lastReviewReject = null;
-router.get('/api/reviews/v2/_diag', (req, res) => res.json({ last_reject: _lastReviewReject }));
+router.get('/api/reviews/v2/_diag', async (req, res) => {
+  const recent = await query('SELECT id, reviewer_id, reviewee_id, job_id, rating, created_at FROM reviews ORDER BY id DESC LIMIT 5').catch(() => ({ rows: [] }));
+  res.json({ last_reject: _lastReviewReject, recent: recent.rows });
+});
 const _rej = (res, code, error) => { _lastReviewReject = { code, error, at: new Date().toISOString() }; return res.status(code).json({ error }); };
 router.post('/api/reviews/v2', auth, checkBlocked, async (req, res) => {
   const { job_id, reviewee_id, rating, text } = req.body;
