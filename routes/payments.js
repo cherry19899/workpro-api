@@ -1183,8 +1183,8 @@ router.post('/api/escrows/:id/milestone/:milestoneId/request', auth, checkBlocke
       [autoReleaseAt, milestoneId]
     );
     // Notify client
-    notify(e.client_id, 'milestone_requested', 'Milestone completion requested',
-      `Freelancer requested release of milestone ${m.milestone_index + 1}`, { escrow_id: escrowId, milestone_id: milestoneId }).catch(() => {});
+    notify(e.client_id, 'milestone_requested', 'Запрошена выплата этапа',
+      `Фрилансер запросил выплату этапа ${m.milestone_index + 1}`, e.job_id, null).catch(() => {});
     res.json({ success: true, auto_release_at: autoReleaseAt });
   } catch (err) { serverError(err, res); }
 });
@@ -1229,10 +1229,25 @@ router.post('/api/escrows/:id/milestone/:milestoneId/approve', auth, checkBlocke
       await client.query("UPDATE escrows SET status='completed', updated_at=NOW() WHERE id=$1", [escrowId]);
     }
     await client.query('COMMIT');
+    // Real wallet payout via A2U, same as full release: on success deduct the
+    // just-credited balance_pi; on failure the debt stays retryable.
+    let payoutTxid = null;
+    if (a2uEnabled()) {
+      try {
+        const { txid } = await sendA2U(e.freelancer_id, freelancerAmt, 'WorkPro milestone payment',
+          { type: 'milestone_release', escrow_id: escrowId, milestone_id: milestoneId });
+        payoutTxid = txid;
+        await query('UPDATE users SET balance_pi = GREATEST(COALESCE(balance_pi,0) - $1, 0), updated_at = NOW() WHERE id = $2', [freelancerAmt, e.freelancer_id]).catch(() => {});
+        await audit('milestone_payout_a2u', { escrow_id: escrowId, milestone_id: milestoneId, freelancer_id: e.freelancer_id, net_paid: freelancerAmt, txid });
+      } catch (a2uErr) {
+        logger.warn(`[a2u] milestone payout failed for escrow ${escrowId}/${milestoneId}: ${a2uErr.message} — kept as balance_pi`);
+      }
+    }
     // Notify freelancer
-    notify(e.freelancer_id, 'milestone_approved', 'Milestone payment received!',
-      `${freelancerAmt} π released for milestone ${m.milestone_index + 1}`, { escrow_id: escrowId }).catch(() => {});
-    res.json({ success: true, released: freelancerAmt, fee: platformFee, all_completed: allDone });
+    notify(e.freelancer_id, 'milestone_approved', 'Этап оплачен',
+      payoutTxid ? `${freelancerAmt}π за этап ${m.milestone_index + 1} отправлено на ваш Pi-кошелёк.` : `${freelancerAmt}π зачислено за этап ${m.milestone_index + 1}.`,
+      e.job_id, null).catch(() => {});
+    res.json({ success: true, released: freelancerAmt, fee: platformFee, all_completed: allDone, payout_txid: payoutTxid });
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     serverError(err, res);
