@@ -520,12 +520,31 @@ router.post('/api/reviews/v2', auth, checkBlocked, async (req, res) => {
   if (text && text.length < 10) return res.status(400).json({ error: 'Review text must be at least 10 characters' });
   if (text && text.length > 2000) return res.status(400).json({ error: 'Review too long (max 2000 chars)' });
   if (req.userId === reviewee_id) return res.status(400).json({ error: 'Cannot review yourself' });
+  if (job_id !== undefined && job_id !== null && isNaN(parseInt(job_id))) return res.status(400).json({ error: 'Invalid job_id' });
   try {
-    // Check for duplicate
+    // Same participant rules as POST /api/ratings: only the two sides of a
+    // completed job may review each other (v2 previously skipped this entirely).
     if (job_id) {
-      const dup = await query('SELECT id FROM reviews WHERE job_id=$1 AND reviewer_id=$2 AND reviewee_id=$3', [job_id, req.userId, reviewee_id]);
-      if (dup.rows.length) return res.status(409).json({ error: 'You already reviewed this person for this job' });
+      const jobCheck = await query('SELECT posted_by, hired_freelancer_id, status FROM jobs WHERE id = $1', [job_id]);
+      if (!jobCheck.rows.length) return res.status(404).json({ error: 'Job not found' });
+      const job = jobCheck.rows[0];
+      const isParticipant = normalizeId(job.posted_by) === normalizeId(req.userId) || normalizeId(job.hired_freelancer_id) === normalizeId(req.userId);
+      if (!isParticipant) return res.status(403).json({ error: 'You were not a participant in this job' });
+      if (job.status !== 'completed') return res.status(400).json({ error: 'Job must be completed before reviewing' });
+      const expectedTarget = normalizeId(job.posted_by) === normalizeId(req.userId) ? job.hired_freelancer_id : job.posted_by;
+      if (normalizeId(reviewee_id) !== normalizeId(expectedTarget)) return res.status(403).json({ error: 'You can only review the other participant of this job' });
+    } else {
+      const sharedJob = await query(
+        `SELECT id FROM jobs WHERE status='completed' AND (
+          (posted_by=$1 AND hired_freelancer_id=$2) OR (posted_by=$2 AND hired_freelancer_id=$1)
+        ) LIMIT 1`,
+        [req.userId, reviewee_id]
+      );
+      if (!sharedJob.rows.length) return res.status(403).json({ error: 'You have no completed job with this user' });
     }
+    // Check for duplicate (job_id NULL included — one general review per pair)
+    const dup = await query('SELECT id FROM reviews WHERE job_id IS NOT DISTINCT FROM $1 AND reviewer_id=$2 AND reviewee_id=$3', [job_id || null, req.userId, reviewee_id]);
+    if (dup.rows.length) return res.status(409).json({ error: 'You already reviewed this person for this job' });
     const { sanitizeText } = require('../src/sanitize');
     const safeText = text ? sanitizeText(text, 2000) : null;
     const r = await query(
