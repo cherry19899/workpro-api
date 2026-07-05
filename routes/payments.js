@@ -871,7 +871,7 @@ router.post('/api/escrows/:id/dispute', auth, checkBlocked, async (req, res) => 
     if (escrow.status !== 'funded') {
       return res.status(400).json({ error: `Can only dispute a funded escrow (current status: '${escrow.status}')` });
     }
-    await query('UPDATE escrows SET status = $1, updated_at = NOW() WHERE id = $2', ['disputed', req.params.id]);
+    await query('UPDATE escrows SET status = $1, dispute_reason = $2, updated_at = NOW() WHERE id = $3', ['disputed', reason || null, req.params.id]);
     await audit('escrow_disputed', { escrow_id: req.params.id, reason, user_id: req.userId });
     const otherParty = normalizeId(req.userId) === normalizeId(escrow.client_id) ? escrow.freelancer_id : escrow.client_id;
     await notify(otherParty, 'dispute', 'Открыт спор по задаче',

@@ -438,6 +438,7 @@ async function ensureNotificationsTable() {
      END $$`,
     'fk_escrows_job_id'
   );
+  await run(`ALTER TABLE escrows ADD COLUMN IF NOT EXISTS dispute_reason TEXT`, 'escrows.dispute_reason');
   // Backfill applications.updated_at for rows created before the column existed
   await run(
     `UPDATE applications SET updated_at = created_at WHERE updated_at IS NULL`,
