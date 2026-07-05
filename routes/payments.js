@@ -1179,7 +1179,7 @@ router.post('/api/escrows/:id/milestone/:milestoneId/request', auth, checkBlocke
     // Auto-release in 14 days if client doesn't respond
     const autoReleaseAt = new Date(Date.now() + 14 * 24 * 60 * 60 * 1000);
     await query(
-      'UPDATE escrow_milestones SET freelancer_requested=TRUE, requested_at=NOW(), auto_release_at=$1 WHERE id=$2',
+      "UPDATE escrow_milestones SET status='requested', freelancer_requested=TRUE, requested_at=NOW(), auto_release_at=$1 WHERE id=$2",
       [autoReleaseAt, milestoneId]
     );
     // Notify client
@@ -1204,7 +1204,7 @@ router.post('/api/escrows/:id/milestone/:milestoneId/approve', auth, checkBlocke
     const msRow = await client.query('SELECT * FROM escrow_milestones WHERE id=$1 AND escrow_id=$2 FOR UPDATE', [milestoneId, escrowId]);
     if (!msRow.rows.length) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Milestone not found' }); }
     const m = msRow.rows[0];
-    if (m.status !== 'pending') { await client.query('ROLLBACK'); return res.status(400).json({ error: 'Already processed' }); }
+    if (!['pending', 'requested'].includes(m.status)) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'Already processed' }); }
 
     const releaseAmt = parseFloat(m.amount);
     const fee = await getPlatformFee();
@@ -1223,7 +1223,7 @@ router.post('/api/escrows/:id/milestone/:milestoneId/approve', auth, checkBlocke
     await client.query('INSERT INTO escrow_transactions (escrow_id, milestone_id, type, amount, note) VALUES ($1,$2,$3,$4,$5)',
       [escrowId, milestoneId, 'fee', platformFee, 'Platform fee']);
     // Check if all milestones completed
-    const remaining = await client.query("SELECT COUNT(*) FROM escrow_milestones WHERE escrow_id=$1 AND status='pending'", [escrowId]);
+    const remaining = await client.query("SELECT COUNT(*) FROM escrow_milestones WHERE escrow_id=$1 AND status IN ('pending','requested')", [escrowId]);
     const allDone = parseInt(remaining.rows[0].count) === 0;
     if (allDone) {
       await client.query("UPDATE escrows SET status='completed', updated_at=NOW() WHERE id=$1", [escrowId]);

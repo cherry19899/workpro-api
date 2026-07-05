@@ -662,6 +662,50 @@ initDb().then(async () => {
         await arAudit('escrow_auto_released', { escrow_id: escrow.id, freelancer_id: escrow.freelancer_id, net_paid: net, payout_txid: arTxid }).catch(() => {});
         logger.info(`[auto-release] escrow ${escrow.id} released (${net}π)${arTxid ? ' + A2U ' + arTxid : ''}`);
       }
+      // Milestone auto-release: freelancer requested a milestone payout and the
+      // client stayed silent past auto_release_at (14 days) — release that stage.
+      const msDue = await arQuery(
+        `SELECT m.*, e.client_id, e.freelancer_id, e.job_id FROM escrow_milestones m
+         JOIN escrows e ON e.id = m.escrow_id
+         WHERE m.status = 'requested' AND m.auto_release_at IS NOT NULL AND m.auto_release_at < NOW()
+           AND e.status = 'funded'`
+      ).catch(() => ({ rows: [] }));
+      for (const m of msDue.rows) {
+        const msFee = await arGetFee();
+        const msNet = parseFloat((parseFloat(m.amount) * (1 - msFee)).toFixed(2));
+        const cl = await arGetPool().connect();
+        try {
+          await cl.query('BEGIN');
+          const upd = await cl.query("UPDATE escrow_milestones SET status='auto_released', approved_at=NOW() WHERE id=$1 AND status='requested' RETURNING id", [m.id]);
+          if (!upd.rows.length) { await cl.query('ROLLBACK'); cl.release(); continue; }
+          await cl.query('UPDATE users SET balance_pi = COALESCE(balance_pi,0) + $1, updated_at=NOW() WHERE id=$2', [msNet, m.freelancer_id]);
+          await cl.query('INSERT INTO escrow_transactions (escrow_id, milestone_id, type, amount, note) VALUES ($1,$2,$3,$4,$5)',
+            [m.escrow_id, m.id, 'release', parseFloat(m.amount), `Milestone ${m.milestone_index + 1} auto-released`]);
+          const left = await cl.query("SELECT COUNT(*) FROM escrow_milestones WHERE escrow_id=$1 AND status IN ('pending','requested')", [m.escrow_id]);
+          if (parseInt(left.rows[0].count) === 0) {
+            await cl.query("UPDATE escrows SET status='completed', updated_at=NOW() WHERE id=$1", [m.escrow_id]);
+          }
+          await cl.query('COMMIT');
+        } catch (e) {
+          await cl.query('ROLLBACK').catch(() => {});
+          cl.release();
+          logger.warn(`[auto-release] milestone ${m.id} failed:`, e.message);
+          continue;
+        }
+        cl.release();
+        let msTxid = null;
+        if (arA2uEnabled()) {
+          try {
+            const r = await arSendA2U(m.freelancer_id, msNet, 'WorkPro milestone payment', { type: 'milestone_auto_release', escrow_id: m.escrow_id, milestone_id: m.id });
+            msTxid = r.txid;
+            await arQuery('UPDATE users SET balance_pi = GREATEST(COALESCE(balance_pi,0) - $1, 0), updated_at = NOW() WHERE id = $2', [msNet, m.freelancer_id]).catch(() => {});
+          } catch (e) { logger.warn(`[a2u] milestone auto-release payout failed ${m.id}: ${e.message}`); }
+        }
+        await arNotify(m.freelancer_id, 'milestone_approved', 'Этап авто-выплачен', msTxid ? `${msNet}π за этап ${m.milestone_index + 1} отправлено на ваш Pi-кошелёк (14 дней без ответа заказчика).` : `${msNet}π зачислено за этап ${m.milestone_index + 1} автоматически.`, m.job_id, null).catch(() => {});
+        await arNotify(m.client_id, 'escrow', 'Этап авто-выплачен', `Этап ${m.milestone_index + 1} автоматически выплачен фрилансеру через 14 дней.`, m.job_id, null).catch(() => {});
+        await arAudit('milestone_auto_released', { escrow_id: m.escrow_id, milestone_id: m.id, net_paid: msNet, payout_txid: msTxid }).catch(() => {});
+        logger.info(`[auto-release] milestone ${m.id} released (${msNet}π)${msTxid ? ' + A2U ' + msTxid : ''}`);
+      }
     } catch (e) { logger.warn('[auto-release] sweep error:', e.message); }
   }
   if (NODE_ENV === 'production') {
