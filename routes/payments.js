@@ -1261,29 +1261,8 @@ router.post('/api/saved-searches/check-alerts', async (req, res) => {
   const { ADMIN_API_KEY } = require('../src/middleware');
   if (!key || key !== ADMIN_API_KEY) return res.status(403).json({ error: 'Forbidden' });
   try {
-    const searches = await query("SELECT * FROM saved_searches WHERE alert_enabled=TRUE AND (last_alerted_at IS NULL OR last_alerted_at < NOW() - INTERVAL '1 day')");
-    let alerted = 0;
-    for (const s of searches.rows) {
-      const params = s.query_params || {};
-      const q = params.q || params.search || '';
-      const cat = params.category || '';
-      let conditions = ["status='open'"];
-      const qParams = [];
-      let idx = 1;
-      if (q) { conditions.push(`search_vector @@ plainto_tsquery('english',$${idx++})`); qParams.push(q); }
-      if (cat && cat !== 'all') { conditions.push(`category ILIKE $${idx++}`); qParams.push(cat); }
-      conditions.push(`created_at > COALESCE((SELECT last_alerted_at FROM saved_searches WHERE id=$${idx++}), NOW()-INTERVAL '1 day')`);
-      qParams.push(s.id);
-      const newJobs = await query(`SELECT id, title, budget FROM jobs WHERE ${conditions.join(' AND ')} LIMIT 5`, qParams);
-      if (newJobs.rows.length > 0) {
-        notify(s.user_id, 'saved_search_alert', 'New jobs matching your saved search',
-          `${newJobs.rows.length} new job${newJobs.rows.length > 1 ? 's' : ''} for "${s.name}"`,
-          { jobs: newJobs.rows, search_id: s.id }).catch(() => {});
-        await query('UPDATE saved_searches SET last_alerted_at=NOW() WHERE id=$1', [s.id]);
-        alerted++;
-      }
-    }
-    res.json({ alerted, total: searches.rows.length });
+    const { checkSavedSearchAlerts } = require('../src/saved-search-alerts');
+    res.json(await checkSavedSearchAlerts());
   } catch (err) { serverError(err, res); }
 });
 

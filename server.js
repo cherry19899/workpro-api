@@ -709,9 +709,16 @@ initDb().then(async () => {
       }
     } catch (e) { logger.warn('[auto-release] sweep error:', e.message); }
   }
+  const { checkSavedSearchAlerts } = require('./src/saved-search-alerts');
+  async function hourlySweep() {
+    await autoReleaseExpiredEscrows();
+    await checkSavedSearchAlerts().then(r => {
+      if (r.alerted) logger.info(`[saved-search] alerted ${r.alerted}/${r.total}`);
+    }).catch(e => logger.warn('[saved-search] sweep error:', e.message));
+  }
   if (NODE_ENV === 'production') {
-    setInterval(autoReleaseExpiredEscrows, 60 * 60 * 1000); // hourly sweep
-    setTimeout(autoReleaseExpiredEscrows, 30 * 1000);       // once shortly after boot
+    setInterval(hourlySweep, 60 * 60 * 1000); // hourly sweep
+    setTimeout(hourlySweep, 30 * 1000);       // once shortly after boot
   }
 
   // Graceful shutdown — Render sends SIGTERM before killing the process
