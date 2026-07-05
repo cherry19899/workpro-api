@@ -1227,6 +1227,9 @@ router.post('/api/escrows/:id/milestone/:milestoneId/approve', auth, checkBlocke
     const allDone = parseInt(remaining.rows[0].count) === 0;
     if (allDone) {
       await client.query("UPDATE escrows SET status='completed', updated_at=NOW() WHERE id=$1", [escrowId]);
+      if (e.job_id) {
+        await client.query("UPDATE jobs SET status='completed', updated_at=NOW() WHERE id=$1", [e.job_id]);
+      }
     }
     await client.query('COMMIT');
     // Real wallet payout via A2U, same as full release: on success deduct the
