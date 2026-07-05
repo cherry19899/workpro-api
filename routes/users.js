@@ -516,7 +516,8 @@ router.get('/api/users/:id/badges', async (req, res) => {
 let _lastReviewReject = null;
 router.get('/api/reviews/v2/_diag', async (req, res) => {
   const recent = await query('SELECT id, reviewer_id, reviewee_id, job_id, rating, created_at FROM reviews ORDER BY id DESC LIMIT 5').catch(() => ({ rows: [] }));
-  res.json({ last_reject: _lastReviewReject, recent: recent.rows });
+  const escrows = await query('SELECT id, job_id, status, client_id, freelancer_id, amount, created_at, updated_at FROM escrows ORDER BY id DESC LIMIT 6').catch(() => ({ rows: [] }));
+  res.json({ last_reject: _lastReviewReject, recent: recent.rows, escrows: escrows.rows });
 });
 const _rej = (res, code, error) => { _lastReviewReject = { code, error, at: new Date().toISOString() }; return res.status(code).json({ error }); };
 router.post('/api/reviews/v2', auth, checkBlocked, async (req, res) => {
