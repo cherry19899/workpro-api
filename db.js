@@ -249,6 +249,9 @@ async function initDb() {
     await query(`ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS read_by TEXT[] DEFAULT '{}'`).catch(() => {});
     await query(`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS is_urgent BOOLEAN DEFAULT FALSE`).catch(() => {});
     await query(`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS search_vector tsvector`).catch(() => {});
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS terms_accepted BOOLEAN DEFAULT FALSE`).catch(() => {});
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS terms_accepted_at TIMESTAMP`).catch(() => {});
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP`).catch(() => {});
     // ── Full-text search index ───────────────────────────────────
     await query(`CREATE INDEX IF NOT EXISTS jobs_search_idx ON jobs USING GIN(search_vector)`).catch(() => {});
     await query(`UPDATE jobs SET search_vector = to_tsvector('english', coalesce(title,'') || ' ' || coalesce(description,'') || ' ' || coalesce(skills,'') || ' ' || coalesce(category,'')) WHERE search_vector IS NULL`).catch(() => {});

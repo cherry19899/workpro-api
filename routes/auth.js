@@ -137,7 +137,7 @@ router.put('/api/me', auth, checkBlocked, async (req, res) => {
       'UPDATE users SET username = COALESCE($1, username), bio = COALESCE($2, bio), skills = COALESCE($3, skills), updated_at = NOW() WHERE id = $4',
       [uname || null, bio || null, skillsStr, req.userId]
     );
-    const result = await query('SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, is_blocked, status, created_at, updated_at FROM users WHERE id = $1', [req.userId]);
+    const result = await query('SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, terms_accepted, terms_accepted_at,balance_connects, balance_pi, is_blocked, status, created_at, updated_at FROM users WHERE id = $1', [req.userId]);
     const u = result.rows[0];
     if (!Array.isArray(u.skills)) {
       u.skills = (typeof u.skills === 'string' && u.skills && u.skills !== '{}')
@@ -150,7 +150,7 @@ router.put('/api/me', auth, checkBlocked, async (req, res) => {
 // GET /api/me — get current user profile
 router.get('/api/me', auth, async (req, res) => {
   try {
-    const result = await query('SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, is_blocked, status, created_at, updated_at FROM users WHERE id = $1', [req.userId]);
+    const result = await query('SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, terms_accepted, terms_accepted_at,balance_connects, balance_pi, is_blocked, status, created_at, updated_at FROM users WHERE id = $1', [req.userId]);
     if (!result.rows.length) return res.status(404).json({ error: 'User not found' });
     let u = result.rows[0];
     // Owner self-heal on returning-user path (GET hit via stored JWT, never POST /api/me)
@@ -238,7 +238,7 @@ router.post('/api/me', authLimiter, async (req, res) => {
       await query(`UPDATE users SET role = 'admin' WHERE id = $1 AND role != 'admin'`, [uid]).catch(() => {});
     }
     await query(`UPDATE users SET total_jobs_posted = (SELECT COUNT(*) FROM jobs WHERE posted_by = $1), updated_at = NOW() WHERE id = $1`, [uid]).catch(() => {});
-    const user = await query('SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, is_blocked, status, created_at FROM users WHERE id = $1', [uid]);
+    const user = await query('SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, terms_accepted, terms_accepted_at,balance_connects, balance_pi, is_blocked, status, created_at FROM users WHERE id = $1', [uid]);
     const u = user.rows[0];
     if (u && u.status === 'deleted') {
       return res.status(403).json({ error: 'Account has been deleted' });
@@ -325,7 +325,7 @@ router.post('/api/auth/login', async (req, res) => {
     } else {
       await query('UPDATE users SET updated_at = NOW() WHERE id = $1', [uid]);
     }
-    const user = await query('SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, is_blocked, status, created_at FROM users WHERE id = $1', [uid]);
+    const user = await query('SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, terms_accepted, terms_accepted_at,balance_connects, balance_pi, is_blocked, status, created_at FROM users WHERE id = $1', [uid]);
     if (user.rows[0]?.status === 'deleted') {
       return res.status(403).json({ error: 'Account has been deleted' });
     }
@@ -339,7 +339,7 @@ router.post('/api/auth/login', async (req, res) => {
 router.get('/api/auth/me', auth, async (req, res) => {
   try {
     const result = await query(
-      'SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, is_blocked, status, created_at, updated_at FROM users WHERE id = $1',
+      'SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, terms_accepted, terms_accepted_at,balance_connects, balance_pi, is_blocked, status, created_at, updated_at FROM users WHERE id = $1',
       [req.userId]
     );
     if (!result.rows.length) return res.status(404).json({ error: 'User not found' });
@@ -356,7 +356,7 @@ router.get('/api/auth/me', auth, async (req, res) => {
 router.get('/api/users/me', auth, async (req, res) => {
   try {
     const result = await query(
-      'SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, is_blocked, status, title, hourly_rate, location, website, created_at, updated_at FROM users WHERE id = $1',
+      'SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, terms_accepted, terms_accepted_at,balance_connects, balance_pi, is_blocked, status, title, hourly_rate, location, website, created_at, updated_at FROM users WHERE id = $1',
       [req.userId]
     );
     if (!result.rows.length) return res.status(404).json({ error: 'User not found' });
@@ -405,7 +405,7 @@ router.put('/api/users/me', auth, checkBlocked, async (req, res) => {
     fields.push(`updated_at=NOW()`);
     vals.push(req.userId);
     await query(`UPDATE users SET ${fields.join(',')} WHERE id=$${i}`, vals);
-    const result = await query('SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, balance_connects, balance_pi, is_blocked, status, title, hourly_rate, location, website, created_at, updated_at FROM users WHERE id = $1', [req.userId]);
+    const result = await query('SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, terms_accepted, terms_accepted_at,balance_connects, balance_pi, is_blocked, status, title, hourly_rate, location, website, created_at, updated_at FROM users WHERE id = $1', [req.userId]);
     const u = result.rows[0];
     if (!Array.isArray(u.skills)) {
       u.skills = (typeof u.skills === 'string' && u.skills && u.skills !== '{}')
@@ -415,22 +415,104 @@ router.put('/api/users/me', auth, checkBlocked, async (req, res) => {
   } catch (err) { serverError(err, res); }
 });
 
+// Shared by DELETE /api/users/me and POST /api/user/data-delete — same safety
+// guard (no active jobs/escrow left dangling), now also anonymizes the
+// username and stamps deleted_at for GDPR-style erasure requests.
+async function deleteOwnAccount(userId) {
+  const active = await query(
+    `(SELECT 1 FROM jobs WHERE posted_by=$1 AND status IN ('open','in_progress','submitted') LIMIT 1)
+     UNION ALL
+     (SELECT 1 FROM jobs WHERE hired_freelancer_id=$1 AND status IN ('in_progress','submitted') LIMIT 1)
+     UNION ALL
+     (SELECT 1 FROM escrows WHERE (client_id=$1 OR freelancer_id=$1) AND status IN ('pending','funded') LIMIT 1)`,
+    [userId]
+  );
+  if (active.rows.length > 0) {
+    return { error: 'Нельзя удалить аккаунт с активными задачами или эскроу' };
+  }
+  await query(
+    `UPDATE users SET is_blocked = true, status = 'deleted', deleted_at = NOW(),
+       username = $2, updated_at = NOW() WHERE id = $1`,
+    [userId, `deleted_user_${userId}`]
+  );
+  return { success: true };
+}
+
 // DELETE /api/users/me — account deletion
 router.delete('/api/users/me', auth, async (req, res) => {
   try {
-    const active = await query(
-      `(SELECT 1 FROM jobs WHERE posted_by=$1 AND status IN ('open','in_progress','submitted') LIMIT 1)
-       UNION ALL
-       (SELECT 1 FROM jobs WHERE hired_freelancer_id=$1 AND status IN ('in_progress','submitted') LIMIT 1)
-       UNION ALL
-       (SELECT 1 FROM escrows WHERE (client_id=$1 OR freelancer_id=$1) AND status IN ('pending','funded') LIMIT 1)`,
+    const result = await deleteOwnAccount(req.userId);
+    if (result.error) return res.status(400).json(result);
+    res.json(result);
+  } catch (err) { serverError(err, res); }
+});
+
+// ─── GDPR / legal-compliance endpoints ────────────────────────────────────────
+
+// GET /api/user/privacy-status
+router.get('/api/user/privacy-status', auth, async (req, res) => {
+  try {
+    const result = await query('SELECT terms_accepted, terms_accepted_at FROM users WHERE id = $1', [req.userId]);
+    if (!result.rows.length) return res.status(404).json({ error: 'User not found' });
+    res.json(result.rows[0]);
+  } catch (err) { serverError(err, res); }
+});
+
+// POST /api/user/accept-terms
+router.post('/api/user/accept-terms', auth, async (req, res) => {
+  try {
+    const result = await query(
+      `UPDATE users SET terms_accepted = true, terms_accepted_at = NOW(), updated_at = NOW()
+       WHERE id = $1 RETURNING terms_accepted, terms_accepted_at`,
       [req.userId]
     );
-    if (active.rows.length > 0) {
-      return res.status(400).json({ error: 'Нельзя удалить аккаунт с активными задачами или эскроу' });
+    res.json(result.rows[0]);
+  } catch (err) { serverError(err, res); }
+});
+
+// POST /api/user/data-delete — GDPR erasure request (same guard/behavior as DELETE /api/users/me)
+router.post('/api/user/data-delete', auth, async (req, res) => {
+  try {
+    const result = await deleteOwnAccount(req.userId);
+    if (result.error) return res.status(400).json(result);
+    res.json(result);
+  } catch (err) { serverError(err, res); }
+});
+
+// GET /api/user/data-export — everything tied to the caller's own account, as JSON
+router.get('/api/user/data-export', auth, async (req, res) => {
+  try {
+    const id = req.userId;
+    const [profile, portfolio, portfolioItems, jobsPosted, applications, escrows, chatRooms, ratingsGiven, ratingsReceived] = await Promise.all([
+      query('SELECT id, username, email, role, bio, skills, avatar, kyc_verified, availability, title, hourly_rate, location, website, terms_accepted, terms_accepted_at, created_at FROM users WHERE id = $1', [id]),
+      query('SELECT headline, summary, experience_years, website, github, linkedin FROM portfolios WHERE user_id = $1', [id]),
+      query('SELECT title, description, image_url, category, tags, created_at FROM portfolio_items WHERE user_id = $1', [id]),
+      query('SELECT id, title, description, category, budget, status, created_at FROM jobs WHERE posted_by = $1', [id]),
+      query('SELECT id, job_id, job_title, message, status, created_at FROM applications WHERE freelancer_id = $1', [id]),
+      query('SELECT id, job_id, amount, status, created_at FROM escrows WHERE client_id = $1 OR freelancer_id = $1', [id]),
+      query('SELECT id, job_id, created_at FROM chat_rooms WHERE client_id = $1 OR freelancer_id = $1', [id]),
+      query('SELECT to_user_id, job_id, rating, comment, created_at FROM ratings WHERE from_user_id = $1', [id]),
+      query('SELECT from_user_id, job_id, rating, comment, created_at FROM ratings WHERE to_user_id = $1', [id]),
+    ]);
+    let messages = [];
+    if (chatRooms.rows.length) {
+      const roomIds = chatRooms.rows.map(r => r.id);
+      const msgs = await query('SELECT room_id, sender_id, message, created_at FROM chat_messages WHERE room_id = ANY($1) AND sender_id = $2', [roomIds, id]);
+      messages = msgs.rows;
     }
-    await query('UPDATE users SET is_blocked = true, status = $1, updated_at = NOW() WHERE id = $2', ['deleted', req.userId]);
-    res.json({ success: true });
+    res.json({
+      profile: profile.rows[0] || null,
+      portfolio: portfolio.rows[0] || null,
+      portfolio_items: portfolioItems.rows,
+      jobs_posted: jobsPosted.rows,
+      applications: applications.rows,
+      escrows: escrows.rows,
+      chat_rooms: chatRooms.rows,
+      messages_sent: messages,
+      ratings_given: ratingsGiven.rows,
+      ratings_received: ratingsReceived.rows,
+      exported_at: new Date().toISOString(),
+    });
   } catch (err) { serverError(err, res); }
 });
 
