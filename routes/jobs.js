@@ -48,6 +48,13 @@ function parseJobRow(job, { stripBase64 = false } = {}) {
 
 // ─── Jobs ──────────────────────────────────────────────
 
+// GET /api/config — public, lets the frontend show the real admin-configured
+// platform fee (e.g. on the post-job preview) instead of a hardcoded percent.
+router.get('/api/config', async (req, res) => {
+  const fee = await getPlatformFee();
+  res.json({ platform_fee_percent: parseFloat((fee * 100).toFixed(4)) });
+});
+
 // GET /api/jobs/search/autocomplete?q=<text>
 // Uses pg_trgm similarity when available, falls back to ILIKE.
 router.get('/api/jobs/search/autocomplete', async (req, res) => {
