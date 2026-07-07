@@ -23,6 +23,12 @@ router.get('/api/chat/rooms', auth, async (req, res) => {
         `SELECT r.*,
           (SELECT message FROM chat_messages WHERE room_id = r.id ORDER BY created_at DESC LIMIT 1) as last_message,
           (SELECT created_at FROM chat_messages WHERE room_id = r.id ORDER BY created_at DESC LIMIT 1) as last_message_at,
+          (SELECT COUNT(*) FROM chat_messages cm WHERE cm.room_id = r.id AND cm.sender_id != $1
+            AND cm.created_at > COALESCE(
+              (SELECT last_read_at FROM chat_room_reads WHERE room_id = r.id AND user_id = $1),
+              NOW() - INTERVAL '7 days'
+            )
+          ) as unread_count,
           j.title as job_title,
           CASE WHEN r.client_id = $1 THEN r.freelancer_id ELSE r.client_id END as other_user_id,
           CASE WHEN r.client_id = $1 THEN uf.username ELSE uc.username END as other_user_name,
@@ -172,6 +178,12 @@ router.get('/api/chat/conversations', auth, async (req, res) => {
         `SELECT r.*,
           (SELECT message FROM chat_messages WHERE room_id = r.id ORDER BY created_at DESC LIMIT 1) as last_message,
           (SELECT created_at FROM chat_messages WHERE room_id = r.id ORDER BY created_at DESC LIMIT 1) as last_message_at,
+          (SELECT COUNT(*) FROM chat_messages cm WHERE cm.room_id = r.id AND cm.sender_id != $1
+            AND cm.created_at > COALESCE(
+              (SELECT last_read_at FROM chat_room_reads WHERE room_id = r.id AND user_id = $1),
+              NOW() - INTERVAL '7 days'
+            )
+          ) as unread_count,
           j.title as job_title,
           CASE WHEN r.client_id = $1 THEN r.freelancer_id ELSE r.client_id END as other_user_id,
           CASE WHEN r.client_id = $1 THEN uf.username ELSE uc.username END as other_user_name,
