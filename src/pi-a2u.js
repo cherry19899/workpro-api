@@ -1,25 +1,32 @@
 // App-to-User (A2U) payments via the official pi-backend SDK.
-// Sends REAL Pi from the app's wallet to a user. Requires two env vars:
-//   PI_API_KEY               — the app's Pi Platform API key (already used elsewhere)
-//   PI_WALLET_PRIVATE_SEED   — the app wallet private seed (starts with "S")
-// If the seed is not configured, a2uEnabled() is false and callers fall back to
-// crediting the internal balance_pi ledger instead.
+// Sends Pi from the app's wallet to a user. Requires:
+//   PI_WALLET_PRIVATE_SEED   — app wallet private seed (starts with "S")
+//   SANDBOX_PI_API_KEY       — testnet API key (for sandbox/5-wallet requirement phase)
+//     OR PI_API_KEY          — mainnet API key (for production after wallet approved)
+// If only PI_API_KEY is set (no SANDBOX_PI_API_KEY), uses mainnet mode.
+// If SANDBOX_PI_API_KEY is set, uses it — Pi Platform routes to testnet automatically.
 const logger = require('./logger');
 
 let _pi = null;
-// Diagnostics: last A2U attempt result, surfaced via /api/health (no secrets).
+let _lastApiKey = null;
 let _last = { ok: null, stage: null, error: null, at: null };
 function a2uStatus() { return _last; }
 
+function getApiKey() {
+  return process.env.SANDBOX_PI_API_KEY || process.env.PI_API_KEY;
+}
+
 function a2uEnabled() {
-  return !!(process.env.PI_API_KEY && process.env.PI_WALLET_PRIVATE_SEED);
+  return !!(getApiKey() && process.env.PI_WALLET_PRIVATE_SEED);
 }
 
 function getClient() {
   if (!a2uEnabled()) return null;
-  if (!_pi) {
+  const apiKey = getApiKey();
+  if (!_pi || _lastApiKey !== apiKey) {
     const PiNetwork = require('pi-backend').default || require('pi-backend');
-    _pi = new PiNetwork(process.env.PI_API_KEY, process.env.PI_WALLET_PRIVATE_SEED);
+    _pi = new PiNetwork(apiKey, process.env.PI_WALLET_PRIVATE_SEED);
+    _lastApiKey = apiKey;
   }
   return _pi;
 }
@@ -33,8 +40,7 @@ async function sendA2U(uid, amount, memo, metadata = {}) {
     if (!pi) throw new Error('A2U not configured (PI_WALLET_PRIVATE_SEED missing)');
     const amt = Number(parseFloat(amount).toFixed(7));
     if (!(amt > 0)) throw new Error('A2U amount must be > 0');
-    // Our DB stores user ids as "pi_<uid>", but the Pi Platform API expects the
-    // bare uid (otherwise: user_not_found).
+    // DB stores user ids as "pi_<uid>", Pi Platform API expects bare uid.
     const piUid = String(uid).replace(/^pi_/, '');
     stage = 'createPayment';
     const paymentId = await pi.createPayment({ amount: amt, memo, metadata, uid: piUid });
