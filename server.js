@@ -221,6 +221,10 @@ app.get('/api/openapi.json', (req, res) => {
 });
 
 // Pi Network calls this to verify backend ownership
+app.get('/privacy', (req, res) => {
+  res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Work Pro Privacy Policy</title></head><body><h1>Work Pro Privacy Policy</h1><p>Work Pro is a freelance marketplace on the Pi Network. We collect your Pi username and profile information to facilitate job postings and payments between job creators and freelancers. Payment data is processed via the Pi Network SDK. We do not sell your data to third parties. Contact: support via the Work Pro app.</p></body></html>`);
+});
+
 app.get('/.well-known/pi-network', (req, res) => {
   res.json({
     app: 'workpro',
