@@ -638,9 +638,9 @@ initDb().then(async () => {
       const req = http.request(opts, res => {
         let d = '';
         res.on('data', c => d += c);
-        res.on('end', () => { try { logger.info('[auto-test-a2u] result:', JSON.stringify(JSON.parse(d), null, 2)); } catch { logger.info('[auto-test-a2u] raw:', d); } });
+        res.on('end', () => { try { console.log('[auto-test-a2u] result:', JSON.stringify(JSON.parse(d), null, 2)); } catch { console.log('[auto-test-a2u] raw:', d); } });
       });
-      req.on('error', e => logger.error('[auto-test-a2u] error:', e.message));
+      req.on('error', e => console.error('[auto-test-a2u] error:', e.message));
       req.write(body);
       req.end();
     }, 5000); // 5s after startup so the server is fully ready
