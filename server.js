@@ -232,19 +232,21 @@ app.post('/api/sandbox/test-a2u', async (req, res) => {
   const { sendA2U, a2uEnabled } = require('./src/pi-a2u');
   if (!a2uEnabled()) return res.status(503).json({ error: 'a2u_not_configured' });
   const { rows } = await require('./src/db').getPool().query(
-    "SELECT id FROM users WHERE id LIKE 'pi_%' GROUP BY id LIMIT 5"
+    "SELECT id FROM users WHERE id LIKE 'pi_%' GROUP BY id LIMIT 50"
   );
-  const results = [];
+  const successes = [];
+  const failures = [];
   for (const row of rows) {
+    if (successes.length >= 5) break;
     try {
       const r = await sendA2U(row.id, 0.001, 'WorkPro sandbox qualification', { test: true });
-      results.push({ uid: row.id, ok: true, paymentId: r.paymentId, txid: r.txid });
+      successes.push({ uid: row.id, ok: true, paymentId: r.paymentId, txid: r.txid });
     } catch (e) {
       const msg = e?.response?.data ? JSON.stringify(e.response.data) : (e.message || String(e));
-      results.push({ uid: row.id, ok: false, error: String(msg).slice(0, 300) });
+      failures.push({ uid: row.id, ok: false, error: String(msg).slice(0, 200) });
     }
   }
-  res.json({ results, count: rows.length });
+  res.json({ successes: successes.length, failures: failures.length, total_tried: successes.length + failures.length, results: [...successes, ...failures] });
 });
 
 app.get('/.well-known/pi-network', (req, res) => {
