@@ -626,6 +626,26 @@ initDb().then(async () => {
     }, 10 * 60 * 1000); // every 10 minutes
   }
 
+  // ─── One-shot A2U qualification test ──────────────────────────────────────
+  if (process.env.AUTO_TEST_A2U === '1' && process.env.SANDBOX_PI_API_KEY) {
+    setTimeout(() => {
+      const http = require('http');
+      const body = '{}';
+      const opts = {
+        hostname: '127.0.0.1', port: PORT, path: '/api/sandbox/test-a2u', method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-sandbox-key': process.env.SANDBOX_PI_API_KEY, 'Content-Length': Buffer.byteLength(body) }
+      };
+      const req = http.request(opts, res => {
+        let d = '';
+        res.on('data', c => d += c);
+        res.on('end', () => { try { logger.info('[auto-test-a2u] result:', JSON.stringify(JSON.parse(d), null, 2)); } catch { logger.info('[auto-test-a2u] raw:', d); } });
+      });
+      req.on('error', e => logger.error('[auto-test-a2u] error:', e.message));
+      req.write(body);
+      req.end();
+    }, 5000); // 5s after startup so the server is fully ready
+  }
+
   // ─── Auto-release escrow after 14 days ─────────────────────────────────
   // If a funded escrow sits untouched for 14 days (no release, no dispute),
   // auto-release the funds to the freelancer and notify both parties.
