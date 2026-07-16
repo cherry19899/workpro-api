@@ -226,29 +226,6 @@ app.get('/privacy', (req, res) => {
 });
 
 // TEMPORARY: sandbox A2U test endpoint — remove after 5 testnet transactions qualify wallet
-app.post('/api/sandbox/test-a2u', async (req, res) => {
-  const sandboxKey = process.env.SANDBOX_PI_API_KEY;
-  if (!sandboxKey || req.headers['x-sandbox-key'] !== sandboxKey) return res.status(403).json({ error: 'forbidden' });
-  const { sendA2U, a2uEnabled } = require('./src/pi-a2u');
-  if (!a2uEnabled()) return res.status(503).json({ error: 'a2u_not_configured' });
-  const { rows } = await require('./src/db').getPool().query(
-    "SELECT id FROM users WHERE id LIKE 'pi_%' GROUP BY id LIMIT 50"
-  );
-  const successes = [];
-  const failures = [];
-  for (const row of rows) {
-    if (successes.length >= 5) break;
-    try {
-      const r = await sendA2U(row.id, 0.001, 'WorkPro sandbox qualification', { test: true });
-      successes.push({ uid: row.id, ok: true, paymentId: r.paymentId, txid: r.txid });
-    } catch (e) {
-      const msg = e?.response?.data ? JSON.stringify(e.response.data) : (e.message || String(e));
-      failures.push({ uid: row.id, ok: false, error: String(msg).slice(0, 200) });
-    }
-  }
-  res.json({ successes: successes.length, failures: failures.length, total_tried: successes.length + failures.length, results: [...successes, ...failures] });
-});
-
 app.get('/.well-known/pi-network', (req, res) => {
   res.json({
     app: 'workpro',
@@ -624,26 +601,6 @@ initDb().then(async () => {
         .then(r => logger.info(`[keep-alive] self-ping ${r.status}`))
         .catch(e => logger.warn('[keep-alive] self-ping failed:', e.message));
     }, 10 * 60 * 1000); // every 10 minutes
-  }
-
-  // ─── One-shot A2U qualification test ──────────────────────────────────────
-  if (process.env.AUTO_TEST_A2U === '1' && process.env.SANDBOX_PI_API_KEY) {
-    setTimeout(() => {
-      const http = require('http');
-      const body = '{}';
-      const opts = {
-        hostname: '127.0.0.1', port: PORT, path: '/api/sandbox/test-a2u', method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-sandbox-key': process.env.SANDBOX_PI_API_KEY, 'Content-Length': Buffer.byteLength(body) }
-      };
-      const req = http.request(opts, res => {
-        let d = '';
-        res.on('data', c => d += c);
-        res.on('end', () => { try { console.log('[auto-test-a2u] result:', JSON.stringify(JSON.parse(d), null, 2)); } catch { console.log('[auto-test-a2u] raw:', d); } });
-      });
-      req.on('error', e => console.error('[auto-test-a2u] error:', e.message));
-      req.write(body);
-      req.end();
-    }, 5000); // 5s after startup so the server is fully ready
   }
 
   // ─── Auto-release escrow after 14 days ─────────────────────────────────
