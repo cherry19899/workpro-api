@@ -225,6 +225,28 @@ app.get('/privacy', (req, res) => {
   res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Work Pro Privacy Policy</title></head><body><h1>Work Pro Privacy Policy</h1><p>Work Pro is a freelance marketplace on the Pi Network. We collect your Pi username and profile information to facilitate job postings and payments between job creators and freelancers. Payment data is processed via the Pi Network SDK. We do not sell your data to third parties. Contact: support via the Work Pro app.</p></body></html>`);
 });
 
+// TEMPORARY: sandbox A2U test endpoint — remove after 5 testnet transactions qualify wallet
+app.post('/api/sandbox/test-a2u', async (req, res) => {
+  const sandboxKey = process.env.SANDBOX_PI_API_KEY;
+  if (!sandboxKey || req.headers['x-sandbox-key'] !== sandboxKey) return res.status(403).json({ error: 'forbidden' });
+  const { sendA2U, a2uEnabled } = require('./src/pi-a2u');
+  if (!a2uEnabled()) return res.status(503).json({ error: 'a2u_not_configured' });
+  const { rows } = await require('./src/db').getPool().query(
+    "SELECT DISTINCT pi_uid FROM users WHERE pi_uid IS NOT NULL ORDER BY created_at ASC LIMIT 5"
+  );
+  const results = [];
+  for (const row of rows) {
+    try {
+      const r = await sendA2U(row.pi_uid, 0.001, 'WorkPro sandbox qualification', { test: true });
+      results.push({ uid: row.pi_uid, ok: true, paymentId: r.paymentId, txid: r.txid });
+    } catch (e) {
+      const msg = e?.response?.data ? JSON.stringify(e.response.data) : (e.message || String(e));
+      results.push({ uid: row.pi_uid, ok: false, error: String(msg).slice(0, 300) });
+    }
+  }
+  res.json({ results, count: rows.length });
+});
+
 app.get('/.well-known/pi-network', (req, res) => {
   res.json({
     app: 'workpro',
