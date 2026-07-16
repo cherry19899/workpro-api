@@ -232,7 +232,7 @@ app.post('/api/sandbox/test-a2u', async (req, res) => {
   const { sendA2U, a2uEnabled } = require('./src/pi-a2u');
   if (!a2uEnabled()) return res.status(503).json({ error: 'a2u_not_configured' });
   const { rows } = await require('./src/db').getPool().query(
-    "SELECT DISTINCT id FROM users WHERE id LIKE 'pi_%' ORDER BY created_at ASC LIMIT 5"
+    "SELECT id FROM users WHERE id LIKE 'pi_%' GROUP BY id LIMIT 5"
   );
   const results = [];
   for (const row of rows) {
