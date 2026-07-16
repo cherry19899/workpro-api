@@ -237,11 +237,11 @@ app.post('/api/sandbox/test-a2u', async (req, res) => {
   const results = [];
   for (const row of rows) {
     try {
-      const r = await sendA2U(row.pi_uid, 0.001, 'WorkPro sandbox qualification', { test: true });
-      results.push({ uid: row.pi_uid, ok: true, paymentId: r.paymentId, txid: r.txid });
+      const r = await sendA2U(row.id, 0.001, 'WorkPro sandbox qualification', { test: true });
+      results.push({ uid: row.id, ok: true, paymentId: r.paymentId, txid: r.txid });
     } catch (e) {
       const msg = e?.response?.data ? JSON.stringify(e.response.data) : (e.message || String(e));
-      results.push({ uid: row.pi_uid, ok: false, error: String(msg).slice(0, 300) });
+      results.push({ uid: row.id, ok: false, error: String(msg).slice(0, 300) });
     }
   }
   res.json({ results, count: rows.length });
