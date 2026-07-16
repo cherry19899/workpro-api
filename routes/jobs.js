@@ -4,9 +4,11 @@
 const router = require('express').Router();
 const crypto = require('crypto');
 const { query, getPool } = require('../src/db');
+const logger = require('../src/logger');
 const { notify, audit, serverError, getPlatformFee } = require('../src/helpers');
 const { auth, softAuth, checkBlocked, jobPostLimiter } = require('../src/middleware');
 const { processJobImages } = require('../src/github-images');
+const { a2uEnabled, sendA2U } = require('../src/pi-a2u');
 
 const normalizeId = (id) => (id || '').toString().toLowerCase().replace(/^pi_/, '');
 
@@ -620,6 +622,8 @@ router.post('/api/jobs/:id/hire', auth, checkBlocked, async (req, res) => {
 });
 
 // POST /api/jobs/:id/complete
+// Marks the job done AND automatically releases the funded escrow (Pi goes to freelancer).
+// The two actions are intentionally merged: completing a job = accepting the work = paying the freelancer.
 router.post('/api/jobs/:id/complete', auth, checkBlocked, async (req, res) => {
   if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Job not found' });
   try {
@@ -630,11 +634,15 @@ router.post('/api/jobs/:id/complete', auth, checkBlocked, async (req, res) => {
     if (!['in_progress', 'submitted'].includes(job.status)) return res.status(400).json({ error: 'Job is not in progress' });
     const disputedEscrow = await query("SELECT id FROM escrows WHERE job_id = $1 AND status = 'disputed' LIMIT 1", [req.params.id]);
     if (disputedEscrow.rows.length) return res.status(400).json({ error: 'Cannot complete job while escrow is under dispute — wait for admin resolution' });
-    // Block completion until the escrow is funded — otherwise the freelancer is paid 0π for finished work.
     const unfundedComplete = await query("SELECT id FROM escrows WHERE job_id = $1 AND status = 'pending' LIMIT 1", [req.params.id]);
     if (unfundedComplete.rows.length) return res.status(400).json({ error: 'Пополните эскроу, прежде чем принимать работу и завершать задачу' });
-    // Payment is handled exclusively by POST /api/escrow/:id/release (handleEscrowRelease).
-    // job/complete only changes the job status — no escrow release or balance_pi credit here.
+
+    // Find the funded escrow for this job (if any) so we can release it atomically.
+    const escrowRes = await query("SELECT * FROM escrows WHERE job_id = $1 AND status = 'funded' LIMIT 1", [parseInt(req.params.id)]);
+    const escrow = escrowRes.rows[0] || null;
+    const fee = escrow ? await getPlatformFee() : 0;
+    const net = escrow ? parseFloat((escrow.amount * (1 - fee)).toFixed(8)) : 0;
+
     const pgClient5 = await getPool().connect();
     try {
       await pgClient5.query('BEGIN');
@@ -646,15 +654,48 @@ router.post('/api/jobs/:id/complete', auth, checkBlocked, async (req, res) => {
       if (job.hired_freelancer_id) {
         await pgClient5.query('UPDATE users SET total_jobs_completed = total_jobs_completed + 1, updated_at = NOW() WHERE id = $1', [job.hired_freelancer_id]);
       }
+      // Release the funded escrow inside the same transaction.
+      if (escrow && net > 0) {
+        const relUpd = await pgClient5.query(
+          "UPDATE escrows SET status='released', updated_at=NOW() WHERE id=$1 AND status='funded' RETURNING id",
+          [escrow.id]
+        );
+        if (relUpd.rows.length) {
+          await pgClient5.query(
+            'UPDATE users SET balance_pi = COALESCE(balance_pi, 0) + $1, updated_at = NOW() WHERE id = $2',
+            [net, escrow.freelancer_id]
+          );
+        }
+      }
       await pgClient5.query('COMMIT');
     } catch (txErr) { await pgClient5.query('ROLLBACK').catch(() => {}); throw txErr; }
     finally { pgClient5.release(); }
+
     await audit('job_completed', { job_id: req.params.id });
-    if (job.hired_freelancer_id) {
-      await notify(job.hired_freelancer_id, 'completed', `Задача "${job.title}" принята`,
-        'Заказчик принял работу.', parseInt(req.params.id), null);
+
+    // Fire A2U payout in the background (non-blocking — failure keeps balance_pi as owed amount).
+    if (escrow && net > 0 && a2uEnabled()) {
+      sendA2U(escrow.freelancer_id, net, 'WorkPro payment',
+        { type: 'escrow_release', escrow_id: escrow.id, job_id: parseInt(req.params.id) })
+        .then(({ txid }) => {
+          query('UPDATE users SET balance_pi = GREATEST(COALESCE(balance_pi,0) - $1, 0), updated_at=NOW() WHERE id=$2',
+            [net, escrow.freelancer_id]).catch(() => {});
+          query('UPDATE escrows SET payout_txid=$1, updated_at=NOW() WHERE id=$2',
+            [txid, escrow.id]).catch(() => {});
+          audit('escrow_payout_a2u', { escrow_id: escrow.id, freelancer_id: escrow.freelancer_id, net_paid: net, txid }).catch(() => {});
+        })
+        .catch(e => logger.warn(`[a2u] auto-release failed for escrow ${escrow.id}: ${e.message} — kept as balance_pi`));
     }
-    res.json({ success: true });
+
+    if (job.hired_freelancer_id) {
+      const payoutMsg = (escrow && net > 0)
+        ? `${net}π зачислено на ваш счёт.`
+        : 'Заказчик принял работу.';
+      await notify(job.hired_freelancer_id, 'payment', `Задача "${job.title}" завершена — оплата отправлена`,
+        payoutMsg, parseInt(req.params.id), null).catch(() => {});
+    }
+
+    res.json({ success: true, released: !!(escrow && net > 0), net_paid: net || 0 });
   } catch (err) { serverError(err, res); }
 });
 
