@@ -1,10 +1,8 @@
 // App-to-User (A2U) payments via the official pi-backend SDK.
 // Sends Pi from the app's wallet to a user. Requires:
+//   PI_API_KEY               — mainnet API key
 //   PI_WALLET_PRIVATE_SEED   — app wallet private seed (starts with "S")
-//   SANDBOX_PI_API_KEY       — testnet API key (for sandbox/5-wallet requirement phase)
-//     OR PI_API_KEY          — mainnet API key (for production after wallet approved)
-// If only PI_API_KEY is set (no SANDBOX_PI_API_KEY), uses mainnet mode.
-// If SANDBOX_PI_API_KEY is set, uses it — Pi Platform routes to testnet automatically.
+// Always uses PI_API_KEY (mainnet) — frontend is mainnet so A2U must also be mainnet.
 const logger = require('./logger');
 
 let _pi = null;
@@ -13,7 +11,7 @@ let _last = { ok: null, stage: null, error: null, at: null };
 function a2uStatus() { return _last; }
 
 function getApiKey() {
-  return process.env.SANDBOX_PI_API_KEY || process.env.PI_API_KEY;
+  return process.env.PI_API_KEY;
 }
 
 function a2uEnabled() {
