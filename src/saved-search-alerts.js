@@ -22,7 +22,8 @@ async function checkSavedSearchAlerts() {
       // Link the notification to the first matching job so tapping it opens something useful.
       await notify(s.user_id, 'saved_search_alert', 'Новые задачи по вашему поиску',
         `${newJobs.rows.length} нов. задач(и) по запросу «${s.name}»: ${newJobs.rows.map(j => j.title).join(', ').substring(0, 120)}`,
-        newJobs.rows[0].id, null).catch(() => {});
+        newJobs.rows[0].id, null,
+        { key: 'nSavedSearchHits', params: { count: newJobs.rows.length, name: s.name, titles: newJobs.rows.map(j => j.title).join(', ').substring(0, 120) } }).catch(() => {});
       await query('UPDATE saved_searches SET last_alerted_at=NOW() WHERE id=$1', [s.id]);
       alerted++;
     }

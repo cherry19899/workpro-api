@@ -271,7 +271,7 @@ router.post('/api/ratings', auth, checkBlocked, async (req, res) => {
     const avgResult = await query('SELECT AVG(rating) as avg FROM ratings WHERE to_user_id = $1', [to_user_id]);
     const newAvg = Math.round(parseFloat(avgResult.rows[0].avg) * 10) / 10;
     await query('UPDATE users SET rating = $1, updated_at = NOW() WHERE id = $2', [newAvg, to_user_id]);
-    await notify(to_user_id, 'rating', 'Новый отзыв', `Вы получили оценку ${rating}/5. Средний рейтинг: ${newAvg}`, job_id || null, null);
+    await notify(to_user_id, 'rating', 'Новый отзыв', `Вы получили оценку ${rating}/5. Средний рейтинг: ${newAvg}`, job_id || null, null, { key: 'nRating', params: { rating, avg: newAvg } });
     res.json({ rating: result.rows[0], success: true });
   } catch (err) { serverError(err, res); }
 });

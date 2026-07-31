@@ -152,6 +152,13 @@ router.get('/api/me', auth, async (req, res) => {
   try {
     const result = await query('SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, terms_accepted, terms_accepted_at,balance_connects, balance_pi, is_blocked, status, created_at, updated_at FROM users WHERE id = $1', [req.userId]);
     if (!result.rows.length) return res.status(404).json({ error: 'User not found' });
+    // Remember the UI language for Web Push, which is rendered server-side and
+    // so cannot follow the reader's current language the way the in-app list
+    // does. Fire-and-forget — never block the session on it.
+    const uiLang = String(req.headers['x-lang'] || '').slice(0, 8);
+    if (/^[a-z]{2}$/.test(uiLang)) {
+      query('UPDATE users SET lang = $1 WHERE id = $2 AND lang IS DISTINCT FROM $1', [uiLang, req.userId]).catch(() => {});
+    }
     let u = result.rows[0];
     // Owner self-heal on returning-user path (GET hit via stored JWT, never POST /api/me)
     if (u.role !== 'admin' && (

@@ -13,7 +13,7 @@ const PI_API_KEY = process.env.PI_API_KEY || '';
 const PI_API_BASE = 'https://api.minepi.com';
 
 // ─── Platform fee ──────────────────────────────────────────────
-// Hard limits — no matter what's in the DB or env, fee is capped at 10%.
+// Hard limits — no matter what's in the DB or env, fee is capped at 20%.
 const FEE_MIN = 0;
 const FEE_MAX = 0.2;
 const FEE_DEFAULT_PCT = parseFloat(process.env.PLATFORM_FEE_PERCENT || '2');
@@ -75,6 +75,23 @@ function invalidatePlatformFeeCache() {
   _devFeeCache = null;
 }
 
+// ─── Connects pricing ──────────────────────────────────────────────
+// Server-side package catalog — mirrors frontend packages. Never trust client-supplied quantity.
+const CONNECT_PACKAGES = [
+  { connects: 10,  price: 1 },
+  { connects: 50,  price: 5 },
+  { connects: 100, price: 7 },
+];
+
+// Resolve connects to credit for a given Pi amount.
+// Package bonus is granted only when the Pi amount matches a known package price (±5%).
+// Client-supplied package_amount / quantity are intentionally ignored.
+function resolveConnects(piAmount) {
+  const formula = Math.floor(piAmount * 10);
+  const pkg = CONNECT_PACKAGES.find(p => Math.abs(p.price - piAmount) / p.price < 0.05);
+  return Math.max(formula, pkg ? pkg.connects : 0);
+}
+
 // ─── Pi Platform API ──────────────────────────────────────────────
 // userAccessToken: when provided (e.g. for /v2/me identity check), use user Bearer token instead of server Key
 async function piApiRequest(path, method = 'GET', body = null, userAccessToken = null, { retries = 3, baseDelay = 300 } = {}) {
@@ -123,12 +140,18 @@ async function piGetPayment(paymentId) {
 }
 
 // ─── Notification helper ──────────────────────────────────────────────
-async function notify(userId, type, title, body, jobId, roomId) {
+// `opts` may carry { key, params }. The key is what the client renders through
+// its own translation dictionary, so a notification always appears in whatever
+// UI language the reader currently has. `title`/`body` are still written
+// verbatim as the fallback for rows created before this and for clients that
+// don't recognise the key — never stop writing them or old rows go blank.
+async function notify(userId, type, title, body, jobId, roomId, opts = {}) {
   try {
     await query(
-      `INSERT INTO notifications (user_id, type, title, body, job_id, room_id, is_read, created_at)
-       VALUES ($1,$2,$3,$4,$5,$6,false,NOW())`,
-      [userId, type, title, body || null, jobId || null, roomId || null]
+      `INSERT INTO notifications (user_id, type, title, body, job_id, room_id, is_read, created_at, notif_key, params)
+       VALUES ($1,$2,$3,$4,$5,$6,false,NOW(),$7,$8)`,
+      [userId, type, title, body || null, jobId || null, roomId || null,
+       opts.key || null, JSON.stringify(opts.params || {})]
     );
   } catch (_) {}
 }
@@ -180,4 +203,6 @@ module.exports = {
   FEE_MAX,
   DEV_FEE_MAX,
   resolveUserIdFromBody,
+  resolveConnects,
+  CONNECT_PACKAGES,
 };

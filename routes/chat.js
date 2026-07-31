@@ -7,6 +7,7 @@ const { query } = require('../src/db');
 const { notify, serverError } = require('../src/helpers');
 const { auth, softAuth, checkBlocked, messageLimiter } = require('../src/middleware');
 const multer = require('multer');
+const { pushText } = require('../src/push-i18n');
 const normalizeId = (id) => (id || '').toString().toLowerCase().replace(/^pi_/, '');
 // memoryStorage — NOT disk: Render's filesystem is ephemeral (wiped on every
 // restart/deploy), so 'uploads/' would lose files. We persist bytes in Postgres
@@ -129,7 +130,7 @@ router.post('/api/chat/rooms/:id/messages', auth, checkBlocked, messageLimiter, 
     await query('UPDATE chat_rooms SET updated_at = NOW() WHERE id = $1', [req.params.id]);
     const otherUserId = normalizeId(room.rows[0].client_id) === normalizeId(req.userId) ? room.rows[0].freelancer_id : room.rows[0].client_id;
     if (otherUserId) {
-      await notify(otherUserId, 'message', `Новое сообщение от ${senderName}`, message.trim().substring(0, 100), null, req.params.id);
+      await notify(otherUserId, 'message', `Новое сообщение от ${senderName}`, message.trim().substring(0, 100), null, req.params.id, { key: 'nNewMessage', params: { name: senderName } });
     }
     res.json({ message: result.rows[0] });
   } catch (err) { serverError(err, res); }
@@ -263,16 +264,20 @@ router.post('/api/chat/conversations/:id/messages', auth, checkBlocked, messageL
     const io = req.app.get('io');
     if (io) io.to(req.params.id).emit('new_message', newMsg);
     if (otherUserId) {
-      await notify(otherUserId, 'message', `Новое сообщение от ${senderName}`, msg.trim().substring(0, 100), null, req.params.id).catch(() => {});
+      await notify(otherUserId, 'message', `Новое сообщение от ${senderName}`, msg.trim().substring(0, 100), null, req.params.id, { key: 'nNewMessage', params: { name: senderName } }).catch(() => {});
       // Web Push notification to recipient
       const webpush = req.app.get('webpush');
       if (webpush) {
         const subRow = await query('SELECT endpoint, keys FROM push_subscriptions WHERE user_id = $1', [otherUserId]).catch(() => null);
         if (subRow && subRow.rows.length) {
           const sub = subRow.rows[0];
+          // Push is drawn by the OS, so it must be translated here using the
+          // recipient's last known UI language rather than on the client.
+          const langRow = await query('SELECT lang FROM users WHERE id = $1', [otherUserId]).catch(() => null);
+          const toLang = langRow?.rows?.[0]?.lang || 'en';
           webpush.sendNotification(
             { endpoint: sub.endpoint, keys: sub.keys },
-            JSON.stringify({ title: `Message from ${senderName}`, body: msg.trim().substring(0, 80), icon: '/icon-192.png' })
+            JSON.stringify({ title: pushText('msgFrom', toLang, { name: senderName }), body: msg.trim().substring(0, 80), icon: '/icon-192.png' })
           ).catch(() => {}); // fire-and-forget
         }
       }
@@ -364,16 +369,18 @@ router.post('/api/chat/:roomId/messages', auth, messageLimiter, checkBlocked, as
     if (io) io.to(req.params.roomId).emit('new_message', result.rows[0]);
     const otherUserId2 = normalizeId(roomCheck.rows[0].client_id) === normalizeId(req.userId) ? roomCheck.rows[0].freelancer_id : roomCheck.rows[0].client_id;
     if (otherUserId2) {
-      await notify(otherUserId2, 'message', `Новое сообщение от ${senderName}`, msg.substring(0, 100), null, req.params.roomId).catch(() => {});
+      await notify(otherUserId2, 'message', `Новое сообщение от ${senderName}`, msg.substring(0, 100), null, req.params.roomId, { key: 'nNewMessage', params: { name: senderName } }).catch(() => {});
       // Web Push to recipient (same as the /conversations route — this is the route the frontend uses).
       const webpush = req.app.get('webpush');
       if (webpush) {
         const subRow = await query('SELECT endpoint, keys FROM push_subscriptions WHERE user_id = $1', [otherUserId2]).catch(() => null);
         if (subRow && subRow.rows.length) {
           const sub = subRow.rows[0];
+          const langRow = await query('SELECT lang FROM users WHERE id = $1', [otherUserId2]).catch(() => null);
+          const toLang = langRow?.rows?.[0]?.lang || 'en';
           webpush.sendNotification(
             { endpoint: sub.endpoint, keys: sub.keys },
-            JSON.stringify({ title: `Message from ${senderName}`, body: msg.substring(0, 80), icon: '/icon-192.png' })
+            JSON.stringify({ title: pushText('msgFrom', toLang, { name: senderName }), body: msg.substring(0, 80), icon: '/icon-192.png' })
           ).catch(() => {}); // fire-and-forget
         }
       }
@@ -437,7 +444,7 @@ router.post('/api/chat/rooms/:id/upload', auth, checkBlocked, messageLimiter, up
     const io = req.app.get('io');
     if (io) io.to(req.params.id).emit('new_message', result.rows[0]);
     const otherId = normalizeId(roomCheck.rows[0].client_id) === normalizeId(req.userId) ? roomCheck.rows[0].freelancer_id : roomCheck.rows[0].client_id;
-    if (otherId) await notify(otherId, 'message', `Файл от ${senderName}`, req.file.originalname, null, req.params.id).catch(() => {});
+    if (otherId) await notify(otherId, 'message', `Файл от ${senderName}`, req.file.originalname, null, req.params.id, { key: 'nNewFile', params: { name: senderName } }).catch(() => {});
     res.json({ success: true, attachment_id: attId, url: `/api/chat/attachments/${attId}`, message: result.rows[0] });
   } catch (err) { serverError(err, res); }
 });

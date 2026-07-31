@@ -93,7 +93,7 @@ app.use(cors({
     ...(process.env.NODE_ENV !== 'production' ? ['http://localhost:3000', 'http://localhost:5173', 'http://localhost:3001'] : []),
   ],
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-user-id', 'x-pi-token', 'x-admin-key', 'x-username'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-user-id', 'x-pi-token', 'x-admin-key', 'x-username', 'x-lang'],
   credentials: true,
 }));
 
@@ -221,12 +221,17 @@ app.get('/api/openapi.json', (req, res) => {
 });
 
 // Pi Network calls this to verify backend ownership
+const { privacyHtml, termsHtml } = require('./src/legal');
+const { getPlatformFee: legalGetFee } = require('./src/helpers');
+
 app.get('/privacy', (req, res) => {
-  res.send(`<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Work Pro – Privacy Policy</title><style>body{font-family:sans-serif;max-width:720px;margin:40px auto;padding:0 20px;color:#222;line-height:1.6}h1{color:#6b21a8}h2{margin-top:2em}</style></head><body><h1>Work Pro Privacy Policy</h1><p><em>Last updated: July 2026</em></p><p>Work Pro ("the App") is a freelance marketplace built on the Pi Network, operated by the Work Pro team.</p><h2>Information We Collect</h2><ul><li>Pi Network username and user ID (provided by Pi SDK on login)</li><li>Profile information you voluntarily enter (skills, bio, portfolio)</li><li>Job postings, applications, and messages exchanged through the App</li><li>Payment metadata processed via the Pi Network SDK (no raw payment credentials are stored)</li></ul><h2>How We Use Your Information</h2><ul><li>To authenticate you and display your profile</li><li>To match freelancers with job opportunities</li><li>To facilitate Pi-based payments between clients and freelancers</li><li>To send in-app and push notifications about your activity</li></ul><h2>Data Sharing</h2><p>We do not sell your personal data to third parties. Payment processing is handled exclusively by the Pi Network platform. We may share anonymised aggregated statistics for product improvement.</p><h2>Data Retention</h2><p>Your data is retained as long as your account is active. You may request deletion by contacting us through the App.</p><h2>Security</h2><p>We use industry-standard measures (TLS, hashed tokens) to protect your data.</p><h2>Contact</h2><p>For privacy questions, use the contact option inside the Work Pro app.</p></body></html>`);
+  res.type('html').send(privacyHtml());
 });
 
-app.get('/terms', (req, res) => {
-  res.send(`<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Work Pro – Terms of Service</title><style>body{font-family:sans-serif;max-width:720px;margin:40px auto;padding:0 20px;color:#222;line-height:1.6}h1{color:#6b21a8}h2{margin-top:2em}</style></head><body><h1>Work Pro Terms of Service</h1><p><em>Last updated: July 2026</em></p><h2>1. Acceptance</h2><p>By using Work Pro you agree to these Terms. If you do not agree, do not use the App.</p><h2>2. Eligibility</h2><p>You must have a valid Pi Network account to use Work Pro. You are responsible for all activity under your account.</p><h2>3. Services</h2><p>Work Pro provides a platform for clients to post jobs and for freelancers to offer services, with payments settled in Pi cryptocurrency via the Pi Network SDK.</p><h2>4. Payments & Escrow</h2><p>All payments are made in Pi. Funds are held in escrow by the App until the client marks the job complete. Work Pro charges a 2% platform fee on completed transactions. Refunds are subject to dispute resolution at the App's discretion.</p><h2>5. Prohibited Conduct</h2><p>You may not use Work Pro to post illegal content, harass other users, manipulate reviews, or circumvent the payment system.</p><h2>6. Intellectual Property</h2><p>Content you post remains yours. You grant Work Pro a licence to display it within the platform.</p><h2>7. Limitation of Liability</h2><p>Work Pro is provided "as is". We are not liable for lost earnings, payment disputes between users, or Pi Network outages.</p><h2>8. Changes</h2><p>We may update these Terms at any time. Continued use of the App constitutes acceptance of the updated Terms.</p><h2>9. Contact</h2><p>For questions about these Terms, use the contact option inside the Work Pro app.</p></body></html>`);
+app.get('/terms', async (req, res) => {
+  let pct = 2;
+  try { pct = parseFloat(((await legalGetFee()) * 100).toFixed(4)); } catch (_) {}
+  res.type('html').send(termsHtml(pct));
 });
 
 // TEMPORARY: sandbox A2U test endpoint — remove after 5 testnet transactions qualify wallet
@@ -309,6 +314,7 @@ app.use(require('./routes/chat'));          // /api/chat/*, /api/push/*
 app.use(require('./routes/payments'));      // /api/payments/*, /api/connects/*, /api/escrows/*, /api/escrow/*, /api/offers/*
 app.use(require('./routes/jobs'));          // /api/jobs/*, /api/applications/*
 app.use(require('./routes/users').router);  // /api/users/:id, /api/reviews/*, /api/ratings/*
+app.use(require('./routes/ads'));           // /api/ads/*
 
 // ─── 404 & error handler ──────────────────────────────────────────────
 app.use((req, res) => {
@@ -339,6 +345,25 @@ async function ensureNotificationsTable() {
   await run(`CREATE INDEX IF NOT EXISTS idx_users_username_lower ON users(LOWER(username))`, 'idx_users_username_lower');
   await run(`CREATE INDEX IF NOT EXISTS idx_users_id_lower ON users(LOWER(id))`, 'idx_users_id_lower');
   await run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_chat_read_at TIMESTAMPTZ`, 'users.last_chat_read_at');
+  // Notification i18n: the client renders `notif_key` through its own dictionary
+  // so the text follows whatever UI language the reader currently has. `title`
+  // and `body` stay populated as the fallback for rows written before this and
+  // for any client that does not know the key.
+  await run(`ALTER TABLE notifications ADD COLUMN IF NOT EXISTS notif_key TEXT`, 'notifications.notif_key');
+  await run(`ALTER TABLE notifications ADD COLUMN IF NOT EXISTS params JSONB DEFAULT '{}'::jsonb`, 'notifications.params');
+  // Last UI language the user was seen with — only used for Web Push, which is
+  // rendered server-side and so cannot follow the client's current language.
+  await run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS lang TEXT`, 'users.lang');
+  // One row per redeemed rewarded ad. ad_id is the PRIMARY KEY on purpose: it is
+  // the concurrency guard, so two racing requests with the same adId cannot both
+  // credit connects.
+  await run(`CREATE TABLE IF NOT EXISTS ad_rewards (
+    ad_id      TEXT PRIMARY KEY,
+    user_id    TEXT NOT NULL,
+    connects   INTEGER NOT NULL DEFAULT 1,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  )`, 'ad_rewards table');
+  await run(`CREATE INDEX IF NOT EXISTS idx_ad_rewards_user ON ad_rewards(user_id, created_at DESC)`, 'idx_ad_rewards_user');
   // Critical: must run before any UPDATE that references updated_at
   await run(`ALTER TABLE applications ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`, 'applications.updated_at');
   // NOTE: there is no separate "offers" table — offers are stored in `applications`
@@ -667,8 +692,10 @@ initDb().then(async () => {
             await arQuery('UPDATE escrows SET payout_txid = $1, updated_at = NOW() WHERE id = $2', [arTxid, escrow.id]).catch(() => {});
           } catch (e) { logger.warn(`[a2u] auto-release payout failed for escrow ${escrow.id}: ${e.message}`); }
         }
-        await arNotify(escrow.freelancer_id, 'payment', 'Авто-выплата эскроу', arTxid ? `${net}π отправлено на ваш Pi-кошелёк (14 дней без спора).` : `${net}π зачислено автоматически (14 дней без спора).`, escrow.job_id, null).catch(() => {});
-        await arNotify(escrow.client_id, 'escrow', 'Эскроу авто-выплачен', 'Средства по задаче автоматически переведены фрилансеру через 14 дней.', escrow.job_id, null).catch(() => {});
+        await arNotify(escrow.freelancer_id, 'payment', 'Авто-выплата эскроу', arTxid ? `${net}π отправлено на ваш Pi-кошелёк (14 дней без спора).` : `${net}π зачислено автоматически (14 дней без спора).`, escrow.job_id, null,
+          { key: arTxid ? 'nAutoReleasedWallet' : 'nAutoReleasedBalance', params: { amount: net } }).catch(() => {});
+        await arNotify(escrow.client_id, 'escrow', 'Эскроу авто-выплачен', 'Средства по задаче автоматически переведены фрилансеру через 14 дней.', escrow.job_id, null,
+          { key: 'nAutoReleasedClient', params: {} }).catch(() => {});
         await arAudit('escrow_auto_released', { escrow_id: escrow.id, freelancer_id: escrow.freelancer_id, net_paid: net, payout_txid: arTxid }).catch(() => {});
         logger.info(`[auto-release] escrow ${escrow.id} released (${net}π)${arTxid ? ' + A2U ' + arTxid : ''}`);
       }
@@ -711,19 +738,25 @@ initDb().then(async () => {
             await arQuery('UPDATE users SET balance_pi = GREATEST(COALESCE(balance_pi,0) - $1, 0), updated_at = NOW() WHERE id = $2', [msNet, m.freelancer_id]).catch(() => {});
           } catch (e) { logger.warn(`[a2u] milestone auto-release payout failed ${m.id}: ${e.message}`); }
         }
-        await arNotify(m.freelancer_id, 'milestone_approved', 'Этап авто-выплачен', msTxid ? `${msNet}π за этап ${m.milestone_index + 1} отправлено на ваш Pi-кошелёк (14 дней без ответа заказчика).` : `${msNet}π зачислено за этап ${m.milestone_index + 1} автоматически.`, m.job_id, null).catch(() => {});
-        await arNotify(m.client_id, 'escrow', 'Этап авто-выплачен', `Этап ${m.milestone_index + 1} автоматически выплачен фрилансеру через 14 дней.`, m.job_id, null).catch(() => {});
+        await arNotify(m.freelancer_id, 'milestone_approved', 'Этап авто-выплачен', msTxid ? `${msNet}π за этап ${m.milestone_index + 1} отправлено на ваш Pi-кошелёк (14 дней без ответа заказчика).` : `${msNet}π зачислено за этап ${m.milestone_index + 1} автоматически.`, m.job_id, null,
+          { key: msTxid ? 'nMilestoneAutoWallet' : 'nMilestoneAutoBalance', params: { amount: msNet, n: m.milestone_index + 1 } }).catch(() => {});
+        await arNotify(m.client_id, 'escrow', 'Этап авто-выплачен', `Этап ${m.milestone_index + 1} автоматически выплачен фрилансеру через 14 дней.`, m.job_id, null,
+          { key: 'nMilestoneAutoClient', params: { n: m.milestone_index + 1 } }).catch(() => {});
         await arAudit('milestone_auto_released', { escrow_id: m.escrow_id, milestone_id: m.id, net_paid: msNet, payout_txid: msTxid }).catch(() => {});
         logger.info(`[auto-release] milestone ${m.id} released (${msNet}π)${msTxid ? ' + A2U ' + msTxid : ''}`);
       }
     } catch (e) { logger.warn('[auto-release] sweep error:', e.message); }
   }
   const { checkSavedSearchAlerts } = require('./src/saved-search-alerts');
+  const { sweepStuckPayments } = require('./src/stuck-payments');
   async function hourlySweep() {
     await autoReleaseExpiredEscrows();
     await checkSavedSearchAlerts().then(r => {
       if (r.alerted) logger.info(`[saved-search] alerted ${r.alerted}/${r.total}`);
     }).catch(e => logger.warn('[saved-search] sweep error:', e.message));
+    await sweepStuckPayments(logger).then(r => {
+      if (r.checked) logger.info(`[stuck-payments] checked ${r.checked} → completed ${r.completed}, credited ${r.credited}, cancelled ${r.cancelled}, failed ${r.failed}`);
+    }).catch(e => logger.warn('[stuck-payments] sweep error:', e.message));
   }
   if (NODE_ENV === 'production') {
     setInterval(hourlySweep, 60 * 60 * 1000); // hourly sweep

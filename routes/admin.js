@@ -325,9 +325,9 @@ router.delete('/api/admin/jobs/:id', adminAuth, async (req, res) => {
     finally { pgAdm.release(); }
     if (fundedEscrow.rows.length) {
       const esc = fundedEscrow.rows[0];
-      await notify(esc.client_id, 'payment', 'Задача удалена администратором', 'Средства эскроу возвращены на ваш баланс.', parseInt(req.params.id), null).catch(() => {});
+      await notify(esc.client_id, 'payment', 'Задача удалена администратором', 'Средства эскроу возвращены на ваш баланс.', parseInt(req.params.id), null, { key: 'nJobDeletedAdminClient', params: {} }).catch(() => {});
       if (esc.freelancer_id) {
-        await notify(esc.freelancer_id, 'info', 'Задача удалена администратором', 'Задача, над которой вы работали, была удалена администратором.', parseInt(req.params.id), null).catch(() => {});
+        await notify(esc.freelancer_id, 'info', 'Задача удалена администратором', 'Задача, над которой вы работали, была удалена администратором.', parseInt(req.params.id), null, { key: 'nJobDeletedAdminFreelancer', params: {} }).catch(() => {});
       }
     }
     await audit('admin_job_deleted', { job_id: req.params.id, by: req.userId, escrow_refunded: fundedEscrow.rows.length > 0, connects_refunded: applicants.rows.length });
@@ -409,9 +409,13 @@ router.post('/api/admin/escrows/:id/resolve', adminAuth, async (req, res) => {
     await audit(escrow.status === 'disputed' ? 'admin_dispute_resolved' : 'admin_escrow_resolved', { escrow_id: req.params.id, action, reason: reason || null, by: req.userId, payout_txid: payoutTxid });
     const notifTitle = escrow.status === 'disputed' ? 'Спор разрешён администратором'
       : (action === 'release_to_freelancer' ? 'Средства выплачены фрилансеру' : 'Средства возвращены заказчику');
+    const notifKey = escrow.status === 'disputed' ? 'nDisputeResolved'
+      : (action === 'release_to_freelancer' ? 'nEscrowReleasedAdmin' : 'nEscrowRefundedAdmin');
     const notifBody = reason || (action === 'release_to_freelancer' ? 'Эскроу выплачен.' : 'Эскроу возвращён заказчику.');
-    await notify(escrow.client_id, 'escrow', notifTitle, notifBody, escrow.job_id, null).catch(() => {});
-    await notify(escrow.freelancer_id, 'escrow', notifTitle, notifBody, escrow.job_id, null).catch(() => {});
+    await notify(escrow.client_id, 'escrow', notifTitle, notifBody, escrow.job_id, null,
+      { key: notifKey, params: { reason: reason || '' } }).catch(() => {});
+    await notify(escrow.freelancer_id, 'escrow', notifTitle, notifBody, escrow.job_id, null,
+      { key: notifKey, params: { reason: reason || '' } }).catch(() => {});
     res.json({ success: true, action, payout_txid: payoutTxid });
   } catch (err) { serverError(err, res); }
 });
@@ -430,7 +434,7 @@ router.post('/api/admin/users/:id/payout-owed', adminAuth, async (req, res) => {
       { type: 'owed_payout', by: req.userId });
     await query('UPDATE users SET balance_pi = GREATEST(COALESCE(balance_pi,0) - $1, 0), updated_at = NOW() WHERE id = $2', [owed, req.params.id]);
     await audit('admin_owed_payout', { user_id: req.params.id, amount: owed, txid, payment_id: paymentId, by: req.userId });
-    await notify(req.params.id, 'payment', 'Выплата получена', `${owed}π отправлено на ваш Pi-кошелёк.`, null, null).catch(() => {});
+    await notify(req.params.id, 'payment', 'Выплата получена', `${owed}π отправлено на ваш Pi-кошелёк.`, null, null, { key: 'nPayoutSent', params: { amount: owed } }).catch(() => {});
     res.json({ success: true, paid: owed, txid });
   } catch (err) {
     // Surface the real A2U error to the admin instead of a generic 500.
@@ -506,6 +510,8 @@ router.patch('/api/admin/developer-fee', adminAuth, async (req, res) => {
       [String(pct)]
     );
     invalidatePlatformFeeCache();
+    _statsCache = null;   // stats carry developerFeePercent — see PATCH /api/admin/settings
+    _statsCacheTs = 0;
     await audit('admin_developer_fee_updated', { percent: pct, by: req.userId });
     res.json({ success: true, developerFeePercent: pct });
   } catch (err) { serverError(err, res); }
@@ -754,13 +760,22 @@ router.patch('/api/admin/settings', adminAuth, async (req, res) => {
       [key, strVal, req.userId || 'admin']
     );
     invalidatePlatformFeeCache();
+    // The stats payload carries platformFeePercent and is cached for 5 minutes.
+    // Without dropping it here the admin saves a new fee, reloads Stats, and is
+    // served the old percentage — indistinguishable from the save having failed.
+    _statsCache = null;
+    _statsCacheTs = 0;
     await audit('admin_setting_changed', { key, old_value: oldVal, new_value: strVal, by: req.userId });
     const fee = await getPlatformFee();
+    const devFee = await getDeveloperFee();
     res.json({
       success: true,
       key,
       value: strVal,
-      effective: { platform_fee_percent: parseFloat((fee * 100).toFixed(4)) },
+      effective: {
+        platform_fee_percent: parseFloat((fee * 100).toFixed(4)),
+        developer_fee_percent: parseFloat((devFee * 100).toFixed(4)),
+      },
     });
   } catch (err) { serverError(err, res); }
 });
@@ -970,6 +985,34 @@ router.post('/api/admin/backup/trigger', adminAuth, async (req, res) => {
     await audit('backup_failed', { error: err.message, by: req.userId }).catch(() => {});
     res.status(500).json({ error: 'Backup failed', detail: err.message });
   }
+});
+
+// POST /api/admin/payments/sweep-stuck — reconcile pending payments against Pi now,
+// instead of waiting for the hourly sweep.
+router.post('/api/admin/payments/sweep-stuck', adminAuth, async (req, res) => {
+  try {
+    const { sweepStuckPayments } = require('../src/stuck-payments');
+    const result = await sweepStuckPayments(logger);
+    await audit('stuck_payments_swept', { ...result, by: req.userId });
+    res.json({ success: true, ...result });
+  } catch (err) { serverError(err, res); }
+});
+
+// GET /api/admin/payments/stuck — list pending payments the sweep would look at
+router.get('/api/admin/payments/stuck', adminAuth, async (req, res) => {
+  try {
+    const r = await query(
+      `SELECT p.id, p.user_id, u.username, p.type, p.amount, p.created_at,
+              ROUND(EXTRACT(EPOCH FROM (NOW() - p.created_at)) / 3600, 1) AS age_hours
+         FROM payments p
+         LEFT JOIN users u ON u.id = p.user_id
+        WHERE p.status = 'pending'
+          AND p.created_at < NOW() - INTERVAL '15 minutes'
+        ORDER BY p.created_at ASC
+        LIMIT 200`
+    );
+    res.json({ stuck: r.rows, count: r.rows.length });
+  } catch (err) { serverError(err, res); }
 });
 
 // GET /api/admin/rate-limits — list IPs currently tracked as blocked

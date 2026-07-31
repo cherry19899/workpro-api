@@ -12,21 +12,7 @@ const { a2uEnabled, sendA2U } = require('../src/pi-a2u');
 
 const normalizeId = (id) => (id || '').toString().toLowerCase().replace(/^pi_/, '');
 
-// Server-side package catalog — mirrors frontend packages. Never trust client-supplied quantity.
-const CONNECT_PACKAGES = [
-  { connects: 10,  price: 1 },
-  { connects: 50,  price: 5 },
-  { connects: 100, price: 7 },
-];
-
-// Resolve connects to credit for a given Pi amount.
-// Package bonus is granted only when the Pi amount matches a known package price (±5%).
-// Client-supplied package_amount / quantity are intentionally ignored.
-function resolveConnects(piAmount) {
-  const formula = Math.floor(piAmount * 10);
-  const pkg = CONNECT_PACKAGES.find(p => Math.abs(p.price - piAmount) / p.price < 0.05);
-  return Math.max(formula, pkg ? pkg.connects : 0);
-}
+const { resolveConnects, CONNECT_PACKAGES } = require('../src/helpers');
 
 // ─── Shared Pi payment handlers ────────────────────────────────────────────
 // handlePaymentApprove and handlePaymentComplete: shared by RESTful /:id/approve|complete
@@ -223,7 +209,8 @@ async function handleEscrowRelease(req, res) {
     }
     await notify(escrow.freelancer_id, 'payment', 'Оплата получена',
       payoutTxid ? `${net}π отправлено на ваш Pi-кошелёк.` : `${net}π зачислено на ваш счёт после завершения задачи.`,
-      escrow.job_id, null).catch(() => {});
+      escrow.job_id, null,
+      { key: payoutTxid ? 'nPaidToWallet' : 'nPaidToBalance', params: { amount: net } }).catch(() => {});
     await audit('escrow_released', { escrow_id: req.params.id, freelancer_id: escrow.freelancer_id, amount: escrow.amount, net_paid: net, payout_txid: payoutTxid });
     res.json({ success: true, payout_txid: payoutTxid, escrow: { ...escrow, status: 'released' } });
   } catch (err) { serverError(err, res); }
@@ -742,7 +729,8 @@ router.post(['/api/escrow', '/api/escrows'], auth, checkBlocked, async (req, res
     const jobTitleRes = await query('SELECT title FROM jobs WHERE id = $1', [job_id]).catch(() => ({ rows: [] }));
     const jobTitle = jobTitleRes.rows[0]?.title || job_id;
     await notify(freelancer_id, 'hired', `Вас наняли на задачу "${jobTitle}"`,
-      'Заказчик создал эскроу. Можете приступать к работе.', parseInt(job_id), null).catch(() => {});
+      'Заказчик создал эскроу. Можете приступать к работе.', parseInt(job_id), null,
+      { key: 'nHiredEscrowFunded', params: { job: jobTitle || '' } }).catch(() => {});
     const existRmEsc = await query('SELECT id FROM chat_rooms WHERE job_id=$1 AND client_id=$2 AND freelancer_id=$3',
       [job_id, req.userId, freelancer_id]).catch(() => ({ rows: [] }));
     if (!existRmEsc.rows.length) {
@@ -787,7 +775,7 @@ router.post(['/api/escrows/:id/cancel', '/api/escrow/:id/cancel'], auth, checkBl
     } catch (txErr) { await pgClient6.query('ROLLBACK').catch(() => {}); throw txErr; }
     finally { pgClient6.release(); }
     if (wasFunded) {
-      await notify(escrow.freelancer_id, 'payment', 'Задача отменена заказчиком', `Эскроу по задаче отменён. Свяжитесь с заказчиком для уточнения деталей.`, escrow.job_id, null).catch(() => {});
+      await notify(escrow.freelancer_id, 'payment', 'Задача отменена заказчиком', `Эскроу по задаче отменён. Свяжитесь с заказчиком для уточнения деталей.`, escrow.job_id, null, { key: 'nJobCancelled', params: {} }).catch(() => {});
       await audit('escrow_cancelled_refunded', { escrow_id: req.params.id, amount: escrow.amount, client_id: escrow.client_id });
     }
     res.json({ success: true });
@@ -820,7 +808,7 @@ router.post('/api/escrow/:id/refund', auth, checkBlocked, async (req, res) => {
     } catch (txErr) { await pgClient7.query('ROLLBACK').catch(() => {}); throw txErr; }
     finally { pgClient7.release(); }
     if (wasFunded) {
-      await notify(escrow.client_id, 'payment', 'Возврат средств', `${escrow.amount}π возвращено на ваш счёт.`, escrow.job_id, null);
+      await notify(escrow.client_id, 'payment', 'Возврат средств', `${escrow.amount}π возвращено на ваш счёт.`, escrow.job_id, null, { key: 'nRefund', params: { amount: escrow.amount } });
     }
     await audit('escrow_refunded', { escrow_id: req.params.id, status_was: escrow.status, amount: escrow.amount });
     res.json({ success: true });
@@ -875,7 +863,8 @@ router.post('/api/escrows/:id/dispute', auth, checkBlocked, async (req, res) => 
     await audit('escrow_disputed', { escrow_id: req.params.id, reason, user_id: req.userId });
     const otherParty = normalizeId(req.userId) === normalizeId(escrow.client_id) ? escrow.freelancer_id : escrow.client_id;
     await notify(otherParty, 'dispute', 'Открыт спор по задаче',
-      reason || 'Одна из сторон открыла спор. Пожалуйста, свяжитесь с поддержкой.', escrow.job_id, null);
+      reason || 'Одна из сторон открыла спор. Пожалуйста, свяжитесь с поддержкой.', escrow.job_id, null,
+      { key: 'nDisputeOpened', params: { reason: reason || '' } });
     res.json({ escrow: { ...escrow, status: 'disputed' }, success: true });
   } catch (err) { serverError(err, res); }
 });
@@ -969,7 +958,8 @@ router.post('/api/offers', auth, checkBlocked, async (req, res) => {
       );
     }
     await notify(to_user_id, 'offer', `Вам отправлено предложение по задаче "${job.title}"`,
-      `${callerName} предлагает вам работу. Сумма: ${amount || job.budget} π`, job_id, null);
+      `${callerName} предлагает вам работу. Сумма: ${amount || job.budget} π`, job_id, null,
+      { key: 'nOfferReceived', params: { job: job.title, name: callerName, amount: amount || job.budget } });
     res.json({ offer: result.rows[0], success: true });
   } catch (err) { serverError(err, res); }
 });
@@ -1053,7 +1043,8 @@ router.post('/api/offers/:id/accept', auth, checkBlocked, async (req, res) => {
     } catch (txErr) { await pgOffer.query('ROLLBACK').catch(() => {}); throw txErr; }
     finally { pgOffer.release(); }
     await notify(offer.posted_by, 'hired', `Фрилансер принял ваше предложение по задаче "${offer.job_title}"`,
-      'Пополните эскроу, чтобы начать работу.', parseInt(offer.job_id), null).catch(() => {});
+      'Пополните эскроу, чтобы начать работу.', parseInt(offer.job_id), null,
+      { key: 'nOfferAccepted', params: { job: offer.job_title || '' } }).catch(() => {});
     const existRmOffer = await query('SELECT id FROM chat_rooms WHERE job_id=$1 AND client_id=$2 AND freelancer_id=$3',
       [offer.job_id, offer.posted_by, req.userId]).catch(() => ({ rows: [] }));
     if (!existRmOffer.rows.length) {
@@ -1078,7 +1069,8 @@ router.post('/api/offers/:id/decline', auth, checkBlocked, async (req, res) => {
     const jobRow = await query('SELECT posted_by, title FROM jobs WHERE id = $1', [app_.job_id]).catch(() => ({ rows: [] }));
     if (jobRow.rows.length) {
       await notify(jobRow.rows[0].posted_by, 'offer', `Предложение отклонено`,
-        `Фрилансер отклонил ваше предложение по задаче "${jobRow.rows[0].title}"`, app_.job_id, null).catch(() => {});
+        `Фрилансер отклонил ваше предложение по задаче "${jobRow.rows[0].title}"`, app_.job_id, null,
+        { key: 'nOfferDeclined', params: { job: jobRow.rows[0].title || '' } }).catch(() => {});
     }
     res.json({ application: app_, success: true });
   } catch (err) { serverError(err, res); }
@@ -1184,7 +1176,8 @@ router.post('/api/escrows/:id/milestone/:milestoneId/request', auth, checkBlocke
     );
     // Notify client
     notify(e.client_id, 'milestone_requested', 'Запрошена выплата этапа',
-      `Фрилансер запросил выплату этапа ${m.milestone_index + 1}`, e.job_id, null).catch(() => {});
+      `Фрилансер запросил выплату этапа ${m.milestone_index + 1}`, e.job_id, null,
+      { key: 'nMilestoneRequested', params: { n: m.milestone_index + 1 } }).catch(() => {});
     res.json({ success: true, auto_release_at: autoReleaseAt });
   } catch (err) { serverError(err, res); }
 });
@@ -1249,7 +1242,9 @@ router.post('/api/escrows/:id/milestone/:milestoneId/approve', auth, checkBlocke
     // Notify freelancer
     notify(e.freelancer_id, 'milestone_approved', 'Этап оплачен',
       payoutTxid ? `${freelancerAmt}π за этап ${m.milestone_index + 1} отправлено на ваш Pi-кошелёк.` : `${freelancerAmt}π зачислено за этап ${m.milestone_index + 1}.`,
-      e.job_id, null).catch(() => {});
+      e.job_id, null,
+      { key: payoutTxid ? 'nMilestonePaidWallet' : 'nMilestonePaidBalance',
+        params: { amount: freelancerAmt, n: m.milestone_index + 1 } }).catch(() => {});
     res.json({ success: true, released: freelancerAmt, fee: platformFee, all_completed: allDone, payout_txid: payoutTxid });
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});

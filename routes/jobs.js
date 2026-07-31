@@ -334,7 +334,8 @@ router.patch('/api/jobs/:id', auth, checkBlocked, async (req, res) => {
     if (!result.rows.length) return res.status(409).json({ error: 'Job status changed concurrently — try again' });
     if (status === 'submitted' && isHiredFreelancer) {
       await notify(job.posted_by, 'submitted', `Фрилансер сдал работу по задаче "${job.title}"`,
-        'Проверьте результат и примите работу или откройте спор.', parseInt(req.params.id), null);
+        'Проверьте результат и примите работу или откройте спор.', parseInt(req.params.id), null,
+        { key: 'nWorkSubmitted', params: { job: job.title } });
     }
     res.json({ job: result.rows[0], success: true });
   } catch (err) { serverError(err, res); }
@@ -528,7 +529,8 @@ router.post('/api/jobs/:id/apply', auth, checkBlocked, async (req, res) => {
 
     await audit('job_applied', { job_id: req.params.id, user_id: req.userId });
     await notify(job.posted_by, 'application', `Новый отклик на задачу "${job.title}"`,
-      `${user.username || 'Фрилансер'} откликнулся на вашу задачу`, parseInt(req.params.id), roomId).catch(() => {});
+      `${user.username || 'Фрилансер'} откликнулся на вашу задачу`, parseInt(req.params.id), roomId,
+      { key: 'nNewApplication', params: { job: job.title, name: user.username || '' } }).catch(() => {});
     const newBalance = (user.balance_connects || 0) - lockedCost;
     res.json({ application: appResult.rows[0], success: true, remaining_connects: newBalance, new_balance: newBalance, room_id: roomId });
   } catch (err) { serverError(err, res); }
@@ -616,7 +618,8 @@ router.post('/api/jobs/:id/hire', auth, checkBlocked, async (req, res) => {
     }
     await audit('job_hired', { job_id: req.params.id, freelancer_id, application_id, payment_id });
     await notify(freelancer_id, 'hired', `Вас наняли на задачу "${job.title}"`,
-      'Заказчик выбрал вас и создал эскроу. Можете приступать к работе.', parseInt(req.params.id), roomId);
+      'Заказчик выбрал вас и создал эскроу. Можете приступать к работе.', parseInt(req.params.id), roomId,
+      { key: 'nHiredEscrowFunded', params: { job: job.title } });
     res.json({ success: true, room_id: roomId, freelancer_name: freelancerName, escrow: escrowRow });
   } catch (err) { serverError(err, res); }
 });
@@ -692,7 +695,8 @@ router.post('/api/jobs/:id/complete', auth, checkBlocked, async (req, res) => {
         ? `${net}π зачислено на ваш счёт.`
         : 'Заказчик принял работу.';
       await notify(job.hired_freelancer_id, 'payment', `Задача "${job.title}" завершена — оплата отправлена`,
-        payoutMsg, parseInt(req.params.id), null).catch(() => {});
+        payoutMsg, parseInt(req.params.id), null,
+        { key: (escrow && net > 0) ? 'nJobDonePaid' : 'nJobDoneAccepted', params: { job: job.title, amount: net } }).catch(() => {});
     }
 
     res.json({ success: true, released: !!(escrow && net > 0), net_paid: net || 0 });
@@ -822,7 +826,8 @@ router.post('/api/applications', auth, checkBlocked, async (req, res) => {
     finally { pgClient.release(); }
     await audit('job_applied', { job_id, user_id: req.userId });
     await notify(job.posted_by, 'application', `Новый отклик на задачу "${job.title}"`,
-      `${user.username || 'Фрилансер'} откликнулся на вашу задачу`, parseInt(job_id), null);
+      `${user.username || 'Фрилансер'} откликнулся на вашу задачу`, parseInt(job_id), null,
+      { key: 'nNewApplication', params: { job: job.title, name: user.username || '' } });
     const newBal = (user.balance_connects || 0) - cost;
     res.json({ application: appResult.rows[0], success: true, remaining_connects: newBal, new_balance: newBal });
   } catch (err) { serverError(err, res); }
@@ -959,7 +964,8 @@ router.patch('/api/applications/:id', auth, checkBlocked, async (req, res) => {
     finally { pgPatch.release(); }
     if (status === 'accepted' && app_.freelancer_id) {
       await notify(app_.freelancer_id, 'hired', `Вас наняли на задачу "${app_.job_title_full || app_.job_title}"`,
-        'Заказчик принял ваш отклик. Ожидайте финансирования эскроу.', parseInt(app_.job_id), null).catch(() => {});
+        'Заказчик принял ваш отклик. Ожидайте финансирования эскроу.', parseInt(app_.job_id), null,
+        { key: 'nHiredAwaitingEscrow', params: { job: app_.job_title_full || app_.job_title || '' } }).catch(() => {});
       const existRmPatch = await query('SELECT id FROM chat_rooms WHERE job_id=$1 AND client_id=$2 AND freelancer_id=$3',
         [app_.job_id, req.userId, app_.freelancer_id]).catch(() => ({ rows: [] }));
       if (!existRmPatch.rows.length) {
@@ -1030,7 +1036,8 @@ router.post('/api/applications/:id/accept', auth, checkBlocked, async (req, res)
     finally { pgClientAccept.release(); }
     if (freelancerId) {
       await notify(freelancerId, 'hired', `Вас наняли на задачу "${app_.title}"`,
-        'Заказчик принял ваш отклик. Ожидайте финансирования эскроу.', parseInt(app_.job_id), null).catch(() => {});
+        'Заказчик принял ваш отклик. Ожидайте финансирования эскроу.', parseInt(app_.job_id), null,
+        { key: 'nHiredAwaitingEscrow', params: { job: app_.title || '' } }).catch(() => {});
     }
     if (freelancerId) {
       const existingRoom = await query(
@@ -1152,7 +1159,8 @@ router.put('/api/applications/:id/status', auth, checkBlocked, async (req, res) 
     finally { pgStatusClient.release(); }
     if (status === 'accepted' && app_.freelancer_id) {
       await notify(app_.freelancer_id, 'hired', `Вас наняли на задачу`,
-        'Заказчик принял ваш отклик. Ожидайте финансирования эскроу.', parseInt(app_.job_id), null).catch(() => {});
+        'Заказчик принял ваш отклик. Ожидайте финансирования эскроу.', parseInt(app_.job_id), null,
+        { key: 'nHiredAwaitingEscrow', params: { job: '' } }).catch(() => {});
       const existRm = await query('SELECT id FROM chat_rooms WHERE job_id=$1 AND client_id=$2 AND freelancer_id=$3',
         [app_.job_id, req.userId, app_.freelancer_id]).catch(() => ({ rows: [] }));
       if (!existRm.rows.length) {
@@ -1230,7 +1238,8 @@ router.post('/api/applications/:id/hire', auth, checkBlocked, async (req, res) =
     } catch (txErr) { await pgClientHire.query('ROLLBACK').catch(() => {}); throw txErr; }
     finally { pgClientHire.release(); }
     await notify(freelancerId, 'hired', `Вас наняли на задачу "${app_.job_title || app_.job_id}"`,
-      'Заказчик выбрал вас и создал эскроу. Можете приступать к работе.', parseInt(app_.job_id), null);
+      'Заказчик выбрал вас и создал эскроу. Можете приступать к работе.', parseInt(app_.job_id), null,
+      { key: 'nHiredEscrowFunded', params: { job: app_.job_title || '' } });
     const existRmHire = await query('SELECT id FROM chat_rooms WHERE job_id=$1 AND client_id=$2 AND freelancer_id=$3',
       [app_.job_id, req.userId, freelancerId]).catch(() => ({ rows: [] }));
     if (!existRmHire.rows.length) {
