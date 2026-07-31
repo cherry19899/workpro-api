@@ -221,10 +221,12 @@ with settlement in Pi via the Pi Network SDK. We are:</p>
 <p>All payments are denominated in Pi. When a client funds a job, the amount is held by the
 escrow mechanism until the client marks the job complete, a milestone is approved, or an
 automatic release condition is met.</p>
-<p>Work Pro charges a platform fee of <strong>${fee}</strong> on completed transactions.
-This rate is displayed in the App before you commit to a transaction and may be changed
-prospectively; the rate shown at the moment you transact is the rate that applies. The fee is
-retained by us and is non-refundable once a transaction completes.</p>
+<p>Work Pro charges a platform fee of <strong>between 0% and 20%</strong> on completed
+transactions (currently ${fee}). Stating the range rather than a single figure is deliberate:
+the rate is configurable, and the App must never quote a number these Terms contradict. The
+applicable rate is displayed in the App before you commit to a transaction and may be changed
+prospectively within this range; the rate shown at the moment you transact is the rate that
+applies. The fee is retained by us and is non-refundable once a transaction completes.</p>
 <p>Applying to jobs consumes "connects", a prepaid in-app credit. Connects are a licence to
 use a feature, not currency, not a security, not redeemable for Pi or fiat, and non-transferable.
 Unused connects expire on account closure.</p>
