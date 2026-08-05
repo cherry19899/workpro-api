@@ -315,6 +315,7 @@ app.use(require('./routes/payments'));      // /api/payments/*, /api/connects/*,
 app.use(require('./routes/jobs'));          // /api/jobs/*, /api/applications/*
 app.use(require('./routes/users').router);  // /api/users/:id, /api/reviews/*, /api/ratings/*
 app.use(require('./routes/ads'));           // /api/ads/*
+app.use(require('./routes/payouts'));       // /api/payouts/status
 
 // ─── 404 & error handler ──────────────────────────────────────────────
 app.use((req, res) => {
