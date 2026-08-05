@@ -44,7 +44,11 @@ async function healthCheck() {
   }
 }
 
+// .unref() so this background save never keeps the process alive on its own.
+// The HTTP server holds the loop open in production; without unref, any script
+// or test that imports db.js hangs forever instead of exiting.
 const _saveInterval = setInterval(saveJsonDb, 30000);
+_saveInterval.unref();
 process.on('SIGTERM', () => clearInterval(_saveInterval));
 process.on('SIGINT',  () => clearInterval(_saveInterval));
 
