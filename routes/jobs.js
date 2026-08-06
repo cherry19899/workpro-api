@@ -5,7 +5,7 @@ const router = require('express').Router();
 const crypto = require('crypto');
 const { query, getPool } = require('../src/db');
 const logger = require('../src/logger');
-const { notify, audit, serverError, getPlatformFee } = require('../src/helpers');
+const { notify, audit, serverError, getPlatformFee , getConnectsEconomy, applyCostFor } = require('../src/helpers');
 const { auth, softAuth, checkBlocked, jobPostLimiter } = require('../src/middleware');
 const { processJobImages } = require('../src/github-images');
 const { a2uEnabled, sendA2U } = require('../src/pi-a2u');
@@ -53,8 +53,14 @@ function parseJobRow(job, { stripBase64 = false } = {}) {
 // GET /api/config — public, lets the frontend show the real admin-configured
 // platform fee (e.g. on the post-job preview) instead of a hardcoded percent.
 router.get('/api/config', async (req, res) => {
-  const fee = await getPlatformFee();
-  res.json({ platform_fee_percent: parseFloat((fee * 100).toFixed(4)) });
+  const [fee, econ] = await Promise.all([getPlatformFee(), getConnectsEconomy()]);
+  res.json({
+    platform_fee_percent: parseFloat((fee * 100).toFixed(4)),
+    // The client used to hardcode these, which is how a displayed number drifts
+    // away from the one actually charged. Same lesson as the fee.
+    apply_cost_divisor: econ.applyCostDivisor,
+    post_job_cost: econ.postJobCost,
+  });
 });
 
 // GET /api/jobs/search/autocomplete?q=<text>
@@ -192,10 +198,11 @@ router.post('/api/jobs', auth, checkBlocked, jobPostLimiter, async (req, res) =>
     if (isNaN(dl.getTime())) return res.status(400).json({ error: 'Invalid deadline date' });
     if (dl < new Date()) return res.status(400).json({ error: 'Deadline must be in the future' });
   }
+  const econ = await getConnectsEconomy();
   const applyCost = (req.body.connects_required !== undefined && !isNaN(parseInt(req.body.connects_required)) && parseInt(req.body.connects_required) >= 1 && parseInt(req.body.connects_required) <= 200)
   ? parseInt(req.body.connects_required)
-  : Math.ceil(budgetNum / 50);
-  const POST_COST = 1;
+  : applyCostFor(budgetNum, econ.applyCostDivisor);
+  const POST_COST = econ.postJobCost;
   try {
     const userRes = await query('SELECT username, balance_connects FROM users WHERE id = $1', [req.userId]);
     const userRow = userRes.rows[0];

@@ -6,7 +6,7 @@ const router = require('express').Router();
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const { query, getPool } = require('../src/db');
-const { notify, audit, serverError, getPlatformFee, getDeveloperFee, invalidatePlatformFeeCache, FEE_MAX, DEV_FEE_MAX } = require('../src/helpers');
+const { notify, audit, serverError, getPlatformFee, getDeveloperFee, invalidatePlatformFeeCache, invalidateConnectsEconomyCache, FEE_MAX, DEV_FEE_MAX } = require('../src/helpers');
 const { adminAuth, twinId, JWT_SECRET, ADMIN_API_KEY, _rlBlocks } = require('../src/middleware');
 const { a2uEnabled, sendA2U } = require('../src/pi-a2u');
 
@@ -745,6 +745,11 @@ const SETTINGS_WHITELIST = {
   connect_price_base:     { min: 0.001, max: 10,            label: 'Connect price base (Pi)' },
   min_job_budget:         { min: 0.1,   max: 1000,          label: 'Minimum job budget (Pi)' },
   max_job_budget:         { min: 100,   max: 1000000,        label: 'Maximum job budget (Pi)' },
+  // Applying costs 1 connect per this many Pi of budget, minimum 1. Lowering it
+  // makes applying more expensive, which is the lever against spray-and-pray
+  // applications.
+  apply_cost_divisor:     { min: 1,     max: 1000,           label: 'Pi of budget per connect to apply' },
+  post_job_cost:          { min: 0,     max: 50,             label: 'Connects to post a job' },
 };
 router.patch('/api/admin/settings', adminAuth, async (req, res) => {
   const { key, value } = req.body;
@@ -770,6 +775,7 @@ router.patch('/api/admin/settings', adminAuth, async (req, res) => {
       [key, strVal, req.userId || 'admin']
     );
     invalidatePlatformFeeCache();
+    invalidateConnectsEconomyCache();
     // The stats payload carries platformFeePercent and is cached for 5 minutes.
     // Without dropping it here the admin saves a new fee, reloads Stats, and is
     // served the old percentage — indistinguishable from the save having failed.

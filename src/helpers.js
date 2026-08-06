@@ -75,6 +75,44 @@ function invalidatePlatformFeeCache() {
   _devFeeCache = null;
 }
 
+// ─── Connects economy ──────────────────────────────────────────────
+// Both numbers are admin-configurable and cached like the fee. The formula was
+// duplicated in the frontend with the divisor hardcoded — the same setup that
+// let the published fee drift away from the one actually charged, so these are
+// served to the client from /api/config instead.
+const APPLY_DIVISOR_DEFAULT = 50;
+const POST_JOB_COST_DEFAULT = 1;
+let _econCache = null;
+const ECON_CACHE_TTL = 60000;
+
+async function getConnectsEconomy() {
+  const now = Date.now();
+  if (_econCache && now < _econCache.expiresAt) return _econCache.value;
+  const value = { applyCostDivisor: APPLY_DIVISOR_DEFAULT, postJobCost: POST_JOB_COST_DEFAULT };
+  try {
+    const row = await query(
+      "SELECT key, value FROM platform_settings WHERE key IN ('apply_cost_divisor','post_job_cost')"
+    );
+    for (const r of row.rows) {
+      const n = parseFloat(r.value);
+      if (isNaN(n)) continue;
+      if (r.key === 'apply_cost_divisor' && n >= 1) value.applyCostDivisor = n;
+      if (r.key === 'post_job_cost' && n >= 0) value.postJobCost = Math.round(n);
+    }
+  } catch (_) { /* DB unavailable — defaults are safe */ }
+  _econCache = { value, expiresAt: now + ECON_CACHE_TTL };
+  return value;
+}
+
+function invalidateConnectsEconomyCache() { _econCache = null; }
+
+/** Connects required to apply for a job of this budget. Never below 1. */
+function applyCostFor(budget, divisor) {
+  const b = Number(budget) || 0;
+  const d = Number(divisor) || APPLY_DIVISOR_DEFAULT;
+  return Math.max(1, Math.ceil(b / d));
+}
+
 // ─── Connects pricing ──────────────────────────────────────────────
 // Server-side package catalog — mirrors frontend packages. Never trust client-supplied quantity.
 const CONNECT_PACKAGES = [
@@ -200,6 +238,9 @@ module.exports = {
   getPlatformFee,
   getDeveloperFee,
   invalidatePlatformFeeCache,
+  getConnectsEconomy,
+  invalidateConnectsEconomyCache,
+  applyCostFor,
   FEE_MIN,
   FEE_MAX,
   DEV_FEE_MIN,
