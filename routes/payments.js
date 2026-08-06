@@ -746,6 +746,38 @@ router.post(['/api/escrow', '/api/escrows'], auth, checkBlocked, async (req, res
 router.post('/api/escrow/:id/release', auth, checkBlocked, handleEscrowRelease);
 router.post('/api/escrows/:id/release', auth, checkBlocked, handleEscrowRelease);
 
+// POST /api/escrows/:id/dispute/withdraw — either party calls off a dispute.
+//
+// Parties often sort it out between themselves in chat, which the admin cannot
+// see. Without this the escrow stays 'disputed' forever, the money stays frozen,
+// and an admin eventually rules on an argument that ended days ago.
+router.post(['/api/escrows/:id/dispute/withdraw', '/api/escrow/:id/dispute/withdraw'], auth, checkBlocked, async (req, res) => {
+  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Escrow not found' });
+  try {
+    const result = await query('SELECT * FROM escrows WHERE id = $1', [req.params.id]);
+    if (!result.rows.length) return res.status(404).json({ error: 'Escrow not found' });
+    const escrow = result.rows[0];
+    const isClient = normalizeId(escrow.client_id) === normalizeId(req.userId);
+    const isFreelancer = normalizeId(escrow.freelancer_id) === normalizeId(req.userId);
+    if (!isClient && !isFreelancer) return res.status(403).json({ error: 'Not your escrow' });
+    if (escrow.status !== 'disputed') {
+      return res.status(400).json({ error: `No open dispute on this escrow (status: '${escrow.status}')` });
+    }
+    // Back to 'funded', which is where it was before the dispute — the normal
+    // release, cancel and auto-release paths all work again from there.
+    const updated = await query(
+      "UPDATE escrows SET status='funded', dispute_reason=NULL, disputed_by=NULL, disputed_at=NULL, updated_at=NOW() WHERE id=$1 AND status='disputed' RETURNING id",
+      [req.params.id]
+    );
+    if (!updated.rows.length) return res.status(409).json({ error: 'Dispute already resolved' });
+    await audit('escrow_dispute_withdrawn', { escrow_id: req.params.id, by: req.userId });
+    const otherParty = isClient ? escrow.freelancer_id : escrow.client_id;
+    await notify(otherParty, 'escrow', 'Спор отозван', 'Спор по задаче отозван — можно продолжать работу.',
+      escrow.job_id, null, { key: 'nDisputeWithdrawn', params: {} });
+    res.json({ success: true, escrow: { ...escrow, status: 'funded' } });
+  } catch (err) { serverError(err, res); }
+});
+
 router.post(['/api/escrows/:id/cancel', '/api/escrow/:id/cancel'], auth, checkBlocked, async (req, res) => {
   if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Escrow not found' });
   try {
@@ -858,8 +890,17 @@ router.post('/api/escrows/:id/fund', auth, checkBlocked, async (req, res) => {
 
 router.post('/api/escrows/:id/dispute', auth, checkBlocked, async (req, res) => {
   if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Escrow not found' });
-  const { reason } = req.body;
-  if (reason && reason.length > 1000) return res.status(400).json({ error: 'Reason too long (max 1000 chars)' });
+  const reason = String(req.body?.reason || '').trim();
+  // A dispute freezes someone's money until an admin rules on it, and the admin
+  // cannot read the parties' chat. Without a stated reason there is nothing to
+  // rule on — "a dispute was opened" tells them nothing about who is right.
+  if (reason.length < 20) {
+    return res.status(400).json({
+      error: 'Describe the problem in at least 20 characters — the administrator cannot see your chat.',
+      code: 'reason_required',
+    });
+  }
+  if (reason.length > 1000) return res.status(400).json({ error: 'Reason too long (max 1000 chars)' });
   try {
     const result = await query('SELECT * FROM escrows WHERE id = $1', [req.params.id]);
     if (!result.rows.length) return res.status(404).json({ error: 'Escrow not found' });
@@ -870,12 +911,12 @@ router.post('/api/escrows/:id/dispute', auth, checkBlocked, async (req, res) => 
     if (escrow.status !== 'funded') {
       return res.status(400).json({ error: `Can only dispute a funded escrow (current status: '${escrow.status}')` });
     }
-    await query('UPDATE escrows SET status = $1, dispute_reason = $2, updated_at = NOW() WHERE id = $3', ['disputed', reason || null, req.params.id]);
+    await query('UPDATE escrows SET status = $1, dispute_reason = $2, disputed_by = $3, disputed_at = NOW(), updated_at = NOW() WHERE id = $4', ['disputed', reason, req.userId, req.params.id]);
     await audit('escrow_disputed', { escrow_id: req.params.id, reason, user_id: req.userId });
     const otherParty = normalizeId(req.userId) === normalizeId(escrow.client_id) ? escrow.freelancer_id : escrow.client_id;
     await notify(otherParty, 'dispute', 'Открыт спор по задаче',
-      reason || 'Одна из сторон открыла спор. Пожалуйста, свяжитесь с поддержкой.', escrow.job_id, null,
-      { key: 'nDisputeOpened', params: { reason: reason || '' } });
+      reason, escrow.job_id, null,
+      { key: 'nDisputeOpened', params: { reason } });
     res.json({ escrow: { ...escrow, status: 'disputed' }, success: true });
   } catch (err) { serverError(err, res); }
 });

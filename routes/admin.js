@@ -344,10 +344,20 @@ router.get('/api/admin/escrows', adminAuth, async (req, res) => {
       SELECT e.*,
         uc.username AS client_name,
         uf.username AS freelancer_name,
-        j.title AS job_title
+        j.title AS job_title,
+        j.status AS job_status,
+        ud.username AS disputed_by_name,
+        -- Which side raised it. The admin cannot read their chat, so knowing who
+        -- is complaining is most of the context available.
+        CASE
+          WHEN e.disputed_by IS NULL THEN NULL
+          WHEN lower(regexp_replace(e.disputed_by, '^pi_', '')) = lower(regexp_replace(e.client_id, '^pi_', '')) THEN 'client'
+          ELSE 'freelancer'
+        END AS disputed_by_side
       FROM escrows e
       LEFT JOIN users uc ON uc.id = e.client_id
       LEFT JOIN users uf ON uf.id = e.freelancer_id
+      LEFT JOIN users ud ON ud.id = e.disputed_by
       LEFT JOIN jobs j ON j.id = e.job_id
       ORDER BY e.created_at DESC
       LIMIT $1 OFFSET $2

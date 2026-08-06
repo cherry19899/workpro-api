@@ -474,6 +474,11 @@ async function ensureNotificationsTable() {
     'fk_escrows_job_id'
   );
   await run(`ALTER TABLE escrows ADD COLUMN IF NOT EXISTS dispute_reason TEXT`, 'escrows.dispute_reason');
+  // Who raised the dispute and when. Without this the admin resolving it cannot
+  // tell which side is complaining, and a dispute the parties settled between
+  // themselves stays open forever with the money frozen.
+  await run(`ALTER TABLE escrows ADD COLUMN IF NOT EXISTS disputed_by TEXT`, 'escrows.disputed_by');
+  await run(`ALTER TABLE escrows ADD COLUMN IF NOT EXISTS disputed_at TIMESTAMPTZ`, 'escrows.disputed_at');
   // Backfill applications.updated_at for rows created before the column existed
   await run(
     `UPDATE applications SET updated_at = created_at WHERE updated_at IS NULL`,
