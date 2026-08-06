@@ -754,6 +754,17 @@ router.post(['/api/escrows/:id/cancel', '/api/escrow/:id/cancel'], auth, checkBl
     const escrow = result.rows[0];
     if (normalizeId(escrow.client_id) !== normalizeId(req.userId)) return res.status(403).json({ error: 'Not your escrow' });
     if (!['pending', 'funded'].includes(escrow.status)) return res.status(400).json({ error: 'Escrow already settled' });
+    // Work already delivered: cancelling here would let a client take the money
+    // back after receiving the work, with the freelancer having no recourse.
+    // Submission is recorded on the job, not the escrow, so this has to be
+    // checked explicitly — disagreement after delivery goes through a dispute.
+    const jobRow = await query('SELECT status FROM jobs WHERE id = $1', [escrow.job_id]);
+    if (jobRow.rows[0]?.status === 'submitted') {
+      return res.status(409).json({
+        error: 'The freelancer has already submitted the work. Accept it or open a dispute.',
+        code: 'work_submitted',
+      });
+    }
     const wasFunded = escrow.status === 'funded';
     const pgClient6 = await getPool().connect();
     try {
@@ -1109,7 +1120,7 @@ router.get('/api/escrows/:id/milestones', auth, async (req, res) => {
     const esc = await query('SELECT * FROM escrows WHERE id=$1', [escrowId]);
     if (!esc.rows.length) return res.status(404).json({ error: 'Escrow not found' });
     const e = esc.rows[0];
-    if (e.client_id !== req.userId && e.freelancer_id !== req.userId) {
+    if (normalizeId(e.client_id) !== normalizeId(req.userId) && normalizeId(e.freelancer_id) !== normalizeId(req.userId)) {
       return res.status(403).json({ error: 'Not your escrow' });
     }
     const [milestones, txns] = await Promise.all([
@@ -1132,7 +1143,7 @@ router.post('/api/escrows/:id/milestones', auth, async (req, res) => {
     const esc = await query('SELECT * FROM escrows WHERE id=$1', [escrowId]);
     if (!esc.rows.length) return res.status(404).json({ error: 'Escrow not found' });
     const e = esc.rows[0];
-    if (e.client_id !== req.userId) return res.status(403).json({ error: 'Only client can set milestones' });
+    if (normalizeId(e.client_id) !== normalizeId(req.userId)) return res.status(403).json({ error: 'Only client can set milestones' });
     if (!['funded', 'active'].includes(e.status)) return res.status(400).json({ error: 'Escrow must be funded first' });
     // Delete existing pending milestones
     await query('DELETE FROM escrow_milestones WHERE escrow_id=$1 AND status=$2', [escrowId, 'pending']);
@@ -1162,7 +1173,7 @@ router.post('/api/escrows/:id/milestone/:milestoneId/request', auth, checkBlocke
     const esc = await query('SELECT * FROM escrows WHERE id=$1', [escrowId]);
     if (!esc.rows.length) return res.status(404).json({ error: 'Escrow not found' });
     const e = esc.rows[0];
-    if (e.freelancer_id !== req.userId) return res.status(403).json({ error: 'Only freelancer can request release' });
+    if (normalizeId(e.freelancer_id) !== normalizeId(req.userId)) return res.status(403).json({ error: 'Only freelancer can request release' });
     if (!['funded', 'active'].includes(e.status)) return res.status(400).json({ error: 'Escrow not active' });
     const ms = await query('SELECT * FROM escrow_milestones WHERE id=$1 AND escrow_id=$2', [milestoneId, escrowId]);
     if (!ms.rows.length) return res.status(404).json({ error: 'Milestone not found' });
@@ -1193,7 +1204,7 @@ router.post('/api/escrows/:id/milestone/:milestoneId/approve', auth, checkBlocke
     const escRow = await client.query('SELECT * FROM escrows WHERE id=$1 FOR UPDATE', [escrowId]);
     if (!escRow.rows.length) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Escrow not found' }); }
     const e = escRow.rows[0];
-    if (e.client_id !== req.userId) { await client.query('ROLLBACK'); return res.status(403).json({ error: 'Only client can approve' }); }
+    if (normalizeId(e.client_id) !== normalizeId(req.userId)) { await client.query('ROLLBACK'); return res.status(403).json({ error: 'Only client can approve' }); }
     const msRow = await client.query('SELECT * FROM escrow_milestones WHERE id=$1 AND escrow_id=$2 FOR UPDATE', [milestoneId, escrowId]);
     if (!msRow.rows.length) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Milestone not found' }); }
     const m = msRow.rows[0];
