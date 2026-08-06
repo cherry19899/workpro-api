@@ -6,7 +6,7 @@ const router = require('express').Router();
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const { query, getPool } = require('../src/db');
-const { notify, audit, serverError, getPlatformFee, getDeveloperFee, invalidatePlatformFeeCache, invalidateConnectsEconomyCache, FEE_MAX, DEV_FEE_MAX } = require('../src/helpers');
+const { notify, audit, serverError, getPlatformFee, getDeveloperFee, invalidatePlatformFeeCache, invalidateConnectsEconomyCache, invalidateSupportUrlCache, FEE_MAX, DEV_FEE_MAX } = require('../src/helpers');
 const { adminAuth, twinId, JWT_SECRET, ADMIN_API_KEY, _rlBlocks } = require('../src/middleware');
 const { a2uEnabled, sendA2U } = require('../src/pi-a2u');
 
@@ -751,14 +751,50 @@ const SETTINGS_WHITELIST = {
   apply_cost_divisor:     { min: 1,     max: 1000,           label: 'Pi of budget per connect to apply' },
   post_job_cost:          { min: 0,     max: 50,             label: 'Connects to post a job' },
 };
+
+// Settings that hold text rather than a number. Kept separate because the
+// numeric path parses with parseFloat and would turn any URL into NaN.
+const TEXT_SETTINGS = {
+  support_url: {
+    label: 'Support site URL',
+    maxLength: 300,
+    // Only http(s). A javascript: or data: URL here would be handed straight to
+    // every user's browser from a screen they trust.
+    validate: (v) => v === '' || /^https?:\/\/[^\s]+$/i.test(v),
+    hint: 'must start with http:// or https://',
+  },
+};
 router.patch('/api/admin/settings', adminAuth, async (req, res) => {
   const { key, value } = req.body;
   if (!key || value === undefined || value === null) {
     return res.status(400).json({ error: 'key and value required' });
   }
+  const textRule = TEXT_SETTINGS[key];
+  if (textRule) {
+    const raw = String(value).trim();
+    if (raw.length > textRule.maxLength) {
+      return res.status(400).json({ error: `${textRule.label} is too long (max ${textRule.maxLength})` });
+    }
+    if (!textRule.validate(raw)) {
+      return res.status(400).json({ error: `${textRule.label} ${textRule.hint}` });
+    }
+    try {
+      await query(
+        `INSERT INTO platform_settings (key, value, updated_at, updated_by)
+         VALUES ($1, $2, NOW(), $3)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW(), updated_by = EXCLUDED.updated_by`,
+        [key, raw, req.userId || 'admin']
+      );
+      invalidateSupportUrlCache();
+      await audit('admin_setting_changed', { key, new_value: raw, by: req.userId });
+      return res.json({ success: true, key, value: raw });
+    } catch (err) { return serverError(err, res); }
+  }
+
   const rule = SETTINGS_WHITELIST[key];
   if (!rule) {
-    return res.status(400).json({ error: `Unknown setting key. Allowed: ${Object.keys(SETTINGS_WHITELIST).join(', ')}` });
+    const allowed = [...Object.keys(SETTINGS_WHITELIST), ...Object.keys(TEXT_SETTINGS)].join(', ');
+    return res.status(400).json({ error: `Unknown setting key. Allowed: ${allowed}` });
   }
   const num = parseFloat(value);
   if (isNaN(num) || num < rule.min || num > rule.max) {

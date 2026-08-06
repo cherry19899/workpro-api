@@ -82,18 +82,40 @@ router.post('/api/chat/rooms', auth, checkBlocked, messageLimiter, async (req, r
 // GET /api/chat/rooms/:id — specific room details
 router.get('/api/chat/rooms/:id', auth, async (req, res) => {
   try {
+    // Ownership is compared normalised: Pi sends ids with inconsistent case and
+    // an optional pi_ prefix, and a raw match here locks a user out of their own
+    // chat with a bare 404.
+    const norm = "lower(regexp_replace($2, '^pi_', ''))";
     const result = await query(
       `SELECT cr.*,
               u1.username as client_username, u2.username as freelancer_username,
-              u1.avatar as client_avatar, u2.avatar as freelancer_avatar
+              u1.avatar as client_avatar, u2.avatar as freelancer_avatar,
+              j.title  as job_title,
+              j.status as job_status,
+              j.budget as job_budget,
+              -- The pending application from this freelancer for this job, so the
+              -- client can hire straight from the conversation instead of hunting
+              -- for the job page.
+              (SELECT a.id FROM applications a
+                WHERE a.job_id = cr.job_id
+                  AND lower(regexp_replace(a.freelancer_id, '^pi_', '')) = lower(regexp_replace(cr.freelancer_id, '^pi_', ''))
+                  AND a.status = 'pending'
+                LIMIT 1) as pending_application_id
        FROM chat_rooms cr
        LEFT JOIN users u1 ON u1.id = cr.client_id
        LEFT JOIN users u2 ON u2.id = cr.freelancer_id
-       WHERE cr.id = $1 AND (cr.client_id = $2 OR cr.freelancer_id = $2)`,
+       LEFT JOIN jobs  j  ON j.id  = cr.job_id
+       WHERE cr.id = $1 AND (
+         lower(regexp_replace(cr.client_id, '^pi_', '')) = ${norm}
+         OR lower(regexp_replace(cr.freelancer_id, '^pi_', '')) = ${norm}
+       )`,
       [req.params.id, req.userId]
     );
     if (!result.rows.length) return res.status(404).json({ error: 'Room not found' });
-    res.json({ room: result.rows[0] });
+    const room = result.rows[0];
+    const n = (v) => (v || '').toString().toLowerCase().replace(/^pi_/, '');
+    room.viewer_is_client = n(room.client_id) === n(req.userId);
+    res.json({ room });
   } catch (err) { serverError(err, res); }
 });
 
