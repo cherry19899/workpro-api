@@ -275,11 +275,59 @@ function resolveWebhookStatus(piPayment) {
   return null;
 }
 
+// ─── Owner identity ────────────────────────────────────────────────
+// Several places grant the admin role by matching a username, so the owner's
+// name is effectively a credential and no other account may hold it. These are
+// the two real uids the owner logs in with (see routes/auth.js self-heal).
+const OWNER_UIDS = ['pi_cherry19899', 'pi_a2b617f7-f510-4502-a046-805facedcc29'];
+const OWNER_USERNAME = 'cherry19899';
+
+/** True when this uid is entitled to the owner's username. */
+function isOwnerUid(uid) {
+  // Strings only: String({toString:() => 'pi_cherry19899'}) and
+  // String(['pi_cherry19899']) both stringify to the owner's uid, so coercing
+  // would let a JSON body claim ownership through a route that passes one on.
+  if (typeof uid !== 'string') return false;
+  return OWNER_UIDS.includes(uid.toLowerCase());
+}
+
+/** Longest URL a portfolio link or work-item image may be. */
+const MAX_URL_LEN = 500;
+
+/**
+ * Normalizes a user-supplied link, or refuses it.
+ *
+ * Portfolio links are typed by one user and rendered as a clickable href to
+ * every other user, so only http(s) may be stored: `javascript:alert(...)`
+ * saved as a website would execute in the *viewer's* session when they tap it,
+ * and `data:text/html,...` is the same hole with a different scheme. An
+ * allowlist is the only filter that holds — blocklists lose to
+ * `javascript://%0aalert(1)` and friends.
+ *
+ * Returns '' for a legitimately empty value (clearing the field), the
+ * normalized URL when it is safe, or null when it must be rejected.
+ */
+function safeHttpUrl(u) {
+  let s = String(u ?? '').trim();
+  if (!s) return '';
+  // "example.com" is what people actually type. Give it a scheme before
+  // judging it — but only when it really looks like a hostname, or a stray "0"
+  // would be stored as the perfectly valid-looking https://0. Anything that
+  // already carries a scheme is judged exactly as written.
+  if (!s.includes(':') && /^[a-z0-9-]+(\.[a-z0-9-]+)*\.[a-z]{2,}([/?#]|$)/i.test(s)) s = 'https://' + s;
+  if (s.length > MAX_URL_LEN) return null;
+  return /^https?:\/\/[^\s/?#]+[^\s]*$/i.test(s) ? s : null;
+}
+
 module.exports = {
   piApiRequest,
   piApprovePayment,
   piCompletePayment,
   resolveWebhookStatus,
+  safeHttpUrl,
+  MAX_URL_LEN,
+  isOwnerUid,
+  OWNER_USERNAME,
   piGetPayment,
   notify,
   audit,

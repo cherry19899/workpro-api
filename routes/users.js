@@ -4,7 +4,7 @@ const logger = require('../src/logger');
  */
 const router = require('express').Router();
 const { query } = require('../src/db');
-const { notify, serverError } = require('../src/helpers');
+const { notify, serverError, safeHttpUrl, MAX_URL_LEN, isOwnerUid, OWNER_USERNAME } = require('../src/helpers');
 const { auth, softAuth, checkBlocked, adminAuth } = require('../src/middleware');
 
 const normalizeId = (id) => (id || '').toString().toLowerCase().replace(/^pi_/, '');
@@ -80,12 +80,29 @@ router.post('/api/users/:id', auth, checkBlocked, async (req, res) => {
   const ALLOWED_AVAILABILITY = ['available', 'busy', 'away', 'unavailable'];
   if (availability && !ALLOWED_AVAILABILITY.includes(availability)) return res.status(400).json({ error: 'Invalid availability value' });
   if (avatar && avatar.length > 2 * 1024 * 1024 * 1.37) {
-    return res.status(400).json({ error: 'Фото слишком большое (макс. 2MB)' });
+    return res.status(400).json({ error: 'Photo too large (max 2MB)' });
   }
   try {
+    // A username is an identity here — several places grant admin by matching
+    // one, chat and job cards show it as who you are dealing with — yet this
+    // endpoint used to write whatever the body said. Anyone could take the
+    // owner's name (and with it, the role) or pose as another freelancer.
+    let uname = username;
+    if (username !== undefined) {
+      uname = String(username).trim();
+      if (!uname) return res.status(400).json({ error: 'Username cannot be empty' });
+      if (uname.toLowerCase() === OWNER_USERNAME && !isOwnerUid(req.params.id)) {
+        return res.status(409).json({ error: 'That username is reserved' });
+      }
+      const taken = await query(
+        'SELECT id FROM users WHERE LOWER(username) = LOWER($1) AND id <> $2 LIMIT 1',
+        [uname, req.params.id]
+      );
+      if (taken.rows.length) return res.status(409).json({ error: 'That username is already taken' });
+    }
     const result = await query(
       'UPDATE users SET username = COALESCE($1, username), email = COALESCE($2, email), bio = COALESCE($3, bio), skills = COALESCE($4, skills), availability = COALESCE($5, availability), avatar = COALESCE($6, avatar), updated_at = NOW() WHERE id = $7 RETURNING id, username, email, role, bio, skills, avatar, availability, balance_connects, rating, kyc_verified',
-      [username, email, bio, skillsStr !== undefined ? skillsStr : skills, availability, avatar, req.params.id]
+      [uname, email, bio, skillsStr !== undefined ? skillsStr : skills, availability, avatar, req.params.id]
     );
     if (!result.rows.length) return res.status(404).json({ error: 'User not found' });
     const u2 = result.rows[0];
@@ -144,6 +161,16 @@ router.put('/api/users/me/portfolio', auth, checkBlocked, async (req, res) => {
   if (String(summary).length > 2000) return res.status(400).json({ error: 'Summary too long (max 2000)' });
   const years = parseInt(experience_years) || 0;
   if (years < 0 || years > 80) return res.status(400).json({ error: 'Invalid experience_years' });
+  // These three end up as clickable hrefs on a page other users open, so a
+  // non-http(s) scheme is refused rather than stored. See safeHttpUrl.
+  const links = {};
+  for (const [field, raw] of Object.entries({ website, github, linkedin })) {
+    const url = safeHttpUrl(raw);
+    if (url === null) {
+      return res.status(400).json({ error: `Invalid ${field} link — use a full http(s) URL (max ${MAX_URL_LEN} characters)` });
+    }
+    links[field] = url;
+  }
   try {
     const result = await query(
       `INSERT INTO portfolios (user_id, headline, summary, experience_years, website, github, linkedin)
@@ -151,7 +178,7 @@ router.put('/api/users/me/portfolio', auth, checkBlocked, async (req, res) => {
        ON CONFLICT (user_id) DO UPDATE SET
          headline=$2, summary=$3, experience_years=$4, website=$5, github=$6, linkedin=$7, updated_at=NOW()
        RETURNING *`,
-      [req.userId, headline, summary, years, website, github, linkedin]
+      [req.userId, headline, summary, years, links.website, links.github, links.linkedin]
     );
     res.json({ portfolio: result.rows[0], success: true });
   } catch (err) { serverError(err, res); }
@@ -163,13 +190,17 @@ router.post('/api/users/me/portfolio/items', auth, checkBlocked, async (req, res
   if (!title || !String(title).trim()) return res.status(400).json({ error: 'Title required' });
   if (String(title).length > 500) return res.status(400).json({ error: 'Title too long (max 500)' });
   if (String(description).length > 3000) return res.status(400).json({ error: 'Description too long (max 3000)' });
+  if (String(category).length > 50) return res.status(400).json({ error: 'Category too long (max 50)' });
+  if (String(tags).length > 300) return res.status(400).json({ error: 'Tags too long (max 300)' });
+  const image = safeHttpUrl(image_url);
+  if (image === null) return res.status(400).json({ error: `Invalid image link — use a full http(s) URL (max ${MAX_URL_LEN} characters)` });
   try {
     const count = await query('SELECT COUNT(*) FROM portfolio_items WHERE user_id = $1', [req.userId]);
     if (parseInt(count.rows[0].count) >= 20) return res.status(400).json({ error: 'Portfolio limit reached (max 20 items)' });
     const result = await query(
       `INSERT INTO portfolio_items (user_id, title, description, image_url, category, tags)
        VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
-      [req.userId, String(title).trim(), description, image_url, category, tags]
+      [req.userId, String(title).trim(), description, image, category, tags]
     );
     res.json({ item: result.rows[0], success: true });
   } catch (err) { serverError(err, res); }

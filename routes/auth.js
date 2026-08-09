@@ -186,6 +186,10 @@ router.post('/api/me', authLimiter, async (req, res) => {
     // SANDBOX_MODE (Pi Testnet): skip all Pi verification — Testnet accessTokens do not
     // verify against the Mainnet /v2/me endpoint, so we trust the client identity here.
     // Turn SANDBOX_MODE OFF when going to Mainnet to re-enable strict accessToken checks.
+    // The username Pi vouches for, when Pi was asked. The request body's
+    // username must never win over this: role is granted by username further
+    // down, so a body-supplied name is a privilege escalation.
+    let verifiedUsername = null;
     if (!SANDBOX_MODE) {
       if (accessToken) {
         try {
@@ -197,6 +201,7 @@ router.post('/api/me', authLimiter, async (req, res) => {
           if (verifiedCanonical !== incomingCanonical) {
             return res.status(403).json({ error: 'Token does not match uid' });
           }
+          verifiedUsername = piUser.username || null;
           // Persist payments_enabled from Pi so we can gate purchases later
           if (piUser.payments_enabled !== undefined) {
             await query(
@@ -214,7 +219,7 @@ router.post('/api/me', authLimiter, async (req, res) => {
 
     // Normalise to canonical uid — auto-merges any non-canonical twin into canonical.
     const uid = await normalizeLoginUid(rawUid);
-    const uname = username || uid.replace(/^pi_/, '') || uid;
+    const uname = verifiedUsername || username || uid.replace(/^pi_/, '') || uid;
 
     if (accessToken) {
       await query(

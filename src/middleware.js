@@ -31,9 +31,12 @@ const RATE_LIMIT_BYPASS_KEY = process.env.RATE_LIMIT_BYPASS_KEY || null;
 
 function skipIfBypassed(req) {
   if (!RATE_LIMIT_BYPASS_KEY) return false;
-  const header = req.headers['x-rate-bypass'] || '';
-  return header.length === RATE_LIMIT_BYPASS_KEY.length &&
-    crypto.timingSafeEqual(Buffer.from(header), Buffer.from(RATE_LIMIT_BYPASS_KEY));
+  // The old comparison gated timingSafeEqual on *character* length while
+  // timingSafeEqual measures *bytes*, and there is no try/catch here:
+  // an x-rate-bypass header of multi-byte characters whose character count
+  // matched the key threw RangeError inside express-rate-limit's synchronous
+  // skip(), turning every rate-limited endpoint into a 500 for that request.
+  return timingSafeStrEqual(req.headers['x-rate-bypass'], RATE_LIMIT_BYPASS_KEY);
 }
 
 // In dev/sandbox mode all per-endpoint limits are relaxed 10×.

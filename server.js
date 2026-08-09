@@ -102,11 +102,8 @@ const RATE_LIMIT_BYPASS_KEY = process.env.RATE_LIMIT_BYPASS_KEY || null;
 function _skipRateLimit(req) {
   if (req.path === '/api/health') return true;
   if (!RATE_LIMIT_BYPASS_KEY) return false;
-  const h = req.headers['x-rate-bypass'] || '';
-  try {
-    return h.length === RATE_LIMIT_BYPASS_KEY.length &&
-      require('crypto').timingSafeEqual(Buffer.from(h), Buffer.from(RATE_LIMIT_BYPASS_KEY));
-  } catch { return false; }
+  // Same byte-vs-character comparison as everywhere else — one implementation.
+  return require('./src/middleware').timingSafeStrEqual(req.headers['x-rate-bypass'], RATE_LIMIT_BYPASS_KEY);
 }
 // Method-aware global limit: read-heavy GETs capped tighter than mutations.
 // SANDBOX_MODE relaxes 10× for automated testing.
