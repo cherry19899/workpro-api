@@ -7,8 +7,10 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
-      - key: SANDBOX_MODE
-        value: "true"
+      # Deliberately absent. Sandbox skips Pi accessToken verification entirely,
+      # so anyone could log in as anyone; it must never be switched on from a
+      # file that a blueprint sync could apply to the live service. Set it by
+      # hand in the Render dashboard for a testnet deploy, and only to "true".
       - key: PI_API_KEY
         sync: false  # Set via Render dashboard — never commit API keys to git
       - key: FRONTEND_URL

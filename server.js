@@ -40,7 +40,7 @@ const PORT = process.env.PORT || 3000;
 const NODE_ENV = process.env.NODE_ENV || 'production';
 
 // ── Pre-flight secret checks (fatal in production without SANDBOX escape hatch) ──
-const IS_SANDBOX = !!process.env.SANDBOX_MODE;
+const { SANDBOX_MODE: IS_SANDBOX } = require('./src/helpers');
 if (NODE_ENV === 'production') {
   if (IS_SANDBOX) {
     logger.warn('[WARN] SANDBOX_MODE is enabled — testnet mode active. Remove before switching to mainnet.');
@@ -110,7 +110,7 @@ function _skipRateLimit(req) {
 }
 // Method-aware global limit: read-heavy GETs capped tighter than mutations.
 // SANDBOX_MODE relaxes 10× for automated testing.
-const _rateMult = process.env.SANDBOX_MODE ? 10 : 1;
+const _rateMult = IS_SANDBOX ? 10 : 1;
 app.use(rateLimit({
   windowMs: 15 * 60 * 1000,
   max: (req) => (req.method === 'GET' ? 100 : 500) * _rateMult,
@@ -279,7 +279,7 @@ app.get('/api/health', async (req, res) => {
   try { result.last_500 = require('./src/helpers').last500(); } catch {}
 
   // Pi API latency (only on deep=1 to avoid slowing every ping) — cached 60s
-  if (piKey && process.env.SANDBOX_MODE !== 'true' && req.query.deep === '1') {
+  if (piKey && !IS_SANDBOX && req.query.deep === '1') {
     const now = Date.now();
     if (_piHealthCache && (now - _piHealthCache.ts) < 60000) {
       result.pi_api_reachable = _piHealthCache.reachable;

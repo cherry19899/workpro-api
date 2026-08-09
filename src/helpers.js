@@ -5,6 +5,14 @@ const fetch = require('node-fetch');
 const { query, getPool } = require('./db');
 
 const PI_API_KEY = process.env.PI_API_KEY || '';
+
+// ─── Sandbox switch ──────────────────────────────────────────────
+// Only the exact string 'true' turns sandbox on. This was a truthiness check on
+// the raw env var, which made SANDBOX_MODE="false" — the obvious way to turn it
+// off — read as ON, and sandbox skips Pi accessToken verification entirely: any
+// caller could POST /api/me with someone else's uid and be handed their JWT.
+// Every reader must go through this constant so the rule cannot drift again.
+const SANDBOX_MODE = process.env.SANDBOX_MODE === 'true';
 // The Pi Platform API (payments approve/complete/get) is served from api.minepi.com
 // for BOTH testnet/sandbox and mainnet apps — sandbox is a frontend-SDK concern only.
 // api.testnet.minepi.com is the Stellar testnet Horizon (blockchain), NOT the Platform
@@ -257,6 +265,7 @@ module.exports = {
   last500,
   PI_API_KEY,
   PI_API_BASE,
+  SANDBOX_MODE,
   getPlatformFee,
   getDeveloperFee,
   invalidatePlatformFeeCache,

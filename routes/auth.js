@@ -5,7 +5,7 @@ const logger = require('../src/logger');
 const router = require('express').Router();
 const jwt = require('jsonwebtoken');
 const { query, getPool } = require('../src/db');
-const { piApiRequest, audit, serverError } = require('../src/helpers');
+const { piApiRequest, audit, serverError, SANDBOX_MODE } = require('../src/helpers');
 const { auth, softAuth, checkBlocked, authLimiter, JWT_SECRET } = require('../src/middleware');
 
 // ─── UID normalisation ────────────────────────────────────────────────────────
@@ -186,7 +186,7 @@ router.post('/api/me', authLimiter, async (req, res) => {
     // SANDBOX_MODE (Pi Testnet): skip all Pi verification — Testnet accessTokens do not
     // verify against the Mainnet /v2/me endpoint, so we trust the client identity here.
     // Turn SANDBOX_MODE OFF when going to Mainnet to re-enable strict accessToken checks.
-    if (!process.env.SANDBOX_MODE) {
+    if (!SANDBOX_MODE) {
       if (accessToken) {
         try {
           const piUser = await piApiRequest('/v2/me', 'GET', null, accessToken);
@@ -232,7 +232,7 @@ router.post('/api/me', authLimiter, async (req, res) => {
       );
     }
     // SANDBOX: top up connects to 10 if balance is 0 so testing is never blocked
-    if (process.env.SANDBOX_MODE) {
+    if (SANDBOX_MODE) {
       await query(
         `UPDATE users SET balance_connects = 10, updated_at = NOW() WHERE id = $1 AND balance_connects < 1`,
         [uid]
@@ -307,7 +307,7 @@ router.post('/api/auth/login', async (req, res) => {
         return res.status(403).json({ error: 'Token does not match userId' });
       }
     } else {
-      if (!process.env.SANDBOX_MODE) {
+      if (!SANDBOX_MODE) {
         return res.status(401).json({ error: 'accessToken required' });
       }
       // SANDBOX_MODE only — skip Pi verification for local/test environments
