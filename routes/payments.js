@@ -6,7 +6,7 @@ const router = require('express').Router();
 const crypto = require('crypto');
 const fetch = require('node-fetch');
 const { query, getPool } = require('../src/db');
-const { piApprovePayment, piCompletePayment, piGetPayment, notify, audit, serverError, resolveWebhookStatus, PI_API_KEY, PI_API_BASE, getPlatformFee } = require('../src/helpers');
+const { isIdParam, piApprovePayment, piCompletePayment, piGetPayment, notify, audit, serverError, resolveWebhookStatus, PI_API_KEY, PI_API_BASE, getPlatformFee } = require('../src/helpers');
 const { auth, softAuth, checkBlocked } = require('../src/middleware');
 const { a2uEnabled, sendA2U } = require('../src/pi-a2u');
 
@@ -168,7 +168,7 @@ async function handlePaymentComplete(paymentId, txid, metadata, userId, res) {
 // The singular version (line 1389) returns { escrow: {..., status:'released'}, success: true }.
 // Merged: returns { success: true, escrow: { ...escrow, status: 'released' } } (both response formats).
 async function handleEscrowRelease(req, res) {
-  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Escrow not found' });
+  if (!isIdParam(req.params.id)) return res.status(404).json({ error: 'Escrow not found' });
   try {
     const result = await query('SELECT * FROM escrows WHERE id = $1', [req.params.id]);
     if (!result.rows.length) return res.status(404).json({ error: 'Escrow not found' });
@@ -774,7 +774,7 @@ router.post('/api/escrows/:id/release', auth, checkBlocked, handleEscrowRelease)
 // see. Without this the escrow stays 'disputed' forever, the money stays frozen,
 // and an admin eventually rules on an argument that ended days ago.
 router.post(['/api/escrows/:id/dispute/withdraw', '/api/escrow/:id/dispute/withdraw'], auth, checkBlocked, async (req, res) => {
-  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Escrow not found' });
+  if (!isIdParam(req.params.id)) return res.status(404).json({ error: 'Escrow not found' });
   try {
     const result = await query('SELECT * FROM escrows WHERE id = $1', [req.params.id]);
     if (!result.rows.length) return res.status(404).json({ error: 'Escrow not found' });
@@ -801,7 +801,7 @@ router.post(['/api/escrows/:id/dispute/withdraw', '/api/escrow/:id/dispute/withd
 });
 
 router.post(['/api/escrows/:id/cancel', '/api/escrow/:id/cancel'], auth, checkBlocked, async (req, res) => {
-  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Escrow not found' });
+  if (!isIdParam(req.params.id)) return res.status(404).json({ error: 'Escrow not found' });
   try {
     const result = await query('SELECT * FROM escrows WHERE id = $1', [req.params.id]);
     if (!result.rows.length) return res.status(404).json({ error: 'Escrow not found' });
@@ -848,7 +848,7 @@ router.post(['/api/escrows/:id/cancel', '/api/escrow/:id/cancel'], auth, checkBl
 });
 
 router.post('/api/escrow/:id/refund', auth, checkBlocked, async (req, res) => {
-  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Escrow not found' });
+  if (!isIdParam(req.params.id)) return res.status(404).json({ error: 'Escrow not found' });
   try {
     const result = await query('SELECT * FROM escrows WHERE id = $1', [req.params.id]);
     if (!result.rows.length) return res.status(404).json({ error: 'Escrow not found' });
@@ -881,7 +881,7 @@ router.post('/api/escrow/:id/refund', auth, checkBlocked, async (req, res) => {
 });
 
 router.post('/api/escrows/:id/fund', auth, checkBlocked, async (req, res) => {
-  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Escrow not found' });
+  if (!isIdParam(req.params.id)) return res.status(404).json({ error: 'Escrow not found' });
   const { payment_id, txid } = req.body;
   if (!payment_id) return res.status(400).json({ error: 'payment_id required — provide the Pi payment identifier' });
   try {
@@ -911,7 +911,7 @@ router.post('/api/escrows/:id/fund', auth, checkBlocked, async (req, res) => {
 });
 
 router.post('/api/escrows/:id/dispute', auth, checkBlocked, async (req, res) => {
-  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Escrow not found' });
+  if (!isIdParam(req.params.id)) return res.status(404).json({ error: 'Escrow not found' });
   const reason = String(req.body?.reason || '').trim();
   // A dispute freezes someone's money until an admin rules on it, and the admin
   // cannot read the parties' chat. Without a stated reason there is nothing to
@@ -944,7 +944,7 @@ router.post('/api/escrows/:id/dispute', auth, checkBlocked, async (req, res) => 
 });
 
 router.get('/api/escrows/:id/room', auth, async (req, res) => {
-  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Escrow not found' });
+  if (!isIdParam(req.params.id)) return res.status(404).json({ error: 'Escrow not found' });
   try {
     const escResult = await query('SELECT * FROM escrows WHERE id = $1 AND (client_id = $2 OR freelancer_id = $2)', [req.params.id, req.userId]);
     if (!escResult.rows.length) return res.status(404).json({ error: 'Escrow not found' });
@@ -1004,7 +1004,10 @@ router.post('/api/offers', auth, checkBlocked, async (req, res) => {
     const job = jobRes.rows[0];
     if (normalizeId(job.posted_by) !== normalizeId(req.userId)) return res.status(403).json({ error: 'Not your job' });
     if (job.status !== 'open') return res.status(400).json({ error: 'Can only send offers for open jobs' });
-    if (to_user_id === req.userId) return res.status(400).json({ error: 'Cannot send offer to yourself' });
+    // normalizeId, not ===: a strict check here fails open, so a client could
+    // send themselves a direct offer by varying the casing of their own id and
+    // accept it — hiring themselves onto their own job.
+    if (normalizeId(to_user_id) === normalizeId(req.userId)) return res.status(400).json({ error: 'Cannot send offer to yourself' });
     const freelancerRes = await query('SELECT id, username FROM users WHERE id = $1', [to_user_id]);
     if (!freelancerRes.rows.length) return res.status(404).json({ error: 'Freelancer not found' });
     const freelancer = freelancerRes.rows[0];
@@ -1057,7 +1060,7 @@ router.get('/api/offers', auth, async (req, res) => {
 });
 
 router.get('/api/offers/:id', auth, async (req, res) => {
-  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Offer not found' });
+  if (!isIdParam(req.params.id)) return res.status(404).json({ error: 'Offer not found' });
   try {
     const result = await query(
       `SELECT a.*, j.title as job_title, j.budget, u.username as client_username
@@ -1073,7 +1076,7 @@ router.get('/api/offers/:id', auth, async (req, res) => {
 });
 
 router.post('/api/offers/:id/accept', auth, checkBlocked, async (req, res) => {
-  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Offer not found' });
+  if (!isIdParam(req.params.id)) return res.status(404).json({ error: 'Offer not found' });
   try {
     const offerRes = await query(
       `SELECT a.*, j.posted_by, j.budget AS job_budget, j.title AS job_title, j.apply_cost
@@ -1131,7 +1134,7 @@ router.post('/api/offers/:id/accept', auth, checkBlocked, async (req, res) => {
 });
 
 router.post('/api/offers/:id/decline', auth, checkBlocked, async (req, res) => {
-  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Offer not found' });
+  if (!isIdParam(req.params.id)) return res.status(404).json({ error: 'Offer not found' });
   try {
     const result = await query("UPDATE applications SET status = $1, updated_at = NOW() WHERE id = $2 AND freelancer_id = $3 AND status = 'offer' RETURNING *", ['rejected', req.params.id, req.userId]);
     if (!result.rows.length) {
@@ -1244,6 +1247,10 @@ router.post('/api/escrows/:id/milestones', auth, async (req, res) => {
 
 // POST /api/escrows/:id/milestone/:milestoneId/request — freelancer requests release
 router.post('/api/escrows/:id/milestone/:milestoneId/request', auth, checkBlocked, async (req, res) => {
+  // parseInt('abc') is NaN, which pg sends as the literal 'NaN' and Postgres
+  // rejects — a 500 for what is simply a URL naming no milestone.
+  if (!isIdParam(req.params.id)) return res.status(404).json({ error: 'Escrow not found' });
+  if (!isIdParam(req.params.milestoneId)) return res.status(404).json({ error: 'Milestone not found' });
   const escrowId = parseInt(req.params.id);
   const milestoneId = parseInt(req.params.milestoneId);
   try {
@@ -1272,6 +1279,10 @@ router.post('/api/escrows/:id/milestone/:milestoneId/request', auth, checkBlocke
 
 // POST /api/escrows/:id/milestone/:milestoneId/approve — client approves, releases funds
 router.post('/api/escrows/:id/milestone/:milestoneId/approve', auth, checkBlocked, async (req, res) => {
+  // Checked before a connection is taken from the pool: this route holds one
+  // for a whole transaction, and a bad id should not cost one.
+  if (!isIdParam(req.params.id)) return res.status(404).json({ error: 'Escrow not found' });
+  if (!isIdParam(req.params.milestoneId)) return res.status(404).json({ error: 'Milestone not found' });
   const escrowId = parseInt(req.params.id);
   const milestoneId = parseInt(req.params.milestoneId);
   const pool = getPool();

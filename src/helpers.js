@@ -234,7 +234,36 @@ async function audit(action, data) {
 // ─── Generic server error responder ──────────────────────────────────────────────
 let _last500 = { error: null, stack: null, at: null };
 function last500() { return _last500; }
+
+/**
+ * Postgres codes that only ever mean "the value the caller supplied is not a
+ * value this column can hold". Every one of them is a bad request that was
+ * answered with 500 because the check happened in the database instead of in
+ * the route.
+ *
+ * Most id path params go straight into `WHERE id = $1` unparsed, and the id
+ * columns of jobs, escrows, applications, reviews, notifications,
+ * saved_searches and escrow_milestones are all SERIAL — so
+ * `DELETE /api/saved-searches/abc` earned 22P02, and `/api/jobs/99999999999`
+ * earned 22003. Mapping them here fixes every such route at once, which
+ * hand-parsing thirty path params would not.
+ */
+const CLIENT_DATA_ERRORS = {
+  '22P02': 'Invalid value in request',        // invalid_text_representation ('abc' as an integer)
+  '22003': 'Value out of range',              // numeric_value_out_of_range (past int4)
+  '22001': 'Value too long',                  // string_data_right_truncation (past VARCHAR(n))
+};
+
 function serverError(err, res) {
+  const clientMsg = err && CLIENT_DATA_ERRORS[err.code];
+  if (clientMsg) {
+    // Still logged: our own code passing a malformed value would land here too,
+    // and that is a bug worth seeing. But it is not recorded as the last 500 —
+    // /api/health?deep=1 reports that field to diagnose server faults, and a
+    // caller's typo is not one.
+    console.error('[BadInput]', err.code, err.message);
+    return res.status(400).json({ error: clientMsg });
+  }
   console.error('[Error]', err);
   _last500 = {
     error: (err && (err.message || String(err))) || 'unknown',
@@ -289,6 +318,22 @@ function isOwnerUid(uid) {
   // would let a JSON body claim ownership through a route that passes one on.
   if (typeof uid !== 'string') return false;
   return OWNER_UIDS.includes(uid.toLowerCase());
+}
+
+/**
+ * True when this path param can name a row in a SERIAL-id table
+ * (jobs, escrows, applications, reviews, notifications, saved_searches…).
+ *
+ * Thirty-one routes guarded these with `isNaN(parseInt(req.params.id))`, and
+ * `parseInt('5abc')` is 5 — so '5abc' passed the guard, went into
+ * `WHERE id = $1` as the original string, and Postgres answered 22P02, which
+ * the caller saw as a 500. `'99999999999'` got past it the same way and earned
+ * 22003. Digits only, and inside int4, so neither reaches the database.
+ */
+function isIdParam(v) {
+  if (typeof v !== 'string' || !/^\d{1,10}$/.test(v)) return false;
+  const n = Number(v);
+  return n > 0 && n <= 2147483647;
 }
 
 /** Longest URL a portfolio link or work-item image may be. */
@@ -392,6 +437,7 @@ module.exports = {
   resolveWebhookStatus,
   ratingTarget,
   parseJobId,
+  isIdParam,
   normalizeId,
   safeHttpUrl,
   MAX_URL_LEN,

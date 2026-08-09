@@ -5,7 +5,7 @@ const logger = require('../src/logger');
 const router = require('express').Router();
 const jwt = require('jsonwebtoken');
 const { query, getPool } = require('../src/db');
-const { piApiRequest, audit, serverError, SANDBOX_MODE } = require('../src/helpers');
+const { isIdParam, piApiRequest, audit, serverError, SANDBOX_MODE } = require('../src/helpers');
 const { auth, softAuth, checkBlocked, authLimiter, JWT_SECRET } = require('../src/middleware');
 
 // ─── UID normalisation ────────────────────────────────────────────────────────
@@ -575,7 +575,7 @@ router.post('/api/users/me/portfolio/items', auth, checkBlocked, async (req, res
 
 // DELETE /api/users/me/portfolio/items/:id
 router.delete('/api/users/me/portfolio/items/:id', auth, async (req, res) => {
-  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Portfolio item not found' });
+  if (!isIdParam(req.params.id)) return res.status(404).json({ error: 'Portfolio item not found' });
   try {
     const result = await query('DELETE FROM portfolio_items WHERE id = $1 AND user_id = $2 RETURNING id', [req.params.id, req.userId]);
     if (!result.rows.length) return res.status(404).json({ error: 'Portfolio item not found' });

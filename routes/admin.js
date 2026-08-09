@@ -6,7 +6,7 @@ const router = require('express').Router();
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const { query, getPool } = require('../src/db');
-const { notify, audit, serverError, getPlatformFee, getDeveloperFee, invalidatePlatformFeeCache, invalidateConnectsEconomyCache, invalidateSupportUrlCache, FEE_MAX, DEV_FEE_MAX } = require('../src/helpers');
+const { isIdParam, notify, audit, serverError, getPlatformFee, getDeveloperFee, invalidatePlatformFeeCache, invalidateConnectsEconomyCache, invalidateSupportUrlCache, FEE_MAX, DEV_FEE_MAX } = require('../src/helpers');
 const { adminAuth, twinId, JWT_SECRET, ADMIN_API_KEY, timingSafeStrEqual, _rlBlocks } = require('../src/middleware');
 const { a2uEnabled, sendA2U } = require('../src/pi-a2u');
 
@@ -270,7 +270,7 @@ router.get('/api/admin/debug/connects/:userId', adminAuth, async (req, res) => {
 // PATCH /api/admin/jobs/:id/images — used by the image migration script to swap
 // base64 payloads for static file URLs without touching any other job fields.
 router.patch('/api/admin/jobs/:id/images', adminAuth, async (req, res) => {
-  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Job not found' });
+  if (!isIdParam(req.params.id)) return res.status(404).json({ error: 'Job not found' });
   const { images } = req.body;
   if (!Array.isArray(images)) return res.status(400).json({ error: 'images must be an array' });
   try {
@@ -283,7 +283,7 @@ router.patch('/api/admin/jobs/:id/images', adminAuth, async (req, res) => {
 
 // PATCH /api/admin/jobs/:id — update featured flag (and other admin-level job fields)
 router.patch('/api/admin/jobs/:id', adminAuth, async (req, res) => {
-  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Job not found' });
+  if (!isIdParam(req.params.id)) return res.status(404).json({ error: 'Job not found' });
   const { featured } = req.body;
   if (typeof featured !== 'boolean') return res.status(400).json({ error: 'featured (boolean) required' });
   try {
@@ -296,7 +296,7 @@ router.patch('/api/admin/jobs/:id', adminAuth, async (req, res) => {
 
 // DELETE /api/admin/jobs/:id
 router.delete('/api/admin/jobs/:id', adminAuth, async (req, res) => {
-  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Job not found' });
+  if (!isIdParam(req.params.id)) return res.status(404).json({ error: 'Job not found' });
   try {
     const fundedEscrow = await query("SELECT * FROM escrows WHERE job_id = $1 AND status = 'funded' LIMIT 1", [req.params.id]);
     const jobMeta = await query('SELECT apply_cost, posted_by FROM jobs WHERE id = $1', [req.params.id]);
@@ -369,7 +369,7 @@ router.get('/api/admin/escrows', adminAuth, async (req, res) => {
 
 // POST /api/admin/escrows/:id/resolve
 router.post('/api/admin/escrows/:id/resolve', adminAuth, async (req, res) => {
-  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Escrow not found' });
+  if (!isIdParam(req.params.id)) return res.status(404).json({ error: 'Escrow not found' });
   const { action, reason } = req.body;
   if (!['release_to_freelancer', 'refund_to_client'].includes(action)) {
     return res.status(400).json({ error: 'action must be release_to_freelancer or refund_to_client' });

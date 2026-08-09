@@ -43,7 +43,7 @@ const NODE_ENV = process.env.NODE_ENV || 'production';
 const { SANDBOX_MODE: IS_SANDBOX } = require('./src/helpers');
 if (NODE_ENV === 'production') {
   if (IS_SANDBOX) {
-    logger.warn('[WARN] SANDBOX_MODE is enabled — testnet mode active. Remove before switching to mainnet.');
+    logger.error('[WARN] SANDBOX_MODE is enabled — testnet mode active. Remove before switching to mainnet.');
   }
   if (!process.env.JWT_SECRET) {
     logger.error('[FATAL] JWT_SECRET env var is not set. Set a strong JWT_SECRET in Render env vars. Refusing to start.');
@@ -606,7 +606,7 @@ initDb().then(async () => {
     app.set('webpush', webpush);
     logger.info('[WorkPro API] Web Push VAPID configured');
   } else {
-    logger.warn('[WorkPro API] Web Push disabled — set VAPID_PUBLIC_KEY + VAPID_PRIVATE_KEY env vars');
+    logger.error('[WorkPro API] Web Push disabled — set VAPID_PUBLIC_KEY + VAPID_PRIVATE_KEY env vars');
     // Generate keys and print them to logs (one-time helper)
     if (process.env.GENERATE_VAPID === '1') {
       const keys = webpush.generateVAPIDKeys();
@@ -631,7 +631,7 @@ initDb().then(async () => {
     setInterval(() => {
       fetch(`${SELF_URL}/api/health`, { method: 'GET' })
         .then(r => logger.info(`[keep-alive] self-ping ${r.status}`))
-        .catch(e => logger.warn('[keep-alive] self-ping failed:', e.message));
+        .catch(e => logger.error('[keep-alive] self-ping failed:', e.message));
     }, 10 * 60 * 1000); // every 10 minutes
   }
 
@@ -681,7 +681,7 @@ initDb().then(async () => {
         } catch (e) {
           await client.query('ROLLBACK').catch(() => {});
           client.release();
-          logger.warn(`[auto-release] escrow ${escrow.id} failed:`, e.message);
+          logger.error(`[auto-release] escrow ${escrow.id} failed:`, e.message);
           continue;
         }
         client.release();
@@ -693,7 +693,7 @@ initDb().then(async () => {
             arTxid = r.txid;
             await arQuery('UPDATE users SET balance_pi = GREATEST(COALESCE(balance_pi,0) - $1, 0), updated_at = NOW() WHERE id = $2', [net, escrow.freelancer_id]).catch(() => {});
             await arQuery('UPDATE escrows SET payout_txid = $1, updated_at = NOW() WHERE id = $2', [arTxid, escrow.id]).catch(() => {});
-          } catch (e) { logger.warn(`[a2u] auto-release payout failed for escrow ${escrow.id}: ${e.message}`); }
+          } catch (e) { logger.error(`[a2u] auto-release payout failed for escrow ${escrow.id}: ${e.message}`); }
         }
         await arNotify(escrow.freelancer_id, 'payment', 'Авто-выплата эскроу', arTxid ? `${net}π отправлено на ваш Pi-кошелёк (14 дней без спора).` : `${net}π зачислено автоматически (14 дней без спора).`, escrow.job_id, null,
           { key: arTxid ? 'nAutoReleasedWallet' : 'nAutoReleasedBalance', params: { amount: net } }).catch(() => {});
@@ -729,7 +729,7 @@ initDb().then(async () => {
         } catch (e) {
           await cl.query('ROLLBACK').catch(() => {});
           cl.release();
-          logger.warn(`[auto-release] milestone ${m.id} failed:`, e.message);
+          logger.error(`[auto-release] milestone ${m.id} failed:`, e.message);
           continue;
         }
         cl.release();
@@ -739,7 +739,7 @@ initDb().then(async () => {
             const r = await arSendA2U(m.freelancer_id, msNet, 'WorkPro milestone payment', { type: 'milestone_auto_release', escrow_id: m.escrow_id, milestone_id: m.id });
             msTxid = r.txid;
             await arQuery('UPDATE users SET balance_pi = GREATEST(COALESCE(balance_pi,0) - $1, 0), updated_at = NOW() WHERE id = $2', [msNet, m.freelancer_id]).catch(() => {});
-          } catch (e) { logger.warn(`[a2u] milestone auto-release payout failed ${m.id}: ${e.message}`); }
+          } catch (e) { logger.error(`[a2u] milestone auto-release payout failed ${m.id}: ${e.message}`); }
         }
         await arNotify(m.freelancer_id, 'milestone_approved', 'Этап авто-выплачен', msTxid ? `${msNet}π за этап ${m.milestone_index + 1} отправлено на ваш Pi-кошелёк (14 дней без ответа заказчика).` : `${msNet}π зачислено за этап ${m.milestone_index + 1} автоматически.`, m.job_id, null,
           { key: msTxid ? 'nMilestoneAutoWallet' : 'nMilestoneAutoBalance', params: { amount: msNet, n: m.milestone_index + 1 } }).catch(() => {});
@@ -748,7 +748,7 @@ initDb().then(async () => {
         await arAudit('milestone_auto_released', { escrow_id: m.escrow_id, milestone_id: m.id, net_paid: msNet, payout_txid: msTxid }).catch(() => {});
         logger.info(`[auto-release] milestone ${m.id} released (${msNet}π)${msTxid ? ' + A2U ' + msTxid : ''}`);
       }
-    } catch (e) { logger.warn('[auto-release] sweep error:', e.message); }
+    } catch (e) { logger.error('[auto-release] sweep error:', e.message); }
   }
   const { checkSavedSearchAlerts } = require('./src/saved-search-alerts');
   const { sweepStuckPayments } = require('./src/stuck-payments');
@@ -756,10 +756,10 @@ initDb().then(async () => {
     await autoReleaseExpiredEscrows();
     await checkSavedSearchAlerts().then(r => {
       if (r.alerted) logger.info(`[saved-search] alerted ${r.alerted}/${r.total}`);
-    }).catch(e => logger.warn('[saved-search] sweep error:', e.message));
+    }).catch(e => logger.error('[saved-search] sweep error:', e.message));
     await sweepStuckPayments(logger).then(r => {
       if (r.checked) logger.info(`[stuck-payments] checked ${r.checked} → completed ${r.completed}, credited ${r.credited}, cancelled ${r.cancelled}, failed ${r.failed}`);
-    }).catch(e => logger.warn('[stuck-payments] sweep error:', e.message));
+    }).catch(e => logger.error('[stuck-payments] sweep error:', e.message));
   }
   if (NODE_ENV === 'production') {
     setInterval(hourlySweep, 60 * 60 * 1000); // hourly sweep

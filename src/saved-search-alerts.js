@@ -2,14 +2,24 @@
 // searches. Called from the hourly sweep in server.js (and the admin endpoint).
 const { query } = require('./db');
 const { notify } = require('./helpers');
+const logger = require('./logger');
 
 async function checkSavedSearchAlerts() {
   const searches = await query("SELECT * FROM saved_searches WHERE alert_enabled=TRUE AND (last_alerted_at IS NULL OR last_alerted_at < NOW() - INTERVAL '1 day')");
   let alerted = 0;
+  let failed = 0;
   for (const s of searches.rows) {
+    // Per search, not around the loop. query_params is user-supplied JSONB, so
+    // one row whose `q` is an object (or anything else plainto_tsquery refuses)
+    // used to throw out of the whole sweep — and every user ordered after that
+    // row silently stopped receiving alerts, every hour, indefinitely.
+    try {
     const params = s.query_params || {};
-    const q = params.q || params.search || '';
-    const cat = params.category || '';
+    // Coerced, because these reach plainto_tsquery and ILIKE as bind values:
+    // a nested object arrives as '[object Object]' and matches nothing, which
+    // is the right outcome for a search nobody can satisfy.
+    const q = String(params.q || params.search || '').slice(0, 200);
+    const cat = String(params.category || '').slice(0, 100);
     const conditions = ["status='open'"];
     const qParams = [];
     let idx = 1;
@@ -27,8 +37,12 @@ async function checkSavedSearchAlerts() {
       await query('UPDATE saved_searches SET last_alerted_at=NOW() WHERE id=$1', [s.id]);
       alerted++;
     }
+    } catch (e) {
+      failed++;
+      logger.error(`[saved-search] search ${s.id} (user ${s.user_id}) failed: ${e.message}`);
+    }
   }
-  return { alerted, total: searches.rows.length };
+  return { alerted, failed, total: searches.rows.length };
 }
 
 module.exports = { checkSavedSearchAlerts };

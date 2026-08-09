@@ -3,7 +3,7 @@
  */
 const router = require('express').Router();
 const { query } = require('../src/db');
-const { serverError } = require('../src/helpers');
+const { serverError, isIdParam } = require('../src/helpers');
 const { auth } = require('../src/middleware');
 
 // GET /api/notifications/unread-count (alias: /unread)
@@ -16,7 +16,11 @@ router.get(['/api/notifications/unread-count', '/api/notifications/unread'], aut
     const unread_count = parseInt(result.rows[0].count) || 0;
     res.json({ unread_count, count: unread_count });
   } catch (err) {
-    res.json({ unread_count: 0, count: 0 });
+    // Was `res.json({ unread_count: 0 })`: a failed query was indistinguishable
+    // from an empty inbox, and nothing was logged at all. App.tsx already
+    // `.catch(() => {})`s this call, so an error leaves the badge at its last
+    // known value — which is honest, where a fabricated 0 was not.
+    serverError(err, res);
   }
 });
 
@@ -38,7 +42,11 @@ router.get('/api/notifications', auth, async (req, res) => {
       offset,
     });
   } catch (err) {
-    res.json({ notifications: [], unread_count: 0, total: 0 });
+    // This returned an empty list with HTTP 200, so Notifications.tsx's
+    // `.catch(() => setLoadError(true))` could never fire and its error state
+    // was unreachable code: when the query failed the user was shown "No
+    // notifications" and had no way to tell that from actually having none.
+    serverError(err, res);
   }
 });
 
@@ -48,13 +56,19 @@ router.post(['/api/notifications/mark-read', '/api/notifications/read-all'], aut
     await query('UPDATE notifications SET is_read = true WHERE user_id = $1 AND is_read = false', [req.userId]);
     res.json({ success: true });
   } catch (err) {
-    res.json({ success: true });
+    // Reporting success for a write that did not happen. The client cleared the
+    // badge on that answer and the rows stayed unread, so the count reappeared
+    // on the next load — and Notifications.tsx's markAll() rollback, which
+    // exists for exactly this, never ran because the call had "succeeded".
+    serverError(err, res);
   }
 });
 
 // POST /api/notifications/:id/read
 router.post('/api/notifications/:id/read', auth, async (req, res) => {
-  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Notification not found' });
+  // `isNaN(parseInt('5abc'))` is false, so '5abc' passed this guard and went
+  // into `WHERE id = $1`, where Postgres refused the cast.
+  if (!isIdParam(req.params.id)) return res.status(404).json({ error: 'Notification not found' });
   try {
     const result = await query(
       'UPDATE notifications SET is_read = true WHERE id = $1 AND user_id = $2 RETURNING id',
@@ -67,7 +81,7 @@ router.post('/api/notifications/:id/read', auth, async (req, res) => {
 
 // DELETE /api/notifications/:id
 router.delete('/api/notifications/:id', auth, async (req, res) => {
-  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Notification not found' });
+  if (!isIdParam(req.params.id)) return res.status(404).json({ error: 'Notification not found' });
   try {
     const result = await query(
       'DELETE FROM notifications WHERE id = $1 AND user_id = $2 RETURNING id',

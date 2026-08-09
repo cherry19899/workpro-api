@@ -162,7 +162,10 @@ router.post('/api/chat/rooms/:id/messages', auth, checkBlocked, messageLimiter, 
 router.post('/api/chat/start', auth, checkBlocked, messageLimiter, async (req, res) => {
   const { other_user_id, job_id } = req.body;
   if (!other_user_id) return res.status(400).json({ error: 'other_user_id required' });
-  if (other_user_id === req.userId) return res.status(400).json({ error: 'Cannot start a chat with yourself' });
+  // normalizeId, not ===: this refusal fails *open* when it is strict, so
+  // passing your own id with different casing opened a chat room with yourself
+  // — which every "who is the other participant?" lookup then reads wrong.
+  if (normalizeId(other_user_id) === normalizeId(req.userId)) return res.status(400).json({ error: 'Cannot start a chat with yourself' });
   try {
     const otherExists = await query('SELECT id FROM users WHERE id = $1 LIMIT 1', [other_user_id]);
     if (!otherExists.rows.length) return res.status(404).json({ error: 'User not found' });
@@ -322,7 +325,10 @@ router.get('/api/chat/unread', auth, async (req, res) => {
       [req.userId]
     );
     res.json({ count: parseInt(result.rows[0].count) });
-  } catch (err) { res.json({ count: 0 }); }
+    // Was `res.json({ count: 0 })`: a failed query looked exactly like an empty
+    // inbox and logged nothing at all. App.tsx `.catch(() => {})`s this, so an
+    // error leaves the badge at its last value instead of falsely clearing it.
+  } catch (err) { serverError(err, res); }
 });
 
 // GET /api/chat/unread/:roomId
@@ -340,7 +346,7 @@ router.get('/api/chat/unread/:roomId', auth, async (req, res) => {
       [req.params.roomId, req.userId]
     );
     res.json({ count: parseInt(result.rows[0].count) });
-  } catch (err) { res.json({ count: 0 }); }
+  } catch (err) { serverError(err, res); }
 });
 
 // POST /api/chat/read-all

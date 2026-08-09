@@ -4,7 +4,7 @@ const logger = require('../src/logger');
  */
 const router = require('express').Router();
 const { query } = require('../src/db');
-const { notify, serverError, safeHttpUrl, MAX_URL_LEN, isOwnerUid, OWNER_USERNAME, ratingTarget, parseJobId } = require('../src/helpers');
+const { notify, serverError, safeHttpUrl, MAX_URL_LEN, isOwnerUid, OWNER_USERNAME, ratingTarget, parseJobId, isIdParam } = require('../src/helpers');
 const { auth, softAuth, checkBlocked, adminAuth } = require('../src/middleware');
 
 const normalizeId = (id) => (id || '').toString().toLowerCase().replace(/^pi_/, '');
@@ -442,7 +442,10 @@ router.put('/api/reviews/:id/reply', auth, checkBlocked, async (req, res) => {
     const result = await query('SELECT * FROM ratings WHERE id=$1', [id]);
     if (!result.rows.length) return res.status(404).json({ error: 'Review not found' });
     const rev = result.rows[0];
-    if (rev.to_user_id !== req.userId) return res.status(403).json({ error: 'Only the reviewed user can reply' });
+    // normalizeId, not ===: ids are compared case- and pi_-insensitively
+    // everywhere else, so a reviewed user whose id is stored with different
+    // casing than their token carries was refused a reply to their own review.
+    if (normalizeId(rev.to_user_id) !== normalizeId(req.userId)) return res.status(403).json({ error: 'Only the reviewed user can reply' });
     if (rev.reply) return res.status(400).json({ error: 'Reply already submitted' });
     const updated = await query('UPDATE ratings SET reply=$1, replied_at=NOW() WHERE id=$2 RETURNING *', [reply.trim(), id]);
     res.json({ review: updated.rows[0], success: true });
@@ -460,7 +463,10 @@ router.post('/api/ratings/:id/reply', auth, checkBlocked, async (req, res) => {
     const result = await query('SELECT * FROM ratings WHERE id=$1', [id]);
     if (!result.rows.length) return res.status(404).json({ error: 'Review not found' });
     const rev = result.rows[0];
-    if (rev.to_user_id !== req.userId) return res.status(403).json({ error: 'Only the reviewed user can reply' });
+    // normalizeId, not ===: ids are compared case- and pi_-insensitively
+    // everywhere else, so a reviewed user whose id is stored with different
+    // casing than their token carries was refused a reply to their own review.
+    if (normalizeId(rev.to_user_id) !== normalizeId(req.userId)) return res.status(403).json({ error: 'Only the reviewed user can reply' });
     if (rev.reply) return res.status(400).json({ error: 'Reply already submitted' });
     const updated = await query('UPDATE ratings SET reply=$1, replied_at=NOW() WHERE id=$2 RETURNING *', [reply.trim(), id]);
     res.json({ review: updated.rows[0], success: true });
@@ -655,12 +661,24 @@ router.get('/api/saved-searches', auth, async (req, res) => {
 router.post('/api/saved-searches', auth, checkBlocked, async (req, res) => {
   const { name, query_params, alert_enabled } = req.body;
   if (!query_params) return res.status(400).json({ error: 'query_params required' });
+  // name is VARCHAR(255): a longer one was refused by Postgres, which reaches
+  // the caller as a 500 rather than as this message.
+  const searchName = String(name || '').trim() || 'Search ' + Date.now();
+  if (searchName.length > 200) return res.status(400).json({ error: 'Name too long (max 200)' });
+  // query_params is JSONB with no size of its own, and 20 of them per user is
+  // only a cap on the count. It is also read back by the hourly alert sweep,
+  // so it has to be a plain object rather than whatever the body sent.
+  if (typeof query_params !== 'object' || Array.isArray(query_params)) {
+    return res.status(400).json({ error: 'query_params must be an object' });
+  }
+  const paramsJson = JSON.stringify(query_params);
+  if (paramsJson.length > 4000) return res.status(400).json({ error: 'Search is too large (max 4000 characters)' });
   try {
     const count = await query('SELECT COUNT(*) FROM saved_searches WHERE user_id=$1', [req.userId]);
     if (parseInt(count.rows[0].count) >= 20) return res.status(400).json({ error: 'Max 20 saved searches' });
     const r = await query(
       'INSERT INTO saved_searches (user_id, name, query_params, alert_enabled) VALUES ($1,$2,$3,$4) RETURNING *',
-      [req.userId, name || 'Search ' + Date.now(), JSON.stringify(query_params), !!alert_enabled]
+      [req.userId, searchName, paramsJson, !!alert_enabled]
     );
     res.json({ saved_search: r.rows[0] });
   } catch (err) { serverError(err, res); }
@@ -668,6 +686,7 @@ router.post('/api/saved-searches', auth, checkBlocked, async (req, res) => {
 
 // DELETE /api/saved-searches/:id
 router.delete('/api/saved-searches/:id', auth, async (req, res) => {
+  if (!isIdParam(req.params.id)) return res.status(404).json({ error: 'Saved search not found' });
   try {
     await query('DELETE FROM saved_searches WHERE id=$1 AND user_id=$2', [req.params.id, req.userId]);
     res.json({ success: true });

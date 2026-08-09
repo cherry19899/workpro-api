@@ -5,7 +5,7 @@ const router = require('express').Router();
 const crypto = require('crypto');
 const { query, getPool } = require('../src/db');
 const logger = require('../src/logger');
-const { notify, audit, serverError, getPlatformFee , getConnectsEconomy, applyCostFor, getSupportUrl } = require('../src/helpers');
+const { isIdParam, notify, audit, serverError, getPlatformFee , getConnectsEconomy, applyCostFor, getSupportUrl } = require('../src/helpers');
 const { auth, softAuth, checkBlocked, jobPostLimiter } = require('../src/middleware');
 const { processJobImages } = require('../src/github-images');
 const { a2uEnabled, sendA2U } = require('../src/pi-a2u');
@@ -298,7 +298,7 @@ router.get('/api/jobs/my', auth, async (req, res) => {
 
 // GET /api/jobs/:id
 router.get('/api/jobs/:id', softAuth, async (req, res) => {
-  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Job not found' });
+  if (!isIdParam(req.params.id)) return res.status(404).json({ error: 'Job not found' });
   try {
     const jobResult = await query('SELECT * FROM jobs WHERE id = $1', [req.params.id]);
     if (!jobResult.rows.length) return res.status(404).json({ error: 'Job not found' });
@@ -324,7 +324,7 @@ router.get('/api/jobs/:id', softAuth, async (req, res) => {
 
 // PATCH /api/jobs/:id — freelancer submits work
 router.patch('/api/jobs/:id', auth, checkBlocked, async (req, res) => {
-  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Job not found' });
+  if (!isIdParam(req.params.id)) return res.status(404).json({ error: 'Job not found' });
   try {
     const jobResult = await query('SELECT * FROM jobs WHERE id = $1', [req.params.id]);
     if (!jobResult.rows.length) return res.status(404).json({ error: 'Job not found' });
@@ -351,7 +351,7 @@ router.patch('/api/jobs/:id', auth, checkBlocked, async (req, res) => {
 
 // PUT /api/jobs/:id — update job (open jobs only)
 router.put('/api/jobs/:id', auth, checkBlocked, async (req, res) => {
-  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Job not found' });
+  if (!isIdParam(req.params.id)) return res.status(404).json({ error: 'Job not found' });
   const { title, description, category, budget, skills, deadline, images } = req.body;
   try {
     const jobResult = await query('SELECT * FROM jobs WHERE id = $1', [req.params.id]);
@@ -428,7 +428,7 @@ router.put('/api/jobs/:id', auth, checkBlocked, async (req, res) => {
 
 // GET /api/jobs/:id/check-applied
 router.get('/api/jobs/:id/check-applied', auth, async (req, res) => {
-  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Job not found' });
+  if (!isIdParam(req.params.id)) return res.status(404).json({ error: 'Job not found' });
   try {
     const result = await query(
       "SELECT id, status FROM applications WHERE job_id = $1 AND freelancer_id = $2 AND status NOT IN ('withdrawn','rejected','offer','declined') LIMIT 1",
@@ -440,7 +440,7 @@ router.get('/api/jobs/:id/check-applied', auth, async (req, res) => {
 
 // POST /api/jobs/:id/apply
 router.post('/api/jobs/:id/apply', auth, checkBlocked, async (req, res) => {
-  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Job not found' });
+  if (!isIdParam(req.params.id)) return res.status(404).json({ error: 'Job not found' });
   if (req.body.message && req.body.message.length > 2000) {
     return res.status(400).json({ error: 'Cover letter too long (max 2000 chars)' });
   }
@@ -553,7 +553,7 @@ router.post('/api/jobs/:id/apply', auth, checkBlocked, async (req, res) => {
 
 // POST /api/jobs/:id/hire
 router.post('/api/jobs/:id/hire', auth, checkBlocked, async (req, res) => {
-  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Job not found' });
+  if (!isIdParam(req.params.id)) return res.status(404).json({ error: 'Job not found' });
   const { application_id, freelancer_id, payment_id } = req.body;
   if (!application_id || !freelancer_id || !payment_id) return res.status(400).json({ error: 'application_id, freelancer_id, and payment_id required' });
   try {
@@ -643,7 +643,7 @@ router.post('/api/jobs/:id/hire', auth, checkBlocked, async (req, res) => {
 // Marks the job done AND automatically releases the funded escrow (Pi goes to freelancer).
 // The two actions are intentionally merged: completing a job = accepting the work = paying the freelancer.
 router.post('/api/jobs/:id/complete', auth, checkBlocked, async (req, res) => {
-  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Job not found' });
+  if (!isIdParam(req.params.id)) return res.status(404).json({ error: 'Job not found' });
   try {
     const jobResult = await query('SELECT * FROM jobs WHERE id = $1', [req.params.id]);
     if (!jobResult.rows.length) return res.status(404).json({ error: 'Job not found' });
@@ -720,7 +720,7 @@ router.post('/api/jobs/:id/complete', auth, checkBlocked, async (req, res) => {
 
 // DELETE /api/jobs/:id
 router.delete('/api/jobs/:id', auth, checkBlocked, async (req, res) => {
-  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Job not found' });
+  if (!isIdParam(req.params.id)) return res.status(404).json({ error: 'Job not found' });
   try {
     const jobResult = await query('SELECT * FROM jobs WHERE id = $1', [req.params.id]);
     if (!jobResult.rows.length) return res.status(404).json({ error: 'Job not found' });
@@ -747,7 +747,7 @@ router.delete('/api/jobs/:id', auth, checkBlocked, async (req, res) => {
 
 // GET /api/jobs/:id/applications
 router.get('/api/jobs/:id/applications', auth, async (req, res) => {
-  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Job not found' });
+  if (!isIdParam(req.params.id)) return res.status(404).json({ error: 'Job not found' });
   const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 100, 500));
   const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
@@ -911,6 +911,7 @@ router.get('/api/applications/user/:userId', auth, async (req, res) => {
 
 // GET /api/applications/job/:jobId
 router.get('/api/applications/job/:jobId', auth, async (req, res) => {
+  if (!isIdParam(req.params.jobId)) return res.status(404).json({ error: 'Job not found' });
   const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 50, 200));
   const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
@@ -927,7 +928,7 @@ router.get('/api/applications/job/:jobId', auth, async (req, res) => {
 
 // PATCH /api/applications/:id
 router.patch('/api/applications/:id', auth, checkBlocked, async (req, res) => {
-  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Application not found' });
+  if (!isIdParam(req.params.id)) return res.status(404).json({ error: 'Application not found' });
   const { status } = req.body;
   const OWNER_ALLOWED = ['accepted', 'rejected'];
   if (!OWNER_ALLOWED.includes(status)) return res.status(400).json({ error: `Invalid status. Allowed: ${OWNER_ALLOWED.join(', ')}` });
@@ -996,7 +997,7 @@ router.patch('/api/applications/:id', auth, checkBlocked, async (req, res) => {
 
 // POST /api/applications/:id/accept
 router.post('/api/applications/:id/accept', auth, checkBlocked, async (req, res) => {
-  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Application not found' });
+  if (!isIdParam(req.params.id)) return res.status(404).json({ error: 'Application not found' });
   try {
     const appResult = await query(
       'SELECT a.*, j.posted_by, j.budget, j.title FROM applications a JOIN jobs j ON a.job_id = j.id WHERE a.id = $1',
@@ -1072,7 +1073,7 @@ router.post('/api/applications/:id/accept', auth, checkBlocked, async (req, res)
 
 // POST /api/applications/:id/reject
 router.post('/api/applications/:id/reject', auth, checkBlocked, async (req, res) => {
-  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Application not found' });
+  if (!isIdParam(req.params.id)) return res.status(404).json({ error: 'Application not found' });
   try {
     const appResult = await query('SELECT a.*, j.posted_by, j.apply_cost FROM applications a JOIN jobs j ON a.job_id = j.id WHERE a.id = $1', [req.params.id]);
     if (!appResult.rows.length) return res.status(404).json({ error: 'Application not found' });
@@ -1100,7 +1101,7 @@ router.post('/api/applications/:id/reject', auth, checkBlocked, async (req, res)
 
 // POST /api/applications/:id/withdraw
 router.post('/api/applications/:id/withdraw', auth, checkBlocked, async (req, res) => {
-  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Application not found' });
+  if (!isIdParam(req.params.id)) return res.status(404).json({ error: 'Application not found' });
   try {
     const appResult = await query('SELECT a.*, j.apply_cost FROM applications a JOIN jobs j ON a.job_id = j.id WHERE a.id = $1', [req.params.id]);
     if (!appResult.rows.length) return res.status(404).json({ error: 'Application not found' });
@@ -1124,7 +1125,7 @@ router.post('/api/applications/:id/withdraw', auth, checkBlocked, async (req, re
 
 // PUT /api/applications/:id/status
 router.put('/api/applications/:id/status', auth, checkBlocked, async (req, res) => {
-  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Application not found' });
+  if (!isIdParam(req.params.id)) return res.status(404).json({ error: 'Application not found' });
   const { status } = req.body;
   const OWNER_ALLOWED = ['accepted', 'rejected'];
   if (!OWNER_ALLOWED.includes(status)) return res.status(400).json({ error: `Invalid status. Job owners may set: ${OWNER_ALLOWED.join(', ')}` });
@@ -1190,7 +1191,7 @@ router.put('/api/applications/:id/status', auth, checkBlocked, async (req, res) 
 
 // POST /api/applications/:id/hire — initiate Pi escrow for hired freelancer
 router.post('/api/applications/:id/hire', auth, checkBlocked, async (req, res) => {
-  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Application not found' });
+  if (!isIdParam(req.params.id)) return res.status(404).json({ error: 'Application not found' });
   const { payment_id } = req.body;
   if (!payment_id) return res.status(400).json({ error: 'payment_id required — Pi payment must be completed before hiring' });
   try {
@@ -1269,7 +1270,7 @@ router.post('/api/applications/:id/hire', auth, checkBlocked, async (req, res) =
 
 // POST /api/applications/:id/view
 router.post('/api/applications/:id/view', auth, async (req, res) => {
-  if (isNaN(parseInt(req.params.id))) return res.status(404).json({ error: 'Application not found' });
+  if (!isIdParam(req.params.id)) return res.status(404).json({ error: 'Application not found' });
   try {
     const appRes = await query(
       'SELECT j.posted_by FROM applications a JOIN jobs j ON a.job_id = j.id WHERE a.id = $1',
