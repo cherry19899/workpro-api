@@ -95,6 +95,11 @@ test('naming no job at all is allowed — that is the general-review path', () =
   assert.equal(parseJobId(undefined), null);
   assert.equal(parseJobId(null), null);
   assert.equal(parseJobId(''), null);
+  // The rating modal sends `job_id: e.job_id || 0` for an escrow with no job,
+  // and the old `if (job_id)` read that 0 as "no job". Rejecting it would have
+  // broken review submission for every already-deployed bundle.
+  assert.equal(parseJobId(0), null);
+  assert.equal(parseJobId('0'), null);
 });
 
 test('a value that is present but is not a job id is rejected', () => {
@@ -120,7 +125,7 @@ test('an id past int4 is refused here rather than by Postgres', () => {
 });
 
 test('ids that cannot exist are rejected rather than queried', () => {
-  for (const bad of [0, -1, '0', '-7', 1.5, '3.5', Infinity, NaN]) {
+  for (const bad of [-1, '-7', 1.5, '3.5', Infinity, NaN]) {
     assert.ok(Number.isNaN(parseJobId(bad)), `${bad} must not read as a job id`);
   }
 });

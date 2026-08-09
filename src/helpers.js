@@ -332,7 +332,10 @@ const normalizeId = (id) => (id || '').toString().toLowerCase().replace(/^pi_/, 
  * Postgres refused the cast and the caller got a 500 instead of a 400.
  */
 function parseJobId(v) {
-  if (v === undefined || v === null || v === '') return null;
+  // 0 included: jobs.id is a SERIAL so there is no job 0, and the app's own
+  // callers send `job_id: e.job_id || 0` when an escrow carries no job. That
+  // used to reach `if (job_id)` and read as "no job named", and it still must.
+  if (v === undefined || v === null || v === '' || v === 0 || v === '0') return null;
   // jobs.id is a SERIAL, so anything past int4 is not a job that can exist and
   // handing it to Postgres earns "value out of range for type integer" — a 500
   // where this function can say 400.
