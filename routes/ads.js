@@ -9,7 +9,7 @@
  */
 const express = require('express');
 const router = express.Router();
-const { query } = require('../db');
+const { query, getPool } = require('../db');
 const { piApiRequest, audit, serverError } = require('../src/helpers');
 const { auth, checkBlocked } = require('../src/middleware');
 const logger = require('../src/logger');
@@ -41,7 +41,9 @@ router.post('/api/ads/reward', auth, checkBlocked, async (req, res) => {
     try {
       status = await piApiRequest(`/v2/ads_network/status/${encodeURIComponent(adId)}`);
     } catch (e) {
-      logger.warn('[ads] verification failed for %s: %s', adId, e.message);
+      // .error, not .warn: warn is a no-op under NODE_ENV=production, so every
+      // failed verification against Pi printed nothing at all on Render.
+      logger.error(`[ads] verification failed for ${adId}: ${e.message}`);
       return res.status(502).json({ error: 'Could not verify the ad with Pi. Try again shortly.' });
     }
     if (status?.mediator_ack_status !== 'granted') {
@@ -50,24 +52,39 @@ router.post('/api/ads/reward', auth, checkBlocked, async (req, res) => {
 
     // The insert is the lock: a duplicate adId violates the primary key, so a
     // replayed or raced request can never credit connects twice.
+    //
+    // In one transaction with the balance update, because the two were separate
+    // statements before: if the UPDATE failed, the ad_rewards row survived, so
+    // the ad was spent — it counted against the daily cap and the primary key
+    // barred it from ever being redeemed again — while no connect was granted.
+    // The user watched the ad and got nothing, permanently.
+    const pgAds = await getPool().connect();
+    let balance = null;
     try {
-      await query('INSERT INTO ad_rewards (ad_id, user_id, connects, created_at) VALUES ($1,$2,$3,NOW())',
+      await pgAds.query('BEGIN');
+      await pgAds.query('INSERT INTO ad_rewards (ad_id, user_id, connects, created_at) VALUES ($1,$2,$3,NOW())',
         [adId, req.userId, REWARD_CONNECTS]);
+      const upd = await pgAds.query(
+        'UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2 RETURNING balance_connects',
+        [REWARD_CONNECTS, req.userId]
+      );
+      // No row updated means no such user, which must not leave a reward behind.
+      if (!upd.rows.length) throw new Error(`ad reward for unknown user ${req.userId}`);
+      await pgAds.query('COMMIT');
+      balance = upd.rows[0].balance_connects;
     } catch (e) {
+      await pgAds.query('ROLLBACK').catch(() => {});
       if (e.code === '23505') return res.status(409).json({ error: 'This ad was already redeemed' });
       throw e;
+    } finally {
+      pgAds.release();
     }
-
-    const upd = await query(
-      'UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2 RETURNING balance_connects',
-      [REWARD_CONNECTS, req.userId]
-    );
     await audit('ad_reward_granted', { user_id: req.userId, ad_id: adId, connects: REWARD_CONNECTS });
 
     res.json({
       success: true,
       connects_added: REWARD_CONNECTS,
-      balance_connects: upd.rows[0]?.balance_connects ?? null,
+      balance_connects: balance,
       remaining_today: Math.max(0, DAILY_AD_LIMIT - parseInt(today.rows[0].count, 10) - 1),
     });
   } catch (err) { serverError(err, res); }
