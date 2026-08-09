@@ -139,13 +139,29 @@ function softAuth(req, res, next) {
   next();
 }
 
+/**
+ * Constant-time compare of a caller-supplied secret against the real one.
+ *
+ * The call sites used to gate timingSafeEqual on `a.length === b.length` —
+ * *string* length — then hand it Buffers. A token of N multi-byte characters
+ * passes that gate and produces a Buffer of 2N bytes, and timingSafeEqual
+ * throws RangeError on mismatched byte lengths: inside an async handler that
+ * becomes an unhandled rejection and the request never answers. Comparing the
+ * Buffers' own lengths makes the mismatch a plain `false`.
+ */
+function timingSafeStrEqual(a, b) {
+  const bufA = Buffer.from(String(a || ''), 'utf8');
+  const bufB = Buffer.from(String(b || ''), 'utf8');
+  if (bufA.length === 0 || bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
 async function adminAuth(req, res, next) {
   const authHeader = req.headers['authorization'] || '';
   const rawKey = req.headers['x-admin-key'] || req.query.admin_key || '';
   // Path 1: shared ADMIN_API_KEY secret (for direct API / scripts)
   let key = rawKey || (authHeader.startsWith('Bearer ') ? authHeader.slice(7) : authHeader);
-  const keyOk = key.length > 0 && key.length === ADMIN_API_KEY.length &&
-    crypto.timingSafeEqual(Buffer.from(key), Buffer.from(ADMIN_API_KEY));
+  const keyOk = timingSafeStrEqual(key, ADMIN_API_KEY);
   if (keyOk) {
     req.isAdmin = true;
     return next();
@@ -228,5 +244,6 @@ module.exports = {
   jobPostLimiter,
   JWT_SECRET,
   ADMIN_API_KEY,
+  timingSafeStrEqual,
   _rlBlocks,
 };

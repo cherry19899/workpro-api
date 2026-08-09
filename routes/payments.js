@@ -6,7 +6,7 @@ const router = require('express').Router();
 const crypto = require('crypto');
 const fetch = require('node-fetch');
 const { query, getPool } = require('../src/db');
-const { piApprovePayment, piCompletePayment, piGetPayment, notify, audit, serverError, PI_API_KEY, PI_API_BASE, getPlatformFee } = require('../src/helpers');
+const { piApprovePayment, piCompletePayment, piGetPayment, notify, audit, serverError, resolveWebhookStatus, PI_API_KEY, PI_API_BASE, getPlatformFee } = require('../src/helpers');
 const { auth, softAuth, checkBlocked } = require('../src/middleware');
 const { a2uEnabled, sendA2U } = require('../src/pi-a2u');
 
@@ -368,10 +368,21 @@ router.post('/api/payments/:paymentId/cancelled', softAuth, async (req, res) => 
   } catch (err) { res.json({ success: true }); }
 });
 
-// POST /api/payments/:paymentId/resolve-incomplete — no auth, called from onIncompletePaymentFound
+// POST /api/payments/:paymentId/resolve-incomplete — called from onIncompletePaymentFound.
 // Tries to approve+complete (or just approve) the stuck payment via Pi API so Pi SDK unblocks.
-router.post('/api/payments/:paymentId/resolve-incomplete', async (req, res) => {
+//
+// It cannot require `auth`: the Pi SDK fires onIncompletePaymentFound during
+// Pi.authenticate(), before this backend has issued a JWT, and the SDK refuses
+// to create new payments until the stale one is resolved. So it takes softAuth
+// and enforces ownership only when it knows who is calling — but it no longer
+// trusts *any* caller with the cancel path (see the tail of the handler).
+router.post('/api/payments/:paymentId/resolve-incomplete', softAuth, async (req, res) => {
   const paymentId = req.params.paymentId;
+  const owner = await query('SELECT user_id FROM payments WHERE id = $1', [paymentId]).catch(() => ({ rows: [] }));
+  const ownerId = owner.rows[0]?.user_id;
+  if (req.userId && ownerId && normalizeId(ownerId) !== normalizeId(req.userId)) {
+    return res.status(403).json({ error: 'Payment does not belong to you' });
+  }
   try {
     let piPayment = null;
     if (PI_API_KEY) {
@@ -401,9 +412,20 @@ router.post('/api/payments/:paymentId/resolve-incomplete', async (req, res) => {
         }
       }
     }
-    await query(`UPDATE payments SET status='cancelled', updated_at=NOW() WHERE id=$1`, [paymentId]).catch(() => {});
-    res.json({ success: true });
-  } catch (err) { res.json({ success: true }); }
+    // Only Pi gets to declare a payment dead. This used to cancel the row
+    // unconditionally — including when the Pi lookup simply failed or
+    // PI_API_KEY was unset — so a caller with someone else's payment id could
+    // cancel a pending payment, and a transient Pi outage cancelled the user's
+    // own payment out from under them.
+    const cancelled = piPayment?.status?.cancelled || piPayment?.status?.user_cancelled;
+    if (piPayment && cancelled) {
+      await query(`UPDATE payments SET status='cancelled', updated_at=NOW() WHERE id=$1`, [paymentId]).catch(() => {});
+      return res.json({ success: true, status: 'cancelled' });
+    }
+    // Nothing conclusive: leave the row alone. The hourly stuck-payments sweep
+    // reconciles it later against Pi rather than guessing here.
+    res.json({ success: true, status: 'unresolved' });
+  } catch (err) { res.json({ success: true, status: 'unresolved' }); }
 });
 
 // POST /api/payments/clear-pending
@@ -1135,19 +1157,33 @@ router.post('/api/payments/webhook', async (req, res) => {
     if (!payment_id) return res.status(400).json({ error: 'payment_id required' });
     const validStatuses = ['completed', 'cancelled', 'failed'];
     if (status && !validStatuses.includes(status)) return res.status(400).json({ error: 'Invalid status' });
-    // Verify with Pi API before trusting the webhook
+    // Verify with Pi API before trusting the webhook.
+    //
+    // This endpoint is unauthenticated and there is no signature to check, so
+    // Pi's own answer is the only thing that may decide the status. The old
+    // code fell back to `status || 'completed'` whenever the lookup came back
+    // empty — and the lookup comes back empty on any network blip, or if
+    // PI_API_KEY is unset — which let an anonymous POST of
+    // {payment_id, status:'completed', txid:'…'} mark any payment paid.
     let piPayment = null;
     if (PI_API_KEY) {
       try { piPayment = await piGetPayment(payment_id); } catch (_) {}
     }
-    const resolvedStatus = piPayment?.status?.developer_completed ? 'completed'
-      : piPayment?.status?.cancelled ? 'cancelled'
-      : status || 'completed';
+    if (!piPayment) {
+      await audit('webhook_payment_unverified', { payment_id, claimed_status: status });
+      return res.status(502).json({ error: 'Could not verify payment with Pi — not applied' });
+    }
+    const resolvedStatus = resolveWebhookStatus(piPayment);
+    if (!resolvedStatus) {
+      return res.json({ success: true, payment_id, status: 'pending', applied: false });
+    }
+    // Only Pi's txid is trusted — the request body's is attacker-controlled.
+    const verifiedTxid = piPayment.transaction?.txid || null;
     await query(
       `UPDATE payments SET status = $1, txid = COALESCE($2, txid), updated_at = NOW() WHERE id = $3`,
-      [resolvedStatus, txid || null, payment_id]
+      [resolvedStatus, verifiedTxid, payment_id]
     );
-    await audit('webhook_payment_update', { payment_id, status: resolvedStatus, txid });
+    await audit('webhook_payment_update', { payment_id, status: resolvedStatus, txid: verifiedTxid });
     res.json({ success: true, payment_id, status: resolvedStatus });
   } catch (err) { serverError(err, res); }
 });
@@ -1308,8 +1344,10 @@ router.post('/api/escrows/:id/milestone/:milestoneId/approve', auth, checkBlocke
 // POST /api/saved-searches/check-alerts (internal — requires admin key)
 router.post('/api/saved-searches/check-alerts', async (req, res) => {
   const key = req.headers['x-admin-key'] || '';
-  const { ADMIN_API_KEY } = require('../src/middleware');
-  if (!key || key !== ADMIN_API_KEY) return res.status(403).json({ error: 'Forbidden' });
+  const { ADMIN_API_KEY, timingSafeStrEqual } = require('../src/middleware');
+  // `!==` on secrets leaks length and prefix through timing; use the same
+  // constant-time compare the admin middleware uses.
+  if (!timingSafeStrEqual(key, ADMIN_API_KEY)) return res.status(403).json({ error: 'Forbidden' });
   try {
     const { checkSavedSearchAlerts } = require('../src/saved-search-alerts');
     res.json(await checkSavedSearchAlerts());

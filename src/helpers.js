@@ -254,10 +254,32 @@ function resolveUserIdFromBody(body) {
     || null;
 }
 
+/**
+ * What a Pi payment lookup entitles us to write to the payments table.
+ *
+ * /api/payments/webhook is unauthenticated and Pi sends no signature, so the
+ * request body is entirely attacker-controlled: the only trustworthy input is
+ * what Pi itself says when we ask. The webhook used to fall back to
+ * `status || 'completed'` from the body whenever the lookup returned nothing —
+ * which is any network blip, or an unset PI_API_KEY — so an anonymous POST of
+ * {payment_id, status:'completed'} could mark a payment paid.
+ *
+ * Returns 'completed' | 'cancelled' | null (nothing conclusive — leave the row
+ * alone), or throws nothing. A null piPayment means "could not verify".
+ */
+function resolveWebhookStatus(piPayment) {
+  if (!piPayment) return null;
+  const st = piPayment.status || {};
+  if (st.developer_completed) return 'completed';
+  if (st.cancelled || st.user_cancelled) return 'cancelled';
+  return null;
+}
+
 module.exports = {
   piApiRequest,
   piApprovePayment,
   piCompletePayment,
+  resolveWebhookStatus,
   piGetPayment,
   notify,
   audit,

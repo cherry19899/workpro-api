@@ -7,7 +7,7 @@ const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const { query, getPool } = require('../src/db');
 const { notify, audit, serverError, getPlatformFee, getDeveloperFee, invalidatePlatformFeeCache, invalidateConnectsEconomyCache, invalidateSupportUrlCache, FEE_MAX, DEV_FEE_MAX } = require('../src/helpers');
-const { adminAuth, twinId, JWT_SECRET, ADMIN_API_KEY, _rlBlocks } = require('../src/middleware');
+const { adminAuth, twinId, JWT_SECRET, ADMIN_API_KEY, timingSafeStrEqual, _rlBlocks } = require('../src/middleware');
 const { a2uEnabled, sendA2U } = require('../src/pi-a2u');
 
 // In-memory cache for stats (5-minute TTL)
@@ -545,8 +545,7 @@ router.get('/api/admin/verify', async (req, res) => {
   const authHeader = req.headers['authorization'] || '';
   const rawKey = req.headers['x-admin-key'] || req.query.admin_key || '';
   let token = rawKey || (authHeader.startsWith('Bearer ') ? authHeader.slice(7) : authHeader);
-  const keyValid = token.length > 0 && token.length === ADMIN_API_KEY.length &&
-    crypto.timingSafeEqual(Buffer.from(token), Buffer.from(ADMIN_API_KEY));
+  const keyValid = timingSafeStrEqual(token, ADMIN_API_KEY);
   if (keyValid) return res.json({ valid: true });
   if (authHeader.startsWith('Bearer ')) {
     try {
