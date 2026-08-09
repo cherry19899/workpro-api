@@ -5,7 +5,7 @@ const logger = require('../src/logger');
 const router = require('express').Router();
 const { query } = require('../src/db');
 const { notify, serverError } = require('../src/helpers');
-const { auth, softAuth, checkBlocked } = require('../src/middleware');
+const { auth, softAuth, checkBlocked, adminAuth } = require('../src/middleware');
 
 const normalizeId = (id) => (id || '').toString().toLowerCase().replace(/^pi_/, '');
 
@@ -514,7 +514,11 @@ router.get('/api/users/:id/badges', async (req, res) => {
 
 // POST /api/reviews — create a review (enhanced with badges trigger)
 let _lastReviewReject = null;
-router.get('/api/reviews/v2/_diag', async (req, res) => {
+// adminAuth, not open. This returned recent reviews *and* escrow rows —
+// client_id, freelancer_id and amount — to anyone on the internet, so the whole
+// payment graph (who paid whom, how much) could be enumerated without logging
+// in. It exists only to inspect _lastReviewReject while debugging.
+router.get('/api/reviews/v2/_diag', adminAuth, async (req, res) => {
   const recent = await query('SELECT id, reviewer_id, reviewee_id, job_id, rating, created_at FROM reviews ORDER BY id DESC LIMIT 5').catch(() => ({ rows: [] }));
   const escrows = await query('SELECT id, job_id, status, client_id, freelancer_id, amount, created_at, updated_at FROM escrows ORDER BY id DESC LIMIT 6').catch(() => ({ rows: [] }));
   res.json({ last_reject: _lastReviewReject, recent: recent.rows, escrows: escrows.rows });
