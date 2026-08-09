@@ -381,7 +381,14 @@ router.put('/api/jobs/:id', auth, checkBlocked, async (req, res) => {
         }
       }
       fields.push(`budget=$${i++}`); vals.push(b);
-      const newCost = Math.ceil(b / 50);
+      // Same helper and same admin-configured divisor the create path uses.
+      // This was `Math.ceil(b / 50)`, which ignored apply_cost_divisor
+      // entirely: raising the apply cost in admin took effect for new jobs but
+      // silently reverted to /50 for any job whose budget was edited later —
+      // the same duplicate-pricing drift that once let the published platform
+      // fee disagree with the one actually charged.
+      const econEdit = await getConnectsEconomy();
+      const newCost = applyCostFor(b, econEdit.applyCostDivisor);
       fields.push(`apply_cost=$${i++}`); vals.push(newCost);
       fields.push(`connects_spent=$${i++}`); vals.push(newCost);
     }

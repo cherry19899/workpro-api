@@ -50,3 +50,18 @@ test('the cost is always a whole number of connects', () => {
     assert.ok(Number.isInteger(applyCostFor(budget, 50)), `${budget}π gave a fraction`);
   }
 });
+
+test('the configured divisor, not a hardcoded 50, decides the apply cost', () => {
+  // routes/jobs.js recomputed apply_cost on a budget edit with a hardcoded
+  // `Math.ceil(b / 50)`, so an admin who raised the apply cost saw it apply to
+  // newly posted jobs and silently revert on any job edited afterwards. These
+  // are the budgets where that difference is actually visible — below the
+  // divisor the one-connect floor hides it.
+  const hardcoded = (b) => Math.ceil(b / 50);
+  for (const budget of [100, 200, 500]) {
+    assert.notEqual(applyCostFor(budget, 25), hardcoded(budget),
+      `at ${budget}π a divisor of 25 must not agree with the old /50 constant`);
+    assert.equal(applyCostFor(budget, 50), hardcoded(budget),
+      `at ${budget}π a divisor of 50 must still reproduce the old result`);
+  }
+});
