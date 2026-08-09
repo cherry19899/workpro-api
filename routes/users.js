@@ -487,8 +487,20 @@ router.delete('/api/me/gdpr', auth, async (req, res) => {
     // Anonymize reviews/ratings
     await query(`UPDATE ratings SET comment='[deleted]' WHERE from_user_id=$1`, [uid]);
     await query(`UPDATE reviews SET text='[deleted]' WHERE reviewer_id=$1`, [uid]);
+    // The portfolio is free text the user wrote about themselves and it stays
+    // publicly readable by user id — leaving it behind meant an erasure
+    // request erased the profile and left the biography.
+    await query(`DELETE FROM portfolio_items WHERE user_id=$1`, [uid]);
+    await query(`DELETE FROM portfolios WHERE user_id=$1`, [uid]);
+    // Files the user uploaded into chat — the message text was blanked above
+    // but the attachment bytes (photos, documents) were not touched.
+    await query(`DELETE FROM chat_attachments WHERE uploader_id=$1`, [uid]);
     // Delete notifications
     await query(`DELETE FROM notifications WHERE user_id=$1`, [uid]);
+    // The push endpoint is a live channel to the person's device. Deleting the
+    // notification rows without it left them still receiving push after asking
+    // to be deleted.
+    await query(`DELETE FROM push_subscriptions WHERE user_id=$1`, [uid]);
     // Delete saved searches
     await query(`DELETE FROM saved_searches WHERE user_id=$1`, [uid]);
     // Revoke all JWTs by noting deletion (JWT blacklist via timestamp)
