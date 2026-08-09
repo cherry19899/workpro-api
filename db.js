@@ -256,6 +256,24 @@ async function initDb() {
     await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS terms_accepted BOOLEAN DEFAULT FALSE`).catch(() => {});
     await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS terms_accepted_at TIMESTAMP`).catch(() => {});
     await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP`).catch(() => {});
+    // ── One rating per reviewer, per person, per job ──────────────
+    // Both rating routes check for a duplicate and then insert, which two
+    // concurrent requests can both pass, and the `ON CONFLICT DO NOTHING` in
+    // POST /api/reviews/v2 was inert because nothing here declared a conflict
+    // target. Two partial indexes rather than one: before PG15 a plain UNIQUE
+    // treats NULLs as distinct, so job-less reviews would not be covered.
+    for (const [name, sql] of [
+      ['ratings_one_per_job_idx', `CREATE UNIQUE INDEX IF NOT EXISTS ratings_one_per_job_idx ON ratings (from_user_id, to_user_id, job_id) WHERE job_id IS NOT NULL`],
+      ['ratings_one_general_idx', `CREATE UNIQUE INDEX IF NOT EXISTS ratings_one_general_idx ON ratings (from_user_id, to_user_id) WHERE job_id IS NULL`],
+      ['reviews_one_per_job_idx', `CREATE UNIQUE INDEX IF NOT EXISTS reviews_one_per_job_idx ON reviews (reviewer_id, reviewee_id, job_id) WHERE job_id IS NOT NULL`],
+      ['reviews_one_general_idx', `CREATE UNIQUE INDEX IF NOT EXISTS reviews_one_general_idx ON reviews (reviewer_id, reviewee_id) WHERE job_id IS NULL`],
+    ]) {
+      // Not swallowed silently, and .error because it is the only level that
+      // survives production: the one way this fails is duplicate rows already
+      // in the table, which is worth seeing rather than believing in a
+      // constraint that was never created.
+      await query(sql).catch((e) => logger.error(`[db] ${name} not created: ${e.message}`));
+    }
     // ── Full-text search index ───────────────────────────────────
     await query(`CREATE INDEX IF NOT EXISTS jobs_search_idx ON jobs USING GIN(search_vector)`).catch(() => {});
     await query(`UPDATE jobs SET search_vector = to_tsvector('english', coalesce(title,'') || ' ' || coalesce(description,'') || ' ' || coalesce(skills,'') || ' ' || coalesce(category,'')) WHERE search_vector IS NULL`).catch(() => {});

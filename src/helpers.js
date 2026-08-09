@@ -319,11 +319,77 @@ function safeHttpUrl(u) {
   return /^https?:\/\/[^\s/?#]+[^\s]*$/i.test(s) ? s : null;
 }
 
+// ─── Ratings ───────────────────────────────────────────────────────
+const normalizeId = (id) => (id || '').toString().toLowerCase().replace(/^pi_/, '');
+
+/**
+ * The job a rating request refers to: a positive integer, or null when the
+ * request names no job at all. Returns NaN when a value is present but is not
+ * a job id, so the caller can answer 400 itself.
+ *
+ * The routes used to test `isNaN(parseInt(job_id))`, and parseInt('5abc') is 5
+ * — so '5abc' passed validation and went straight into `WHERE id = $1`, where
+ * Postgres refused the cast and the caller got a 500 instead of a 400.
+ */
+function parseJobId(v) {
+  if (v === undefined || v === null || v === '') return null;
+  // jobs.id is a SERIAL, so anything past int4 is not a job that can exist and
+  // handing it to Postgres earns "value out of range for type integer" — a 500
+  // where this function can say 400.
+  const MAX = 2147483647;
+  const ok = (n) => (Number.isInteger(n) && n > 0 && n <= MAX ? n : NaN);
+  if (typeof v === 'number') return ok(v);
+  if (typeof v !== 'string') return NaN;
+  // Digits only, deliberately: Number() also reads '0x10' as 16 and '1e5' as
+  // 100000, which would quietly look up a job the caller never named.
+  const s = v.trim();
+  return /^\d+$/.test(s) ? ok(Number(s)) : NaN;
+}
+
+/**
+ * Who, if anyone, this caller may rate for this job.
+ *
+ * `job` is the row the requested job_id matched, or null when it matched
+ * nothing — and nothing must be a refusal, not a pass. POST /api/ratings and
+ * POST /api/reviews used to wrap this entire check in `if (jobCheck.rows.length)`,
+ * so a job_id naming a job that does not exist skipped every check and fell
+ * through to the INSERT. Any logged-in account could rate any user — once per
+ * invented job_id, and there are unlimited invented job_ids because the
+ * duplicate guard keys on job_id — and the handler then overwrote the victim's
+ * public users.rating with the new average. One curl loop took a freelancer to
+ * 1.0 stars, and rating is what decides who gets hired here.
+ *
+ * The target is returned as the *job row* spells it, not as the request body
+ * spells it: ids are compared case- and prefix-insensitively, so accepting the
+ * body's spelling would let 'PI_Bob' and 'pi_bob' accumulate separate ratings
+ * and separate duplicate guards for one person.
+ */
+function ratingTarget(job, viewerId, requestedTarget) {
+  if (!job) return { code: 404, error: 'Job not found' };
+  const viewer = normalizeId(viewerId);
+  const poster = normalizeId(job.posted_by);
+  const hired = normalizeId(job.hired_freelancer_id);
+  if (viewer !== poster && viewer !== hired) {
+    return { code: 403, error: 'You were not a participant in this job' };
+  }
+  if (job.status !== 'completed') {
+    return { code: 400, error: 'Job must be completed before rating' };
+  }
+  const other = viewer === poster ? job.hired_freelancer_id : job.posted_by;
+  if (!other || normalizeId(requestedTarget) !== normalizeId(other)) {
+    return { code: 403, error: 'You can only rate the other participant of this job' };
+  }
+  return { targetId: other };
+}
+
 module.exports = {
   piApiRequest,
   piApprovePayment,
   piCompletePayment,
   resolveWebhookStatus,
+  ratingTarget,
+  parseJobId,
+  normalizeId,
   safeHttpUrl,
   MAX_URL_LEN,
   isOwnerUid,

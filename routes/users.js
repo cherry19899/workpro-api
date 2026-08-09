@@ -4,7 +4,7 @@ const logger = require('../src/logger');
  */
 const router = require('express').Router();
 const { query } = require('../src/db');
-const { notify, serverError, safeHttpUrl, MAX_URL_LEN, isOwnerUid, OWNER_USERNAME } = require('../src/helpers');
+const { notify, serverError, safeHttpUrl, MAX_URL_LEN, isOwnerUid, OWNER_USERNAME, ratingTarget, parseJobId } = require('../src/helpers');
 const { auth, softAuth, checkBlocked, adminAuth } = require('../src/middleware');
 
 const normalizeId = (id) => (id || '').toString().toLowerCase().replace(/^pi_/, '');
@@ -265,22 +265,22 @@ router.get('/api/users/:id/connects', auth, async (req, res) => {
 router.post('/api/ratings', auth, checkBlocked, async (req, res) => {
   const { to_user_id, job_id, rating, comment } = req.body;
   if (!to_user_id || rating === undefined || rating === null || rating === '') return res.status(400).json({ error: 'to_user_id and rating required' });
-  if (job_id !== undefined && job_id !== null && isNaN(parseInt(job_id))) return res.status(400).json({ error: 'Invalid job_id' });
+  const jobId = parseJobId(job_id);
+  if (Number.isNaN(jobId)) return res.status(400).json({ error: 'Invalid job_id' });
   const ratingNum = parseInt(rating);
   if (isNaN(ratingNum) || ratingNum < 1 || ratingNum > 5) return res.status(400).json({ error: 'Rating must be 1-5' });
-  if (to_user_id === req.userId) return res.status(400).json({ error: 'Cannot rate yourself' });
+  if (normalizeId(to_user_id) === normalizeId(req.userId)) return res.status(400).json({ error: 'Cannot rate yourself' });
   if (comment && comment.length > 1000) return res.status(400).json({ error: 'Comment too long (max 1000)' });
   try {
-    if (job_id) {
-      const jobCheck = await query('SELECT posted_by, hired_freelancer_id, status FROM jobs WHERE id = $1', [job_id]);
-      if (jobCheck.rows.length) {
-        const job = jobCheck.rows[0];
-        const isParticipant = normalizeId(job.posted_by) === normalizeId(req.userId) || normalizeId(job.hired_freelancer_id) === normalizeId(req.userId);
-        if (!isParticipant) return _rej(res, 403, 'You were not a participant in this job');
-        if (job.status !== 'completed') return res.status(400).json({ error: 'Job must be completed before rating' });
-        const expectedTarget = normalizeId(job.posted_by) === normalizeId(req.userId) ? job.hired_freelancer_id : job.posted_by;
-        if (to_user_id !== expectedTarget) return res.status(403).json({ error: 'You can only rate the other participant of this job' });
-      }
+    // The id actually written. When a job vouches for the pair, ratingTarget
+    // hands back the spelling the job row holds, so a differently-cased body
+    // value cannot open a second identity for the same person.
+    let targetId = to_user_id;
+    if (jobId) {
+      const jobCheck = await query('SELECT posted_by, hired_freelancer_id, status FROM jobs WHERE id = $1', [jobId]);
+      const verdict = ratingTarget(jobCheck.rows[0] || null, req.userId, to_user_id);
+      if (verdict.error) return _rej(res, verdict.code, verdict.error);
+      targetId = verdict.targetId;
     } else {
       const sharedJob = await query(
         `SELECT id FROM jobs WHERE status='completed' AND (
@@ -292,17 +292,17 @@ router.post('/api/ratings', auth, checkBlocked, async (req, res) => {
     }
     const existing = await query(
       'SELECT id FROM ratings WHERE from_user_id = $1 AND to_user_id = $2 AND job_id IS NOT DISTINCT FROM $3',
-      [req.userId, to_user_id, job_id || null]
+      [req.userId, targetId, jobId]
     );
     if (existing.rows.length) return res.status(400).json({ error: 'Already rated this job' });
     const result = await query(
       'INSERT INTO ratings (from_user_id, to_user_id, job_id, rating, comment) VALUES ($1, $2, $3, $4, $5) RETURNING *',
-      [req.userId, to_user_id, job_id || null, ratingNum, comment || '']
+      [req.userId, targetId, jobId, ratingNum, comment || '']
     );
-    const avgResult = await query('SELECT AVG(rating) as avg FROM ratings WHERE to_user_id = $1', [to_user_id]);
+    const avgResult = await query('SELECT AVG(rating) as avg FROM ratings WHERE to_user_id = $1', [targetId]);
     const newAvg = Math.round(parseFloat(avgResult.rows[0].avg) * 10) / 10;
-    await query('UPDATE users SET rating = $1, updated_at = NOW() WHERE id = $2', [newAvg, to_user_id]);
-    await notify(to_user_id, 'rating', 'Новый отзыв', `Вы получили оценку ${rating}/5. Средний рейтинг: ${newAvg}`, job_id || null, null, { key: 'nRating', params: { rating, avg: newAvg } });
+    await query('UPDATE users SET rating = $1, updated_at = NOW() WHERE id = $2', [newAvg, targetId]);
+    await notify(targetId, 'rating', 'Новый отзыв', `Вы получили оценку ${rating}/5. Средний рейтинг: ${newAvg}`, jobId, null, { key: 'nRating', params: { rating, avg: newAvg } });
     res.json({ rating: result.rows[0], success: true });
   } catch (err) { serverError(err, res); }
 });
@@ -313,22 +313,20 @@ router.post('/api/reviews', auth, checkBlocked, async (req, res) => {
   const toId = to_user_id || target_id;
   const reviewComment = comment || text || '';
   if (!toId || rating === undefined || rating === null || rating === '') return res.status(400).json({ error: 'to_user_id and rating required' });
-  if (job_id !== undefined && job_id !== null && isNaN(parseInt(job_id))) return res.status(400).json({ error: 'Invalid job_id' });
+  const jobIdR = parseJobId(job_id);
+  if (Number.isNaN(jobIdR)) return res.status(400).json({ error: 'Invalid job_id' });
   const ratingNumR = parseInt(rating);
   if (isNaN(ratingNumR) || ratingNumR < 1 || ratingNumR > 5) return res.status(400).json({ error: 'Rating must be 1-5' });
-  if (toId === req.userId) return res.status(400).json({ error: 'Cannot rate yourself' });
+  if (normalizeId(toId) === normalizeId(req.userId)) return res.status(400).json({ error: 'Cannot rate yourself' });
   if (reviewComment.length > 1000) return res.status(400).json({ error: 'Comment too long (max 1000)' });
   try {
-    if (job_id) {
-      const jobCheck = await query('SELECT posted_by, hired_freelancer_id, status FROM jobs WHERE id = $1', [job_id]);
-      if (jobCheck.rows.length) {
-        const job = jobCheck.rows[0];
-        const isParticipant = normalizeId(job.posted_by) === normalizeId(req.userId) || normalizeId(job.hired_freelancer_id) === normalizeId(req.userId);
-        if (!isParticipant) return res.status(403).json({ error: 'You were not a participant in this job' });
-        if (job.status !== 'completed') return res.status(400).json({ error: 'Job must be completed before rating' });
-        const expectedTargetR = normalizeId(job.posted_by) === normalizeId(req.userId) ? job.hired_freelancer_id : job.posted_by;
-        if (toId !== expectedTargetR) return res.status(403).json({ error: 'You can only rate the other participant of this job' });
-      }
+    // Same rules, and the same fall-through, as POST /api/ratings — see ratingTarget.
+    let targetIdR = toId;
+    if (jobIdR) {
+      const jobCheck = await query('SELECT posted_by, hired_freelancer_id, status FROM jobs WHERE id = $1', [jobIdR]);
+      const verdict = ratingTarget(jobCheck.rows[0] || null, req.userId, toId);
+      if (verdict.error) return res.status(verdict.code).json({ error: verdict.error });
+      targetIdR = verdict.targetId;
     } else {
       const sharedJob = await query(
         `SELECT id FROM jobs WHERE status='completed' AND (
@@ -340,13 +338,13 @@ router.post('/api/reviews', auth, checkBlocked, async (req, res) => {
     }
     const existing = await query(
       'SELECT id FROM ratings WHERE from_user_id = $1 AND to_user_id = $2 AND job_id IS NOT DISTINCT FROM $3',
-      [req.userId, toId, job_id || null]
+      [req.userId, targetIdR, jobIdR]
     );
     if (existing.rows.length) return res.status(400).json({ error: 'Already rated this job' });
-    const result = await query('INSERT INTO ratings (from_user_id, to_user_id, job_id, rating, comment) VALUES ($1, $2, $3, $4, $5) RETURNING *', [req.userId, toId, job_id || null, ratingNumR, reviewComment]);
-    const avgResult = await query('SELECT AVG(rating) as avg FROM ratings WHERE to_user_id = $1', [toId]);
+    const result = await query('INSERT INTO ratings (from_user_id, to_user_id, job_id, rating, comment) VALUES ($1, $2, $3, $4, $5) RETURNING *', [req.userId, targetIdR, jobIdR, ratingNumR, reviewComment]);
+    const avgResult = await query('SELECT AVG(rating) as avg FROM ratings WHERE to_user_id = $1', [targetIdR]);
     const newAvg = Math.round(parseFloat(avgResult.rows[0].avg) * 10) / 10;
-    await query('UPDATE users SET rating = $1, updated_at = NOW() WHERE id = $2', [newAvg, toId]);
+    await query('UPDATE users SET rating = $1, updated_at = NOW() WHERE id = $2', [newAvg, targetIdR]);
     res.json({ review: result.rows[0], rating: result.rows[0], success: true });
   } catch (err) { serverError(err, res); }
 });
@@ -512,7 +510,10 @@ router.delete('/api/me/gdpr', auth, async (req, res) => {
 async function computeBadges(userId) {
   try {
     const [user, reviews] = await Promise.all([
-      query('SELECT total_jobs_completed, rating, total_reviews, repeat_client_count FROM users WHERE id=$1', [userId]),
+      // kyc_verified was missing from this list, so `u.kyc_verified` below was
+      // always undefined and the 'verified' badge could never be awarded to
+      // anyone, no matter how many times badges were recomputed.
+      query('SELECT total_jobs_completed, rating, total_reviews, repeat_client_count, kyc_verified FROM users WHERE id=$1', [userId]),
       query('SELECT rating, created_at FROM ratings WHERE to_user_id=$1 ORDER BY created_at DESC', [userId]),
     ]);
     if (!user.rows.length) return;
@@ -570,23 +571,26 @@ const _rej = (res, code, error) => { _lastReviewReject = { code, error, at: new 
 router.post('/api/reviews/v2', auth, checkBlocked, async (req, res) => {
   const { job_id, reviewee_id, rating, text } = req.body;
   if (!reviewee_id || !rating) return _rej(res, 400, 'reviewee_id and rating required');
-  if (rating < 1 || rating > 5) return _rej(res, 400, 'Rating must be 1-5');
+  // The column is INTEGER CHECK (rating BETWEEN 1 AND 5), and the range test
+  // alone lets anything non-numeric through: `'abc' < 1` and `'abc' > 5` are
+  // both false, so the value reached the INSERT and Postgres answered with a
+  // 500 instead of this 400. Same parse the other two rating routes use.
+  const ratingNumV2 = parseInt(rating, 10);
+  if (isNaN(ratingNumV2) || ratingNumV2 < 1 || ratingNumV2 > 5) return _rej(res, 400, 'Rating must be 1-5');
   if (text && text.length < 10) return _rej(res, 400, 'Review text must be at least 10 characters');
   if (text && text.length > 2000) return res.status(400).json({ error: 'Review too long (max 2000 chars)' });
-  if (req.userId === reviewee_id) return _rej(res, 400, 'Cannot review yourself');
-  if (job_id !== undefined && job_id !== null && isNaN(parseInt(job_id))) return res.status(400).json({ error: 'Invalid job_id' });
+  if (normalizeId(req.userId) === normalizeId(reviewee_id)) return _rej(res, 400, 'Cannot review yourself');
+  const jobIdV2 = parseJobId(job_id);
+  if (Number.isNaN(jobIdV2)) return res.status(400).json({ error: 'Invalid job_id' });
   try {
     // Same participant rules as POST /api/ratings: only the two sides of a
     // completed job may review each other (v2 previously skipped this entirely).
-    if (job_id) {
-      const jobCheck = await query('SELECT posted_by, hired_freelancer_id, status FROM jobs WHERE id = $1', [job_id]);
-      if (!jobCheck.rows.length) return _rej(res, 404, 'Job not found');
-      const job = jobCheck.rows[0];
-      const isParticipant = normalizeId(job.posted_by) === normalizeId(req.userId) || normalizeId(job.hired_freelancer_id) === normalizeId(req.userId);
-      if (!isParticipant) return res.status(403).json({ error: 'You were not a participant in this job' });
-      if (job.status !== 'completed') return _rej(res, 400, 'Job must be completed before reviewing');
-      const expectedTarget = normalizeId(job.posted_by) === normalizeId(req.userId) ? job.hired_freelancer_id : job.posted_by;
-      if (normalizeId(reviewee_id) !== normalizeId(expectedTarget)) return _rej(res, 403, 'You can only review the other participant of this job');
+    let revieweeId = reviewee_id;
+    if (jobIdV2) {
+      const jobCheck = await query('SELECT posted_by, hired_freelancer_id, status FROM jobs WHERE id = $1', [jobIdV2]);
+      const verdict = ratingTarget(jobCheck.rows[0] || null, req.userId, reviewee_id);
+      if (verdict.error) return _rej(res, verdict.code, verdict.error);
+      revieweeId = verdict.targetId;
     } else {
       const sharedJob = await query(
         `SELECT id FROM jobs WHERE status='completed' AND (
@@ -597,19 +601,19 @@ router.post('/api/reviews/v2', auth, checkBlocked, async (req, res) => {
       if (!sharedJob.rows.length) return res.status(403).json({ error: 'You have no completed job with this user' });
     }
     // Check for duplicate (job_id NULL included — one general review per pair)
-    const dup = await query('SELECT id FROM reviews WHERE job_id IS NOT DISTINCT FROM $1 AND reviewer_id=$2 AND reviewee_id=$3', [job_id || null, req.userId, reviewee_id]);
+    const dup = await query('SELECT id FROM reviews WHERE job_id IS NOT DISTINCT FROM $1 AND reviewer_id=$2 AND reviewee_id=$3', [jobIdV2, req.userId, revieweeId]);
     if (dup.rows.length) return _rej(res, 409, 'You already reviewed this person for this job');
     const { sanitizeText } = require('../src/sanitize');
     const safeText = text ? sanitizeText(text, 2000) : null;
     const r = await query(
       'INSERT INTO reviews (job_id, reviewer_id, reviewee_id, rating, text) VALUES ($1,$2,$3,$4,$5) RETURNING *',
-      [job_id || null, req.userId, reviewee_id, rating, safeText]
+      [jobIdV2, req.userId, revieweeId, ratingNumV2, safeText]
     );
     // Also insert into ratings for backward compat
     await query('INSERT INTO ratings (from_user_id, to_user_id, job_id, rating, comment) VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING',
-      [req.userId, reviewee_id, job_id || null, rating, safeText]).catch(() => {});
+      [req.userId, revieweeId, jobIdV2, ratingNumV2, safeText]).catch(() => {});
     // Recompute badges async
-    computeBadges(reviewee_id).catch(() => {});
+    computeBadges(revieweeId).catch(() => {});
     res.json({ review: r.rows[0], success: true });
   } catch (err) { serverError(err, res); }
 });
