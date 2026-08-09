@@ -54,7 +54,7 @@ async function sendA2U(uid, amount, memo, metadata = {}) {
   } catch (e) {
     const msg = (e && (e.response?.data ? JSON.stringify(e.response.data) : e.message)) || String(e);
     _last = { ok: false, stage, error: String(msg).slice(0, 500), at: new Date().toISOString() };
-    logger.warn(`[a2u] failed at ${stage}: ${msg}`);
+    logger.error(`[a2u] failed at ${stage}: ${msg}`);
     throw e;
   }
 }

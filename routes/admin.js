@@ -402,6 +402,13 @@ router.post('/api/admin/escrows/:id/resolve', adminAuth, async (req, res) => {
       } else {
         await pgC.query('UPDATE users SET balance_pi = COALESCE(balance_pi,0) + $1, updated_at=NOW() WHERE id=$2', [escrow.amount, escrow.client_id]);
         await pgC.query("UPDATE jobs SET status='open', hired_freelancer_id=NULL, hired_freelancer_name=NULL, updated_at=NOW() WHERE id=$1", [escrow.job_id]);
+        // The other two refund paths (client cancel, client refund in
+        // payments.js) do this and this one did not: the job reopened with
+        // nobody hired while the application still read 'accepted'. The direct
+        // offer route reads that status, so the client was told "Freelancer is
+        // already working on this job" and could not re-hire the person whose
+        // dispute had just been settled, with no way to clear it from the UI.
+        await pgC.query("UPDATE applications SET status='rejected', updated_at=NOW() WHERE job_id=$1 AND status='accepted'", [escrow.job_id]);
       }
       await pgC.query('COMMIT');
     } catch (txErr) { await pgC.query('ROLLBACK').catch(() => {}); throw txErr; }
@@ -412,9 +419,17 @@ router.post('/api/admin/escrows/:id/resolve', adminAuth, async (req, res) => {
       try {
         const r = await sendA2U(escrow.freelancer_id, net, 'WorkPro dispute resolution', { type: 'dispute_release', escrow_id: escrow.id, job_id: escrow.job_id });
         payoutTxid = r.txid;
-        await query('UPDATE users SET balance_pi = GREATEST(COALESCE(balance_pi,0) - $1, 0), updated_at = NOW() WHERE id = $2', [net, escrow.freelancer_id]).catch(() => {});
-        await query('UPDATE escrows SET payout_txid = $1, updated_at = NOW() WHERE id = $2', [payoutTxid, escrow.id]).catch(() => {});
-      } catch (e) { logger.warn(`[a2u] dispute payout failed for escrow ${escrow.id}: ${e.message}`); }
+        // balance_pi is what /api/admin/users/:id/payout-owed pays out. The Pi
+        // has already left the wallet at this point, so if this deduction is
+        // swallowed the freelancer is still owed `net` on paper and a later
+        // payout-owed sends it a second time. Nothing here can undo the
+        // transfer, so the failure is logged with everything needed to
+        // reconcile by hand rather than discarded.
+        await query('UPDATE users SET balance_pi = GREATEST(COALESCE(balance_pi,0) - $1, 0), updated_at = NOW() WHERE id = $2', [net, escrow.freelancer_id])
+          .catch((e) => logger.error(`[a2u] PAID BUT NOT DEDUCTED — escrow ${escrow.id}, user ${escrow.freelancer_id}, ${net}π, txid ${payoutTxid}: ${e.message}`));
+        await query('UPDATE escrows SET payout_txid = $1, updated_at = NOW() WHERE id = $2', [payoutTxid, escrow.id])
+          .catch((e) => logger.error(`[a2u] payout_txid not recorded for escrow ${escrow.id} (txid ${payoutTxid}): ${e.message}`));
+      } catch (e) { logger.error(`[a2u] dispute payout failed for escrow ${escrow.id}: ${e.message}`); }
     }
     await audit(escrow.status === 'disputed' ? 'admin_dispute_resolved' : 'admin_escrow_resolved', { escrow_id: req.params.id, action, reason: reason || null, by: req.userId, payout_txid: payoutTxid });
     const notifTitle = escrow.status === 'disputed' ? 'Спор разрешён администратором'
@@ -449,7 +464,7 @@ router.post('/api/admin/users/:id/payout-owed', adminAuth, async (req, res) => {
   } catch (err) {
     // Surface the real A2U error to the admin instead of a generic 500.
     const msg = (err && (err.response?.data?.error_message || err.message)) || 'Payout failed';
-    logger.warn(`[a2u] owed payout failed for ${req.params.id}: ${msg}`);
+    logger.error(`[a2u] owed payout failed for ${req.params.id}: ${msg}`);
     res.status(502).json({ error: `A2U payout failed: ${msg}` });
   }
 });

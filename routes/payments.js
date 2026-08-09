@@ -204,7 +204,7 @@ async function handleEscrowRelease(req, res) {
         await query('UPDATE escrows SET payout_txid = $1, updated_at = NOW() WHERE id = $2', [txid, escrow.id]).catch(() => {});
         await audit('escrow_payout_a2u', { escrow_id: escrow.id, freelancer_id: escrow.freelancer_id, net_paid: net, txid });
       } catch (e) {
-        logger.warn(`[a2u] payout failed for escrow ${escrow.id}: ${e.message} — kept as balance_pi`);
+        logger.error(`[a2u] payout failed for escrow ${escrow.id}: ${e.message} — kept as balance_pi`);
       }
     }
     await notify(escrow.freelancer_id, 'payment', 'Оплата получена',
@@ -1324,7 +1324,7 @@ router.post('/api/escrows/:id/milestone/:milestoneId/approve', auth, checkBlocke
         await query('UPDATE users SET balance_pi = GREATEST(COALESCE(balance_pi,0) - $1, 0), updated_at = NOW() WHERE id = $2', [freelancerAmt, e.freelancer_id]).catch(() => {});
         await audit('milestone_payout_a2u', { escrow_id: escrowId, milestone_id: milestoneId, freelancer_id: e.freelancer_id, net_paid: freelancerAmt, txid });
       } catch (a2uErr) {
-        logger.warn(`[a2u] milestone payout failed for escrow ${escrowId}/${milestoneId}: ${a2uErr.message} — kept as balance_pi`);
+        logger.error(`[a2u] milestone payout failed for escrow ${escrowId}/${milestoneId}: ${a2uErr.message} — kept as balance_pi`);
       }
     }
     // Notify freelancer

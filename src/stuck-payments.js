@@ -144,7 +144,7 @@ async function sweepStuckPayments(logger = console) {
       }
     } catch (e) {
       stats.failed++;
-      logger.warn(`[stuck-payments] ${pay.id} failed: ${e.message}`);
+      logger.error(`[stuck-payments] ${pay.id} failed: ${e.message}`);
     }
   }
 

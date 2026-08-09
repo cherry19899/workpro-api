@@ -702,7 +702,7 @@ router.post('/api/jobs/:id/complete', auth, checkBlocked, async (req, res) => {
             [txid, escrow.id]).catch(() => {});
           audit('escrow_payout_a2u', { escrow_id: escrow.id, freelancer_id: escrow.freelancer_id, net_paid: net, txid }).catch(() => {});
         })
-        .catch(e => logger.warn(`[a2u] auto-release failed for escrow ${escrow.id}: ${e.message} — kept as balance_pi`));
+        .catch(e => logger.error(`[a2u] auto-release failed for escrow ${escrow.id}: ${e.message} — kept as balance_pi`));
     }
 
     if (job.hired_freelancer_id) {
