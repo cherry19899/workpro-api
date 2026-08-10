@@ -75,11 +75,13 @@ async function handlePaymentComplete(paymentId, txid, metadata, userId, res) {
       try {
         piPayment = await piCompletePayment(paymentId, txid);
       } catch (piErr) {
-        // Pi API failure (wrong key, network, sandbox quirk) — log but continue:
-        // the Pi blockchain confirmed the payment (client received txid), so we
-        // still mark it completed on our side and credit connects. /api/connects/buy
-        // will do additional idempotency check.
-        logger.error('[Payment] Pi complete failed (continuing):', piErr.message);
+        // Pi API failure means we have no confirmation the transaction is
+        // real — txid is client-supplied and easily fabricated, so "the
+        // client received a txid" is not proof funds moved. Do not mark the
+        // payment completed or credit anything; let the client retry, or the
+        // stuck-payments sweep / resolve-incomplete pick it up later.
+        logger.error('[Payment] Pi complete failed:', piErr.message, '| paymentId:', paymentId);
+        return res.status(502).json({ error: 'Could not verify payment with Pi — please retry' });
       }
     }
     const pgPmtC = await getPool().connect();
@@ -95,19 +97,30 @@ async function handlePaymentComplete(paymentId, txid, metadata, userId, res) {
         // No approved row — check if already completed (idempotent) or never approved (approve step failed).
         const existingRow = await pgPmtC.query('SELECT * FROM payments WHERE id = $1 FOR UPDATE', [paymentId]);
         if (existingRow.rows.length && existingRow.rows[0].status === 'completed') {
-          // Already completed by a previous call — idempotent success.
+          // Status is already 'completed' — but that alone isn't proof
+          // crediting ran (e.g. the webhook flips status to 'completed'
+          // without ever crediting connects or creating an escrow). Fall
+          // through into the shared crediting logic below using this row;
+          // its own connects_credited / existing-escrow checks keep it
+          // idempotent even if crediting genuinely already happened.
+          markRes = existingRow;
+        } else if (!existingRow.rows.length) {
+          // No row at all yet — approve step never even persisted (e.g. cold-start 502). Upsert as completed so connects can be credited.
+          await pgPmtC.query(
+            `INSERT INTO payments (id, user_id, type, amount, status, txid, metadata)
+             VALUES ($1,$2,'connects',$3,'completed',$4,$5)
+             ON CONFLICT (id) DO UPDATE SET status='completed', txid=EXCLUDED.txid, updated_at=NOW()`,
+            [paymentId, userId, parseFloat(piPayment.amount || 0), txid, JSON.stringify({ type: 'connects' })]
+          );
+          markRes = await pgPmtC.query('SELECT * FROM payments WHERE id = $1', [paymentId]);
+          if (!markRes.rows.length) { await pgPmtC.query('ROLLBACK'); return res.json({ success: true, payment: piPayment }); }
+        } else {
+          // Row exists but is stuck in some other terminal, non-completable
+          // status (e.g. 'cancelled' via /api/payments/:id/cancelled) — do
+          // not resurrect it into 'completed'.
           await pgPmtC.query('ROLLBACK');
-          return res.json({ success: true, payment: piPayment });
+          return res.status(400).json({ error: `Payment cannot be completed from status '${existingRow.rows[0].status}'` });
         }
-        // Approve step was skipped (e.g. cold-start 502) — upsert as completed so connects can be credited.
-        await pgPmtC.query(
-          `INSERT INTO payments (id, user_id, type, amount, status, txid, metadata)
-           VALUES ($1,$2,'connects',$3,'completed',$4,$5)
-           ON CONFLICT (id) DO UPDATE SET status='completed', txid=EXCLUDED.txid, updated_at=NOW()`,
-          [paymentId, userId, parseFloat(piPayment.amount || 0), txid, JSON.stringify({ type: 'connects' })]
-        );
-        markRes = await pgPmtC.query('SELECT * FROM payments WHERE id = $1', [paymentId]);
-        if (!markRes.rows.length) { await pgPmtC.query('ROLLBACK'); return res.json({ success: true, payment: piPayment }); }
       }
       const markDone = markRes.rows[0];
       const meta = markDone.metadata || {};
@@ -265,12 +278,12 @@ async function resolveUserId(req) {
   } catch (_) { return null; }
 }
 
-router.post('/api/payments/:paymentId/approve', softAuth, async (req, res) => {
+router.post('/api/payments/:paymentId/approve', softAuth, checkBlocked, async (req, res) => {
   const userId = await resolveUserId(req);
   await handlePaymentApprove(req.params.paymentId, req.body.metadata, userId, res, req.body.payments_enabled);
 });
 
-router.post('/api/payments/:paymentId/complete', softAuth, async (req, res) => {
+router.post('/api/payments/:paymentId/complete', softAuth, checkBlocked, async (req, res) => {
   const userId = await resolveUserId(req);
   await handlePaymentComplete(req.params.paymentId, req.body.txid, req.body.metadata, userId, res);
 });
@@ -285,7 +298,7 @@ router.get('/api/payments', auth, async (req, res) => {
   } catch (err) { serverError(err, res); }
 });
 
-router.post('/api/payments/incomplete', auth, async (req, res) => {
+router.post('/api/payments/incomplete', auth, checkBlocked, async (req, res) => {
   const { paymentId } = req.body;
   if (!paymentId) return res.status(400).json({ error: 'paymentId required' });
   try {
@@ -336,13 +349,13 @@ router.post('/api/payments/incomplete', auth, async (req, res) => {
 });
 
 // Legacy flat-URL aliases — delegate to shared handlers
-router.post('/api/payments/approve', auth, async (req, res) => {
+router.post('/api/payments/approve', auth, checkBlocked, async (req, res) => {
   const { payment_id, metadata } = req.body;
   if (!payment_id) return res.status(400).json({ error: 'payment_id required' });
   await handlePaymentApprove(payment_id, metadata, req.userId, res, req.body.payments_enabled);
 });
 
-router.post('/api/payments/complete', auth, async (req, res) => {
+router.post('/api/payments/complete', auth, checkBlocked, async (req, res) => {
   const { payment_id, txid, metadata } = req.body;
   if (!payment_id) return res.status(400).json({ error: 'payment_id required' });
   await handlePaymentComplete(payment_id, txid, metadata, req.userId, res);
@@ -376,7 +389,7 @@ router.post('/api/payments/:paymentId/cancelled', softAuth, async (req, res) => 
 // to create new payments until the stale one is resolved. So it takes softAuth
 // and enforces ownership only when it knows who is calling — but it no longer
 // trusts *any* caller with the cancel path (see the tail of the handler).
-router.post('/api/payments/:paymentId/resolve-incomplete', softAuth, async (req, res) => {
+router.post('/api/payments/:paymentId/resolve-incomplete', softAuth, checkBlocked, async (req, res) => {
   const paymentId = req.params.paymentId;
   const owner = await query('SELECT user_id FROM payments WHERE id = $1', [paymentId]).catch(() => ({ rows: [] }));
   const ownerId = owner.rows[0]?.user_id;
@@ -395,20 +408,31 @@ router.post('/api/payments/:paymentId/resolve-incomplete', softAuth, async (req,
         const txid = piPayment.transaction?.txid;
         if (st.transaction_verified && txid && !st.developer_completed) {
           try { await piCompletePayment(paymentId, txid); } catch (_) {}
-          // Credit connects if this was a connects payment
-          const row = await query(`SELECT * FROM payments WHERE id=$1`, [paymentId]).catch(() => ({ rows: [] }));
-          const pay = row.rows[0];
-          const meta = pay?.metadata || {};
-          if (pay && !meta.connects_credited && (meta.type === 'connects' || pay.type === 'connects')) {
-            const amount = resolveConnects(parseFloat(piPayment.amount || pay.amount || 0));
-            if (amount > 0 && pay.user_id) {
-              await query(`UPDATE users SET balance_connects = balance_connects + $1, updated_at=NOW() WHERE id=$2`, [amount, pay.user_id]).catch(() => {});
-              await query(`UPDATE payments SET metadata = metadata || '{"connects_credited":true}', status='completed', txid=$1, updated_at=NOW() WHERE id=$2`, [txid, paymentId]).catch(() => {});
-              return res.json({ success: true, credited: amount });
+          // Credit connects if this was a connects payment. Locked in a
+          // transaction: an unlocked read-then-write here let two concurrent
+          // retries both see connects_credited=false and both credit.
+          const pgRI = await getPool().connect();
+          try {
+            await pgRI.query('BEGIN');
+            const row = await pgRI.query('SELECT * FROM payments WHERE id=$1 FOR UPDATE', [paymentId]);
+            const pay = row.rows[0];
+            const meta = pay?.metadata || {};
+            if (pay && !meta.connects_credited && (meta.type === 'connects' || pay.type === 'connects')) {
+              const amount = resolveConnects(parseFloat(piPayment.amount || pay.amount || 0));
+              if (amount > 0 && pay.user_id) {
+                await pgRI.query('UPDATE users SET balance_connects = balance_connects + $1, updated_at=NOW() WHERE id=$2', [amount, pay.user_id]);
+                await pgRI.query(`UPDATE payments SET metadata = metadata || '{"connects_credited":true}', status='completed', txid=$1, updated_at=NOW() WHERE id=$2`, [txid, paymentId]);
+                await pgRI.query('COMMIT');
+                return res.json({ success: true, credited: amount });
+              }
             }
-          }
-          await query(`UPDATE payments SET status='completed', txid=$1, updated_at=NOW() WHERE id=$2`, [txid, paymentId]).catch(() => {});
-          return res.json({ success: true });
+            await pgRI.query(`UPDATE payments SET status='completed', txid=$1, updated_at=NOW() WHERE id=$2`, [txid, paymentId]);
+            await pgRI.query('COMMIT');
+            return res.json({ success: true });
+          } catch (txErr) {
+            await pgRI.query('ROLLBACK').catch(() => {});
+            throw txErr;
+          } finally { pgRI.release(); }
         }
       }
     }
@@ -429,7 +453,7 @@ router.post('/api/payments/:paymentId/resolve-incomplete', softAuth, async (req,
 });
 
 // POST /api/payments/clear-pending
-router.post('/api/payments/clear-pending', auth, async (req, res) => {
+router.post('/api/payments/clear-pending', auth, checkBlocked, async (req, res) => {
   try {
     await query(
       `UPDATE payments SET status = 'cancelled', updated_at = NOW() WHERE user_id = $1 AND status = 'pending' AND created_at < NOW() - INTERVAL '10 minutes'`,
@@ -440,7 +464,7 @@ router.post('/api/payments/clear-pending', auth, async (req, res) => {
 });
 
 // POST /api/payments/:paymentId/resolve-complete
-router.post('/api/payments/:paymentId/resolve-complete', auth, async (req, res) => {
+router.post('/api/payments/:paymentId/resolve-complete', auth, checkBlocked, async (req, res) => {
   const paymentId = req.params.paymentId;
   const ownerCheck = await query('SELECT user_id FROM payments WHERE id = $1', [paymentId]).catch(() => ({ rows: [] }));
   if (ownerCheck.rows.length && ownerCheck.rows[0].user_id && ownerCheck.rows[0].user_id !== req.userId) {
@@ -463,6 +487,13 @@ router.post('/api/payments/:paymentId/resolve-complete', auth, async (req, res) 
           }).catch(() => {});
         }
       }
+    }
+    // Without a real txid from Pi's own GET response, nothing here has been
+    // Pi-confirmed — proceeding anyway (as the code previously did) let this
+    // route mark a payment 'completed' and credit connects/create an escrow
+    // purely because our own /approve step had run, same gap as elsewhere.
+    if (!txid && !process.env.SANDBOX_MODE) {
+      return res.json({ success: true, resolved: false, reason: 'not confirmed by Pi yet' });
     }
     const pgRC = await getPool().connect();
     try {
@@ -526,8 +557,30 @@ router.post('/api/connects/purchase', auth, checkBlocked, async (req, res) => {
     if (payRec.rows[0].user_id !== req.userId) return res.status(403).json({ error: 'Payment does not belong to you' });
     if (payRec.rows[0].status === 'completed') return res.status(400).json({ error: 'Payment already processed' });
     if (payRec.rows[0].status !== 'approved') return res.status(400).json({ error: 'Payment not approved by Pi yet' });
-    const piAmount = parseFloat(payRec.rows[0].amount || 0);
-    const connectsAmount = Math.floor(piAmount * 10);
+
+    // 'approved' only means our own server called Pi's /approve (which
+    // unlocks the user's wallet to let them send funds) — handlePaymentApprove
+    // sets it even when the Pi API call itself failed. It is NOT proof any
+    // Pi transaction was ever broadcast or confirmed. Verify with Pi's own
+    // API before crediting real value, same as /api/connects/buy does.
+    let verifiedAmount = parseFloat(payRec.rows[0].amount || 0);
+    if (PI_API_KEY) {
+      let piPayment;
+      try {
+        piPayment = await piGetPayment(payment_id);
+      } catch (piErr) {
+        logger.error('[Connects] Pi verification failed:', piErr.message);
+        return res.status(502).json({ error: 'Could not verify payment with Pi — please retry' });
+      }
+      const st = piPayment && piPayment.status;
+      const verified = !!(st && (st.transaction_verified || st.developer_completed));
+      if (!verified && !process.env.SANDBOX_MODE) {
+        return res.status(502).json({ error: 'Pi payment not confirmed yet' });
+      }
+      verifiedAmount = parseFloat(piPayment.amount || verifiedAmount || 0);
+    }
+
+    const connectsAmount = resolveConnects(verifiedAmount);
     if (!(connectsAmount > 0)) {
       return res.status(400).json({ error: 'Payment amount too small to credit any connects' });
     }
@@ -535,9 +588,16 @@ router.post('/api/connects/purchase', auth, checkBlocked, async (req, res) => {
     let newBalance;
     try {
       await pgClient2.query('BEGIN');
+      // Same payment_id must not also have funded an escrow (or vice versa —
+      // see the metadata.connects_credited check in escrow creation below).
+      const escrowUsed = await pgClient2.query('SELECT id FROM escrows WHERE payment_id = $1 LIMIT 1', [payment_id]);
+      if (escrowUsed.rows.length) {
+        await pgClient2.query('ROLLBACK');
+        return res.status(400).json({ error: 'Payment already used for an escrow' });
+      }
       const updated = await pgClient2.query(
-        "UPDATE payments SET status = 'completed', updated_at = NOW() WHERE id = $1 AND status = 'approved' RETURNING id",
-        [payment_id]
+        "UPDATE payments SET status = 'completed', amount = $2, metadata = COALESCE(metadata, '{}'::jsonb) || $3::jsonb, updated_at = NOW() WHERE id = $1 AND status = 'approved' RETURNING id",
+        [payment_id, verifiedAmount, JSON.stringify({ type: 'connects', connects_credited: true, credited: connectsAmount })]
       );
       if (!updated.rows.length) {
         await pgClient2.query('ROLLBACK');
@@ -631,10 +691,21 @@ router.post('/api/connects/buy', auth, checkBlocked, async (req, res) => {
         return res.status(403).json({ error: 'Payment does not belong to you' });
       }
 
-      // Accept if Pi confirmed it, server already completed it, OR payment is approved.
-      // In SANDBOX_MODE also accept 'pending' — Pi sandbox doesn't issue real txids.
-      const acceptableStatuses = ['completed', 'approved'];
-      if (process.env.SANDBOX_MODE) acceptableStatuses.push('pending');
+      // Same payment_id must not also have funded an escrow (see the mirrored
+      // check in POST /api/escrow(s) and /api/connects/purchase above).
+      const escrowUsedBuy = await pgClient.query('SELECT id FROM escrows WHERE payment_id = $1 LIMIT 1', [payment_id]);
+      if (escrowUsedBuy.rows.length) {
+        await pgClient.query('ROLLBACK');
+        return res.status(400).json({ error: 'Payment already used for an escrow' });
+      }
+
+      // 'approved' alone is not proof of a Pi-confirmed transaction — it's set
+      // automatically by our own /approve step even when the underlying Pi API
+      // call failed (see handlePaymentApprove). Only trust it when there's no
+      // way to verify at all (no PI_API_KEY configured) or in sandbox, where
+      // Pi doesn't issue real txids.
+      const acceptableStatuses = ['completed'];
+      if (!PI_API_KEY || process.env.SANDBOX_MODE) acceptableStatuses.push('approved', 'pending');
       if (!verified && !acceptableStatuses.includes(payRow.status)) {
         await pgClient.query('ROLLBACK');
         return res.status(502).json({ error: 'Pi payment not confirmed' });
@@ -719,10 +790,17 @@ router.post(['/api/escrow', '/api/escrows'], auth, checkBlocked, async (req, res
   const { job_id, freelancer_id, payment_id } = req.body;
   if (!job_id || !freelancer_id || !payment_id) return res.status(400).json({ error: 'job_id, freelancer_id, payment_id required' });
   try {
-    const pmtRec = await query('SELECT id, user_id, amount, status FROM payments WHERE id = $1', [payment_id]);
+    const pmtRec = await query('SELECT id, user_id, amount, status, metadata FROM payments WHERE id = $1', [payment_id]);
     if (!pmtRec.rows.length) return res.status(402).json({ error: 'Payment not found — complete Pi payment first' });
     if (pmtRec.rows[0].user_id !== req.userId) return res.status(403).json({ error: 'Payment does not belong to you' });
     if (pmtRec.rows[0].status !== 'completed') return res.status(402).json({ error: 'Payment not yet completed' });
+    // A 'completed' status alone doesn't mean this payment is still spendable —
+    // /api/connects/purchase and /api/connects/buy also flip status to
+    // 'completed' when crediting connects from it. Without this check the same
+    // Pi payment could fund both a connects purchase and a full escrow.
+    if (pmtRec.rows[0].metadata && pmtRec.rows[0].metadata.connects_credited) {
+      return res.status(400).json({ error: 'Payment was already used to purchase connects' });
+    }
     const piVerifiedAmount = parseFloat(pmtRec.rows[0].amount || 0);
     const jobCheck = await query('SELECT posted_by, hired_freelancer_id FROM jobs WHERE id = $1', [job_id]);
     if (!jobCheck.rows.length) return res.status(404).json({ error: 'Job not found' });
@@ -828,6 +906,7 @@ router.post(['/api/escrows/:id/cancel', '/api/escrow/:id/cancel'], auth, checkBl
         [req.params.id, ['pending', 'funded']]
       );
       if (!updated.rows.length) { await pgClient6.query('ROLLBACK'); return res.status(400).json({ error: 'Escrow already settled' }); }
+      await pgClient6.query("UPDATE escrow_milestones SET status='cancelled', updated_at=NOW() WHERE escrow_id=$1 AND status IN ('pending','requested')", [req.params.id]);
       await pgClient6.query('UPDATE jobs SET status = $1, hired_freelancer_id = NULL, hired_freelancer_name = NULL, updated_at = NOW() WHERE id = $2', ['open', escrow.job_id]);
       if (wasFunded) {
         await pgClient6.query('UPDATE users SET balance_pi = COALESCE(balance_pi, 0) + $1, updated_at = NOW() WHERE id = $2', [escrow.amount, escrow.client_id]);
@@ -864,6 +943,7 @@ router.post('/api/escrow/:id/refund', auth, checkBlocked, async (req, res) => {
         [req.params.id, ['pending', 'funded']]
       );
       if (!updated.rows.length) { await pgClient7.query('ROLLBACK'); return res.status(400).json({ error: 'Already processed' }); }
+      await pgClient7.query("UPDATE escrow_milestones SET status='cancelled', updated_at=NOW() WHERE escrow_id=$1 AND status IN ('pending','requested')", [req.params.id]);
       await pgClient7.query('UPDATE jobs SET status = $1, hired_freelancer_id = NULL, hired_freelancer_name = NULL, updated_at = NOW() WHERE id = $2', ['open', escrow.job_id]);
       if (wasFunded) {
         await pgClient7.query('UPDATE users SET balance_pi = COALESCE(balance_pi, 0) + $1, updated_at = NOW() WHERE id = $2', [escrow.amount, escrow.client_id]);
@@ -888,8 +968,11 @@ router.post('/api/escrows/:id/fund', auth, checkBlocked, async (req, res) => {
     const preCheck = await query('SELECT * FROM escrows WHERE id = $1', [req.params.id]);
     if (!preCheck.rows.length) return res.status(404).json({ error: 'Escrow not found' });
     if (normalizeId(preCheck.rows[0].client_id) !== normalizeId(req.userId)) return res.status(403).json({ error: 'Not your escrow' });
-    const pmtCheck = await query('SELECT id, amount FROM payments WHERE payment_id = $1 AND status = $2 LIMIT 1', [payment_id, 'completed']);
+    const pmtCheck = await query('SELECT id, amount, metadata FROM payments WHERE payment_id = $1 AND status = $2 LIMIT 1', [payment_id, 'completed']);
     if (!pmtCheck.rows.length) return res.status(402).json({ error: 'Payment not verified — complete Pi payment first' });
+    if (pmtCheck.rows[0].metadata && pmtCheck.rows[0].metadata.connects_credited) {
+      return res.status(400).json({ error: 'Payment was already used to purchase connects' });
+    }
     let escrow;
     const pgFund = await getPool().connect();
     try {
@@ -1223,6 +1306,11 @@ router.post('/api/escrows/:id/milestones', auth, async (req, res) => {
   if (!milestones || !Array.isArray(milestones)) return res.status(400).json({ error: 'milestones array required' });
   const totalPct = milestones.reduce((s, m) => s + (parseInt(m.percent) || 0), 0);
   if (totalPct !== 100) return res.status(400).json({ error: 'Milestone percents must sum to 100' });
+  // Summing to 100 alone allows e.g. {130, -30} — a negative-percent milestone
+  // gets a negative amount, and approving it *reduces* the freelancer's
+  // balance_pi with no floor (see the approve route below). Each slice must
+  // be a genuine positive share of the escrow.
+  if (milestones.some(m => !(parseInt(m.percent) > 0))) return res.status(400).json({ error: 'Each milestone percent must be greater than 0' });
   if (milestones.length < 1 || milestones.length > 10) return res.status(400).json({ error: '1-10 milestones allowed' });
   try {
     const esc = await query('SELECT * FROM escrows WHERE id=$1', [escrowId]);
@@ -1298,6 +1386,11 @@ router.post('/api/escrows/:id/milestone/:milestoneId/approve', auth, checkBlocke
     if (!escRow.rows.length) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Escrow not found' }); }
     const e = escRow.rows[0];
     if (normalizeId(e.client_id) !== normalizeId(req.userId)) { await client.query('ROLLBACK'); return res.status(403).json({ error: 'Only client can approve' }); }
+    // A refunded/cancelled escrow already paid the client back in full — its
+    // milestones must not still be individually payable out of it, or the
+    // freelancer gets paid twice (once from the refund reversal never
+    // happening on milestones, once here).
+    if (!['funded', 'active'].includes(e.status)) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'Escrow is not funded — cannot approve milestones' }); }
     const msRow = await client.query('SELECT * FROM escrow_milestones WHERE id=$1 AND escrow_id=$2 FOR UPDATE', [milestoneId, escrowId]);
     if (!msRow.rows.length) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Milestone not found' }); }
     const m = msRow.rows[0];
