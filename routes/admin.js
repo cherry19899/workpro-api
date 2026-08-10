@@ -130,6 +130,7 @@ router.post('/api/admin/users/:id/block', adminAuth, async (req, res) => {
     if (isOwner) {
       return res.status(403).json({ error: 'Cannot block owner' });
     }
+    if (target.rows.length === 0) return res.status(404).json({ error: 'User not found' });
     // Block both duplicate-account twins so the block can't be bypassed by logging
     // in as the unblocked twin (same person, "pi_" prefix mismatch).
     await query('UPDATE users SET is_blocked = true, status = $1, updated_at = NOW() WHERE id IN ($2, $3)', ['blocked', req.params.id, twin]);
@@ -142,7 +143,8 @@ router.post('/api/admin/users/:id/block', adminAuth, async (req, res) => {
 router.post('/api/admin/users/:id/unblock', adminAuth, async (req, res) => {
   try {
     const twin = twinId(req.params.id);
-    await query('UPDATE users SET is_blocked = false, status = $1, updated_at = NOW() WHERE id IN ($2, $3)', ['active', req.params.id, twin]);
+    const result = await query('UPDATE users SET is_blocked = false, status = $1, updated_at = NOW() WHERE id IN ($2, $3)', ['active', req.params.id, twin]);
+    if (result.rowCount === 0) return res.status(404).json({ error: 'User not found' });
     await audit('user_unblocked', { user_id: req.params.id, by: req.userId, ip: req.headers['x-forwarded-for'] || req.ip });
     res.json({ success: true });
   } catch (err) { serverError(err, res); }
@@ -151,7 +153,8 @@ router.post('/api/admin/users/:id/unblock', adminAuth, async (req, res) => {
 // POST /api/admin/users/:id/make-admin
 router.post('/api/admin/users/:id/make-admin', adminAuth, async (req, res) => {
   try {
-    await query("UPDATE users SET role = 'admin', updated_at = NOW() WHERE id = $1", [req.params.id]);
+    const result = await query("UPDATE users SET role = 'admin', updated_at = NOW() WHERE id = $1", [req.params.id]);
+    if (result.rowCount === 0) return res.status(404).json({ error: 'User not found' });
     await audit('user_made_admin', { user_id: req.params.id, by: req.userId });
     res.json({ success: true });
   } catch (err) { serverError(err, res); }
@@ -160,10 +163,20 @@ router.post('/api/admin/users/:id/make-admin', adminAuth, async (req, res) => {
 // POST /api/admin/users/:id/remove-admin
 router.post('/api/admin/users/:id/remove-admin', adminAuth, async (req, res) => {
   try {
-    const target = await query('SELECT username FROM users WHERE id = $1', [req.params.id]);
-    if (req.params.id === 'cherry19899' || req.params.id === 'pi_cherry19899' || target.rows[0]?.username === 'cherry19899') {
+    // Same owner identities as the block route: the real owner logs in as
+    // 'pi_a2b617f7-…' username 'Cherry19899' (capital C) — the old
+    // case-sensitive, twin-blind check here missed both the uuid id form and
+    // that casing, so the owner's admin role could be stripped by an id or
+    // username this check didn't recognize as the owner.
+    const twin = twinId(req.params.id);
+    const OWNER_IDS = ['cherry19899', 'pi_cherry19899', 'a2b617f7-f510-4502-a046-805facedcc29', 'pi_a2b617f7-f510-4502-a046-805facedcc29'];
+    const target = await query('SELECT username, role FROM users WHERE id IN ($1, $2)', [req.params.id, twin]);
+    const isOwner = OWNER_IDS.includes(req.params.id) || OWNER_IDS.includes(twin) ||
+      target.rows.some(r => (r.username || '').toLowerCase() === 'cherry19899');
+    if (isOwner) {
       return res.status(403).json({ error: 'Cannot remove owner admin' });
     }
+    if (target.rows.length === 0) return res.status(404).json({ error: 'User not found' });
     await query("UPDATE users SET role = 'freelancer', updated_at = NOW() WHERE id = $1", [req.params.id]);
     await audit('user_removed_admin', { user_id: req.params.id, by: req.userId });
     res.json({ success: true });
@@ -175,7 +188,8 @@ router.post('/api/admin/users/:id/grant-connects', adminAuth, async (req, res) =
   const { amount } = req.body;
   const qty = Math.max(1, Math.min(10000, parseInt(amount || 50) || 50));
   try {
-    await query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [qty, req.params.id]);
+    const upd = await query('UPDATE users SET balance_connects = balance_connects + $1, updated_at = NOW() WHERE id = $2', [qty, req.params.id]);
+    if (upd.rowCount === 0) return res.status(404).json({ error: 'User not found' });
     const result = await query('SELECT balance_connects FROM users WHERE id = $1', [req.params.id]);
     await audit('admin_grant_connects', { user_id: req.params.id, amount: qty, granted_by: req.userId });
     res.json({ success: true, balance: result.rows[0]?.balance_connects || 0 });
@@ -298,7 +312,12 @@ router.patch('/api/admin/jobs/:id', adminAuth, async (req, res) => {
 router.delete('/api/admin/jobs/:id', adminAuth, async (req, res) => {
   if (!isIdParam(req.params.id)) return res.status(404).json({ error: 'Job not found' });
   try {
-    const fundedEscrow = await query("SELECT * FROM escrows WHERE job_id = $1 AND status = 'funded' LIMIT 1", [req.params.id]);
+    // escrows.job_id → jobs(id) is ON DELETE CASCADE, so the DELETE FROM jobs
+    // below erases any escrow row for this job regardless of status. A
+    // 'disputed' escrow still holds the client's Pi exactly like a 'funded'
+    // one — only checking 'funded' here silently destroyed that money on
+    // delete with no refund and no trace beyond the audit log's job_id.
+    const fundedEscrow = await query("SELECT * FROM escrows WHERE job_id = $1 AND status IN ('funded','disputed') LIMIT 1", [req.params.id]);
     const jobMeta = await query('SELECT apply_cost, posted_by FROM jobs WHERE id = $1', [req.params.id]);
     if (!jobMeta.rows.length) return res.status(404).json({ error: 'Job not found' });
     const applyRefundCost = jobMeta.rows[0]?.apply_cost || 1;
@@ -648,6 +667,12 @@ router.post('/api/admin/merge-users', adminAuth, async (req, res) => {
           await pgM.query('RELEASE SAVEPOINT sp');
         } catch (e) {
           await pgM.query('ROLLBACK TO SAVEPOINT sp');
+          // This savepoint exists to swallow the one expected failure — a
+          // unique-index collision (chat_rooms etc). Anything else (a
+          // dropped connection, a locked row) is a real failure that would
+          // otherwise leave from_id's rows silently un-repointed while
+          // from_id gets deleted a few statements later, orphaning them.
+          if (e.code !== '23505') throw e;
         }
       };
       // Re-point straightforward FK references first
@@ -695,6 +720,7 @@ router.post('/api/admin/merge-users', adminAuth, async (req, res) => {
             await pgM.query('RELEASE SAVEPOINT sp');
           } catch (e) {
             await pgM.query('ROLLBACK TO SAVEPOINT sp');
+            if (e.code !== '23505') throw e;
           }
         }
       };
@@ -725,7 +751,15 @@ router.post('/api/admin/merge-users', adminAuth, async (req, res) => {
           await pgM.query('DELETE FROM portfolios WHERE user_id = $1', [from_id]);
         }
         await pgM.query('RELEASE SAVEPOINT sp');
-      } catch { await pgM.query('ROLLBACK TO SAVEPOINT sp'); }
+      } catch (e) {
+        // The INSERT already handles the one expected collision via
+        // ON CONFLICT, so there is nothing legitimate left for this to
+        // swallow — anything reaching here is a real failure and merge-users
+        // is about to delete from_id, which would silently lose their
+        // portfolio data if this were absorbed instead of raised.
+        await pgM.query('ROLLBACK TO SAVEPOINT sp');
+        throw e;
+      }
 
       // If from was admin, promote to
       if (from.role === 'admin') {
@@ -927,7 +961,14 @@ router.post('/api/admin/auto-merge-twins', adminAuth, async (req, res) => {
             try {
               await pgM.query(`UPDATE ${tbl} SET ${col} = $1 WHERE ${col} = $2`, [canonical_id, twin_id]);
               await pgM.query('RELEASE SAVEPOINT sp');
-            } catch { await pgM.query('ROLLBACK TO SAVEPOINT sp'); }
+            } catch (e) {
+              await pgM.query('ROLLBACK TO SAVEPOINT sp');
+              // Only a unique-index collision is expected here; anything else
+              // is a real failure and the outer per-pair catch below already
+              // rolls back and reports it instead of deleting twin_id with
+              // this table's rows left un-repointed.
+              if (e.code !== '23505') throw e;
+            }
           };
           const fkCols = [
             ['jobs', 'posted_by'], ['jobs', 'hired_freelancer_id'],
@@ -962,7 +1003,10 @@ router.post('/api/admin/auto-merge-twins', adminAuth, async (req, res) => {
               await pgM.query('DELETE FROM portfolios WHERE user_id=$1', [twin_id]);
             }
             await pgM.query('RELEASE SAVEPOINT sp');
-          } catch { await pgM.query('ROLLBACK TO SAVEPOINT sp'); }
+          } catch (e) {
+            await pgM.query('ROLLBACK TO SAVEPOINT sp');
+            throw e;
+          }
 
           if (from.role === 'admin') await pgM.query("UPDATE users SET role='admin' WHERE id=$1", [canonical_id]);
           await pgM.query('DELETE FROM users WHERE id = $1', [twin_id]);
@@ -1130,10 +1174,15 @@ router.post('/api/admin/users/bulk-block', adminAuth, async (req, res) => {
   const safe = user_ids.filter(id => !OWNER_IDS.includes(id));
   const skipped = user_ids.length - safe.length;
   if (safe.length === 0) return res.status(403).json({ error: 'Cannot block owner account(s)' });
+  // The single-user block route also blocks the id's "pi_" twin (same person,
+  // duplicate account) — bulk-block skipped that, so a bulk-blocked user could
+  // just log in as their unblocked twin and keep going, since /api/auth/login
+  // checks is_blocked on the exact login uid only, not twin-aware.
+  const ids = [...new Set(safe.flatMap(id => [id, twinId(id)]))];
   try {
     await query(
       `UPDATE users SET is_blocked = true, status = 'blocked', updated_at = NOW() WHERE id = ANY($1::text[])`,
-      [safe]
+      [ids]
     );
     await audit('bulk_user_blocked', { user_ids: safe, count: safe.length, skipped_owner: skipped, by: req.userId });
     res.json({ success: true, blocked: safe.length, skipped_owner: skipped });
@@ -1145,10 +1194,14 @@ router.post('/api/admin/users/bulk-unblock', adminAuth, async (req, res) => {
   const { user_ids } = req.body;
   if (!Array.isArray(user_ids) || user_ids.length === 0) return res.status(400).json({ error: 'user_ids array required' });
   if (user_ids.length > 100) return res.status(400).json({ error: 'Max 100 users per request' });
+  // Mirror bulk-block's twin handling — otherwise an admin unblocks a user,
+  // sees success, but the "pi_" twin (blocked by bulk-block above) is still
+  // blocked and the user still can't log in under that id.
+  const ids = [...new Set(user_ids.flatMap(id => [id, twinId(id)]))];
   try {
     await query(
       `UPDATE users SET is_blocked = false, status = 'active', updated_at = NOW() WHERE id = ANY($1::text[])`,
-      [user_ids]
+      [ids]
     );
     await audit('bulk_user_unblocked', { user_ids, count: user_ids.length, by: req.userId });
     res.json({ success: true, unblocked: user_ids.length });
@@ -1225,7 +1278,7 @@ router.get('/api/admin/analytics/retention', adminAuth, async (req, res) => {
         COUNT(CASE WHEN last_active < NOW()-INTERVAL '30 days' THEN 1 END)  AS churned,
         COUNT(*) AS total
       FROM users WHERE status != 'deleted'
-    `).catch(() => ({ rows: [{}] }));
+    `);
     res.json(r.rows[0] || {});
   } catch (err) { serverError(err, res); }
 });
@@ -1237,7 +1290,12 @@ function toCSV(rows) {
   const headers = Object.keys(rows[0]);
   const escape = v => {
     if (v == null) return '';
-    const s = String(v).replace(/"/g, '""');
+    let s = String(v);
+    // A username/category/etc starting with =, +, -, @ (or a tab/CR) is
+    // interpreted as a formula by Excel/Sheets when the export is opened —
+    // prefix with a quote to defuse it (standard CSV-injection mitigation).
+    if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`;
+    s = s.replace(/"/g, '""');
     return s.includes(',') || s.includes('"') || s.includes('\n') ? `"${s}"` : s;
   };
   return [
@@ -1252,7 +1310,10 @@ router.get('/api/admin/export/:table', adminAuth, async (req, res) => {
   const table = ALLOWED[req.params.table];
   if (!table) return res.status(400).json({ error: `Unknown table. Allowed: ${Object.keys(ALLOWED).join(', ')}` });
   try {
-    const limit = Math.min(10000, parseInt(req.query.limit) || 1000);
+    // parseInt('-1') is truthy, so without a floor here ?limit=-1 reaches
+    // Postgres as `LIMIT -1`, which errors ("LIMIT must not be negative")
+    // and isn't in CLIENT_DATA_ERRORS, surfacing as a raw 500 instead of 400.
+    const limit = Math.min(10000, Math.max(1, parseInt(req.query.limit) || 1000));
     const r = await query(`SELECT * FROM ${table} ORDER BY created_at DESC LIMIT $1`, [limit]);
     const csv = toCSV(r.rows);
     res.setHeader('Content-Type', 'text/csv');
@@ -1270,7 +1331,7 @@ router.get('/api/admin/realtime', adminAuth, async (req, res) => {
         (SELECT COUNT(*) FROM jobs WHERE created_at >= NOW()-INTERVAL '1 hour') AS jobs_last_hour,
         (SELECT COALESCE(SUM(amount),0) FROM payments WHERE status='completed' AND created_at >= NOW()-INTERVAL '24 hours') AS revenue_24h,
         (SELECT COUNT(*) FROM escrows WHERE status IN ('funded','active')) AS active_escrows
-    `).catch(() => ({ rows: [{ online_now: 0, jobs_last_hour: 0, revenue_24h: 0, active_escrows: 0 }] }));
+    `);
     res.json(r.rows[0]);
   } catch (err) { serverError(err, res); }
 });
