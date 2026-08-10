@@ -142,8 +142,11 @@ router.get('/api/users/:id/portfolio', async (req, res) => {
   try {
     const userResult = await query('SELECT id, username, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar FROM users WHERE id = $1', [req.params.id]);
     if (!userResult.rows.length) return res.status(404).json({ error: 'User not found' });
-    const portfolioResult = await query('SELECT * FROM portfolios WHERE user_id = $1', [req.params.id]).catch(() => ({ rows: [] }));
-    const itemsResult = await query('SELECT * FROM portfolio_items WHERE user_id = $1 ORDER BY created_at DESC', [req.params.id]).catch(() => ({ rows: [] }));
+    // No .catch(() => ({rows: []})) here: both tables are created at boot, so
+    // a failure is a real one, and swallowing it rendered the owner's
+    // portfolio as empty — indistinguishable from never having written one.
+    const portfolioResult = await query('SELECT * FROM portfolios WHERE user_id = $1', [req.params.id]);
+    const itemsResult = await query('SELECT * FROM portfolio_items WHERE user_id = $1 ORDER BY created_at DESC', [req.params.id]);
     const owner = userResult.rows[0];
     res.json({
       owner,
@@ -208,8 +211,11 @@ router.post('/api/users/me/portfolio/items', auth, checkBlocked, async (req, res
 
 // DELETE /api/users/me/portfolio/items/:itemId — remove own work item
 router.delete('/api/users/me/portfolio/items/:itemId', auth, async (req, res) => {
+  // Not isNaN(parseInt(...)): parseInt stops at the first non-digit, so
+  // `/items/5abc` passed that check and then deleted item 5 — a different
+  // item than the URL named — and reported success for it.
+  if (!isIdParam(req.params.itemId)) return res.status(404).json({ error: 'Item not found' });
   const itemId = parseInt(req.params.itemId);
-  if (isNaN(itemId)) return res.status(400).json({ error: 'Invalid item id' });
   try {
     const result = await query('DELETE FROM portfolio_items WHERE id = $1 AND user_id = $2 RETURNING id', [itemId, req.userId]);
     if (!result.rows.length) return res.status(404).json({ error: 'Item not found' });

@@ -1195,6 +1195,7 @@ router.post('/api/payments/webhook', async (req, res) => {
 
 // GET /api/escrows/:id/milestones
 router.get('/api/escrows/:id/milestones', auth, async (req, res) => {
+  if (!isIdParam(req.params.id)) return res.status(404).json({ error: 'Escrow not found' });
   const escrowId = parseInt(req.params.id);
   try {
     const esc = await query('SELECT * FROM escrows WHERE id=$1', [escrowId]);
@@ -1213,6 +1214,10 @@ router.get('/api/escrows/:id/milestones', auth, async (req, res) => {
 
 // POST /api/escrows/:id/milestones — create milestones (on fund, auto-created)
 router.post('/api/escrows/:id/milestones', auth, async (req, res) => {
+  // This route deletes the escrow's pending milestones and writes new ones, so
+  // parseInt's prefix parsing let `/escrows/5abc/milestones` rewrite the
+  // milestones of escrow 5.
+  if (!isIdParam(req.params.id)) return res.status(404).json({ error: 'Escrow not found' });
   const escrowId = parseInt(req.params.id);
   const { milestones } = req.body; // [{ title, percent }]
   if (!milestones || !Array.isArray(milestones)) return res.status(400).json({ error: 'milestones array required' });
