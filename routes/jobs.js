@@ -305,7 +305,7 @@ router.get('/api/jobs/:id', softAuth, async (req, res) => {
     const job_row = jobResult.rows[0];
     const callerId = req.userId || null;
     let applications = [];
-    if (callerId && callerId === job_row.posted_by) {
+    if (callerId && normalizeId(callerId) === normalizeId(job_row.posted_by)) {
       const appsResult = await query('SELECT * FROM applications WHERE job_id = $1 ORDER BY created_at DESC LIMIT 200', [req.params.id]);
       applications = appsResult.rows;
     }
@@ -571,7 +571,7 @@ router.post('/api/jobs/:id/hire', auth, checkBlocked, async (req, res) => {
     }
     const pmtRec = await query('SELECT id, user_id, amount, status FROM payments WHERE id = $1', [payment_id]);
     if (!pmtRec.rows.length) return res.status(402).json({ error: 'Payment not found — complete Pi payment first' });
-    if (pmtRec.rows[0].user_id !== req.userId) return res.status(403).json({ error: 'Payment does not belong to you' });
+    if (normalizeId(pmtRec.rows[0].user_id) !== normalizeId(req.userId)) return res.status(403).json({ error: 'Payment does not belong to you' });
     if (pmtRec.rows[0].status !== 'completed') return res.status(402).json({ error: 'Payment not yet completed' });
     const appResult = await query('SELECT * FROM applications WHERE id = $1 AND job_id = $2 AND status = $3', [application_id, req.params.id, 'pending']);
     if (!appResult.rows.length) return res.status(404).json({ error: 'Application not found or not in pending status' });
@@ -722,26 +722,30 @@ router.post('/api/jobs/:id/complete', auth, checkBlocked, async (req, res) => {
 router.delete('/api/jobs/:id', auth, checkBlocked, async (req, res) => {
   if (!isIdParam(req.params.id)) return res.status(404).json({ error: 'Job not found' });
   try {
-    const jobResult = await query('SELECT * FROM jobs WHERE id = $1', [req.params.id]);
+    const jobResult = await query('SELECT posted_by FROM jobs WHERE id = $1', [req.params.id]);
     if (!jobResult.rows.length) return res.status(404).json({ error: 'Job not found' });
-    const job = jobResult.rows[0];
-    if (normalizeId(job.posted_by) !== normalizeId(req.userId)) return res.status(403).json({ error: 'Not your job' });
-    if (['in_progress', 'submitted'].includes(job.status)) return res.status(400).json({ error: 'Cannot delete a job that is in progress' });
-    const applyRefundCost = job.apply_cost || 1;
-    const applicants = await query("SELECT DISTINCT freelancer_id FROM applications WHERE job_id = $1 AND status = 'pending'", [req.params.id]);
+    if (normalizeId(jobResult.rows[0].posted_by) !== normalizeId(req.userId)) return res.status(403).json({ error: 'Not your job' });
     const pgClientDel = await getPool().connect();
     try {
       await pgClientDel.query('BEGIN');
-      /* connects are non-refundable — spent on apply/post, no refund on reject/delete */
-      for (const row of applicants.rows) {
-        /* connects are non-refundable — spent on apply/post, no refund on reject/delete */
+      // Re-check status inside the transaction under a row lock. The ownership
+      // read above is stale by the time DELETE runs — escrows.job_id is ON
+      // DELETE CASCADE, so a concurrent hire landing in that window would
+      // otherwise let a freshly-funded escrow get wiped with no refund.
+      const jobLockDel = await pgClientDel.query('SELECT status FROM jobs WHERE id = $1 FOR UPDATE', [req.params.id]);
+      if (!jobLockDel.rows.length) { await pgClientDel.query('ROLLBACK'); return res.status(404).json({ error: 'Job not found' }); }
+      if (['in_progress', 'submitted'].includes(jobLockDel.rows[0].status)) {
+        await pgClientDel.query('ROLLBACK');
+        return res.status(400).json({ error: 'Cannot delete a job that is in progress' });
       }
+      const applicants = await pgClientDel.query("SELECT DISTINCT freelancer_id FROM applications WHERE job_id = $1 AND status = 'pending'", [req.params.id]);
+      /* connects are non-refundable — spent on apply/post, no refund on reject/delete */
       await pgClientDel.query('DELETE FROM applications WHERE job_id = $1', [req.params.id]);
       await pgClientDel.query('DELETE FROM jobs WHERE id = $1', [req.params.id]);
       await pgClientDel.query('COMMIT');
+      return res.json({ success: true, refunded: applicants.rows.length });
     } catch (txErr) { await pgClientDel.query('ROLLBACK').catch(() => {}); throw txErr; }
     finally { pgClientDel.release(); }
-    res.json({ success: true, refunded: applicants.rows.length });
   } catch (err) { serverError(err, res); }
 });
 
@@ -751,11 +755,13 @@ router.get('/api/jobs/:id/applications', auth, async (req, res) => {
   const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 100, 500));
   const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
-    const jobResult = await query('SELECT j.posted_by, j.posted_by_name, u.username FROM jobs j LEFT JOIN users u ON u.id = $1 WHERE j.id = $2', [req.userId, req.params.id]);
+    const jobResult = await query('SELECT posted_by FROM jobs WHERE id = $1', [req.params.id]);
     if (!jobResult.rows.length) return res.status(404).json({ error: 'Job not found' });
-    const { posted_by, posted_by_name, username: callerUsername } = jobResult.rows[0];
-    const isOwner = normalizeId(posted_by) === normalizeId(req.userId)
-      || (posted_by_name && callerUsername && posted_by_name.toLowerCase() === callerUsername.toLowerCase());
+    // jobs.posted_by is always set to the poster's stable id at creation
+    // (see POST /api/jobs) — a username-match fallback here would let anyone
+    // read another client's applicant list just by renaming into a username
+    // the real owner previously held and has since changed away from.
+    const isOwner = normalizeId(jobResult.rows[0].posted_by) === normalizeId(req.userId);
     if (!isOwner) return res.status(403).json({ error: 'Forbidden' });
     const [result, totalRes] = await Promise.all([
       query(
@@ -808,14 +814,25 @@ router.post('/api/applications', auth, checkBlocked, async (req, res) => {
     const cost = job.apply_cost || 1;
     if (!user || user.balance_connects < cost) return res.status(400).json({ error: 'Not enough connects', required: cost, current: user?.balance_connects || 0 });
     let appResult;
+    let lockedCostAlias = cost;
     const pgClient = await getPool().connect();
     try {
       await pgClient.query('BEGIN');
+      // Re-check job status inside the transaction (same race the sibling
+      // /api/jobs/:id/apply guards against) — without this, a job that gets
+      // hired between the outer check and here still takes the freelancer's
+      // non-refundable connects for an application that can never be accepted.
+      const jobLockAlias = await pgClient.query('SELECT status, apply_cost FROM jobs WHERE id = $1 FOR UPDATE', [job_id]);
+      if (!jobLockAlias.rows.length || jobLockAlias.rows[0].status !== 'open') {
+        await pgClient.query('ROLLBACK');
+        return res.status(400).json({ error: 'Job is not open' });
+      }
+      lockedCostAlias = jobLockAlias.rows[0].apply_cost || 1;
       const deductResult2 = await pgClient.query(
         'UPDATE users SET balance_connects = balance_connects - $1, updated_at = NOW() WHERE id = $2 AND balance_connects >= $1 RETURNING id',
-        [cost, req.userId]
+        [lockedCostAlias, req.userId]
       );
-      if (!deductResult2.rows.length) { await pgClient.query('ROLLBACK'); return res.status(400).json({ error: 'Not enough connects', required: cost }); }
+      if (!deductResult2.rows.length) { await pgClient.query('ROLLBACK'); return res.status(400).json({ error: 'Not enough connects', required: lockedCostAlias }); }
       const existingForAlias = await pgClient.query(
         `SELECT id FROM applications WHERE job_id=$1 AND freelancer_id=$2 AND status IN ('withdrawn','rejected','offer','declined') LIMIT 1`,
         [job_id, req.userId]
@@ -843,7 +860,7 @@ router.post('/api/applications', auth, checkBlocked, async (req, res) => {
     await notify(job.posted_by, 'application', `Новый отклик на задачу "${job.title}"`,
       `${user.username || 'Фрилансер'} откликнулся на вашу задачу`, parseInt(job_id), null,
       { key: 'nNewApplication', params: { job: job.title, name: user.username || '' } });
-    const newBal = (user.balance_connects || 0) - cost;
+    const newBal = (user.balance_connects || 0) - lockedCostAlias;
     res.json({ application: appResult.rows[0], success: true, remaining_connects: newBal, new_balance: newBal });
   } catch (err) { serverError(err, res); }
 });
@@ -944,6 +961,23 @@ router.patch('/api/applications/:id', auth, checkBlocked, async (req, res) => {
       if (status === 'rejected' && app_.status === 'pending') {
         /* connects are non-refundable — spent on apply/post, no refund on reject/delete */
       }
+      if (status === 'accepted') {
+        // Lock the job row and re-verify job+application state inside the
+        // transaction — without this, a job that's already hired/in-progress
+        // could get its hired_freelancer_id hijacked, and concurrent accepts
+        // on the same job could each insert their own escrow (no job lock
+        // meant "no existing escrow yet" was visible to both at once).
+        const jobLockPatch = await pgPatch.query('SELECT status FROM jobs WHERE id = $1 FOR UPDATE', [app_.job_id]);
+        if (!jobLockPatch.rows.length || jobLockPatch.rows[0].status !== 'open') {
+          await pgPatch.query('ROLLBACK');
+          return res.status(400).json({ error: 'Job is not open' });
+        }
+        const appLockPatch = await pgPatch.query("SELECT id FROM applications WHERE id = $1 AND status = 'pending' FOR UPDATE", [req.params.id]);
+        if (!appLockPatch.rows.length) {
+          await pgPatch.query('ROLLBACK');
+          return res.status(409).json({ error: 'Application is no longer pending — it may have already been accepted' });
+        }
+      }
       const result = await pgPatch.query('UPDATE applications SET status = $1, updated_at = NOW() WHERE id = $2 RETURNING *', [status, req.params.id]);
       patchedApp = result.rows[0];
       if (status === 'accepted') {
@@ -1006,10 +1040,6 @@ router.post('/api/applications/:id/accept', auth, checkBlocked, async (req, res)
     if (!appResult.rows.length) return res.status(404).json({ error: 'Application not found' });
     const app_ = appResult.rows[0];
     if (normalizeId(app_.posted_by) !== normalizeId(req.userId)) return res.status(403).json({ error: 'Forbidden' });
-    const jobStatusCheck = await query('SELECT status FROM jobs WHERE id = $1', [app_.job_id]);
-    if (!jobStatusCheck.rows.length || ['completed', 'cancelled'].includes(jobStatusCheck.rows[0].status)) {
-      return res.status(400).json({ error: 'Cannot accept application — job is already completed or cancelled' });
-    }
     const freelancerId = app_.freelancer_id;
     const escrowAmount = app_.bid_amount || app_.budget || 0;
     let escrow = null;
@@ -1017,6 +1047,21 @@ router.post('/api/applications/:id/accept', auth, checkBlocked, async (req, res)
     const pgClientAccept = await getPool().connect();
     try {
       await pgClientAccept.query('BEGIN');
+      // Lock the job row and re-verify job+application state inside the
+      // transaction. The old outer check only excluded 'completed'/'cancelled'
+      // (missing 'in_progress'/'submitted'), so an already-hired job could get
+      // hijacked to a new freelancer, and with no job-row lock, two concurrent
+      // accepts could each see "no existing escrow yet" and both insert one.
+      const jobLockAccept = await pgClientAccept.query('SELECT status FROM jobs WHERE id = $1 FOR UPDATE', [app_.job_id]);
+      if (!jobLockAccept.rows.length || jobLockAccept.rows[0].status !== 'open') {
+        await pgClientAccept.query('ROLLBACK');
+        return res.status(400).json({ error: 'Job is not open' });
+      }
+      const appLockAccept = await pgClientAccept.query("SELECT id FROM applications WHERE id = $1 AND status = 'pending' FOR UPDATE", [req.params.id]);
+      if (!appLockAccept.rows.length) {
+        await pgClientAccept.query('ROLLBACK');
+        return res.status(409).json({ error: 'Application is no longer pending — it may have already been accepted' });
+      }
       const acceptRes = await pgClientAccept.query('UPDATE applications SET status = $1, updated_at = NOW() WHERE id = $2 RETURNING *', ['accepted', req.params.id]);
       acceptedApp = acceptRes.rows[0];
       const jobApplyCost = await pgClientAccept.query('SELECT apply_cost FROM jobs WHERE id = $1', [app_.job_id]);
@@ -1141,6 +1186,22 @@ router.put('/api/applications/:id/status', auth, checkBlocked, async (req, res) 
       if (status === 'rejected' && app_.status === 'pending') {
         /* connects are non-refundable — spent on apply/post, no refund on reject/delete */
       }
+      if (status === 'accepted') {
+        // Same guard as PATCH /api/applications/:id — lock the job row and
+        // re-verify job+application state inside the transaction so an
+        // already-hired job can't be hijacked and concurrent accepts can't
+        // each insert their own escrow for the same job.
+        const jobLockStatus = await pgStatusClient.query('SELECT status FROM jobs WHERE id = $1 FOR UPDATE', [app_.job_id]);
+        if (!jobLockStatus.rows.length || jobLockStatus.rows[0].status !== 'open') {
+          await pgStatusClient.query('ROLLBACK');
+          return res.status(400).json({ error: 'Job is not open' });
+        }
+        const appLockStatus = await pgStatusClient.query("SELECT id FROM applications WHERE id = $1 AND status = 'pending' FOR UPDATE", [req.params.id]);
+        if (!appLockStatus.rows.length) {
+          await pgStatusClient.query('ROLLBACK');
+          return res.status(409).json({ error: 'Application is no longer pending — it may have already been accepted' });
+        }
+      }
       const result = await pgStatusClient.query('UPDATE applications SET status = $1, updated_at = NOW() WHERE id = $2 RETURNING *', [status, req.params.id]);
       updatedApp = result.rows[0];
       if (status === 'accepted') {
@@ -1213,6 +1274,23 @@ router.post('/api/applications/:id/hire', auth, checkBlocked, async (req, res) =
     const pgClientHire = await getPool().connect();
     try {
       await pgClientHire.query('BEGIN');
+      // This route had no job-status check at all — it could fire on a
+      // completed/in_progress job, reopening it and overwriting
+      // hired_freelancer_id to a new freelancer while the original funded
+      // escrow stayed untouched (money and "job done" notification would
+      // then go to different freelancers). Lock the job row and require
+      // 'open', and re-verify the application is still pending, matching
+      // the pattern already used by the correctly-guarded /api/jobs/:id/hire.
+      const jobLockHire = await pgClientHire.query('SELECT status FROM jobs WHERE id = $1 FOR UPDATE', [app_.job_id]);
+      if (!jobLockHire.rows.length || jobLockHire.rows[0].status !== 'open') {
+        await pgClientHire.query('ROLLBACK');
+        return res.status(400).json({ error: 'Job is not open' });
+      }
+      const appLockHire = await pgClientHire.query("SELECT id FROM applications WHERE id = $1 AND status = 'pending' FOR UPDATE", [req.params.id]);
+      if (!appLockHire.rows.length) {
+        await pgClientHire.query('ROLLBACK');
+        return res.status(409).json({ error: 'Application is no longer pending — it may have already been accepted' });
+      }
       await pgClientHire.query('UPDATE applications SET status = $1, updated_at = NOW() WHERE id = $2', ['accepted', req.params.id]);
       const existingEsc = await pgClientHire.query(
         "SELECT * FROM escrows WHERE job_id = $1 AND status = ANY($2) FOR UPDATE",
