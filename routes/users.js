@@ -198,13 +198,18 @@ router.post('/api/users/me/portfolio/items', auth, checkBlocked, async (req, res
   const image = safeHttpUrl(image_url);
   if (image === null) return res.status(400).json({ error: `Invalid image link — use a full http(s) URL (max ${MAX_URL_LEN} characters)` });
   try {
-    const count = await query('SELECT COUNT(*) FROM portfolio_items WHERE user_id = $1', [req.userId]);
-    if (parseInt(count.rows[0].count) >= 20) return res.status(400).json({ error: 'Portfolio limit reached (max 20 items)' });
+    // The count and the insert used to be a separate round trip apiece, wide
+    // enough for two near-simultaneous taps of "add" to both read 19 and both
+    // insert. One statement closes that window; a soft display cap doesn't
+    // need the row locking that would make it airtight under true concurrency.
     const result = await query(
       `INSERT INTO portfolio_items (user_id, title, description, image_url, category, tags)
-       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+       SELECT $1,$2,$3,$4,$5,$6
+       WHERE (SELECT COUNT(*) FROM portfolio_items WHERE user_id = $1) < 20
+       RETURNING *`,
       [req.userId, String(title).trim(), description, image, category, tags]
     );
+    if (!result.rows.length) return res.status(400).json({ error: 'Portfolio limit reached (max 20 items)' });
     res.json({ item: result.rows[0], success: true });
   } catch (err) { serverError(err, res); }
 });
