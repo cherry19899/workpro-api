@@ -9,6 +9,18 @@ const { auth, softAuth, checkBlocked, messageLimiter } = require('../src/middlew
 const multer = require('multer');
 const { pushText } = require('../src/push-i18n');
 const normalizeId = (id) => (id || '').toString().toLowerCase().replace(/^pi_/, '');
+
+// Ids must be compared normalised. Pi sends them with inconsistent case and an
+// optional pi_ prefix, so a raw match locks a user out of their own chat — they
+// could open the room header (which already normalised) but every message read
+// and send answered 403, and their rooms could go missing from the list.
+// Built once here so the two spellings cannot drift apart again.
+const nrm = (expr) => `lower(regexp_replace(${expr}, '^pi_', ''))`;
+/** SQL: is `param` (a $n placeholder) a participant of the row? */
+const memberOf = (param, p = '') => `(${nrm(p + 'client_id')} = ${nrm(param)} OR ${nrm(p + 'freelancer_id')} = ${nrm(param)})`;
+/** SQL: are `a` and `b` the two participants, in either order? */
+const pairIs = (a, b) => `((${nrm('client_id')} = ${nrm(a)} AND ${nrm('freelancer_id')} = ${nrm(b)})` +
+  ` OR (${nrm('client_id')} = ${nrm(b)} AND ${nrm('freelancer_id')} = ${nrm(a)}))`;
 // memoryStorage — NOT disk: Render's filesystem is ephemeral (wiped on every
 // restart/deploy), so 'uploads/' would lose files. We persist bytes in Postgres
 // (chat_attachments) so attachments survive restarts. 5 MB cap.
@@ -31,19 +43,21 @@ router.get('/api/chat/rooms', auth, async (req, res) => {
             )
           ) as unread_count,
           j.title as job_title,
-          CASE WHEN r.client_id = $1 THEN r.freelancer_id ELSE r.client_id END as other_user_id,
-          CASE WHEN r.client_id = $1 THEN uf.username ELSE uc.username END as other_user_name,
-          CASE WHEN r.client_id = $1 THEN uf.avatar ELSE uc.avatar END as other_user_avatar
+          -- Normalised like the membership test below: a raw match here picks
+          -- the wrong side, showing the viewer themselves as "the other user".
+          CASE WHEN ${nrm('r.client_id')} = ${nrm('$1')} THEN r.freelancer_id ELSE r.client_id END as other_user_id,
+          CASE WHEN ${nrm('r.client_id')} = ${nrm('$1')} THEN uf.username ELSE uc.username END as other_user_name,
+          CASE WHEN ${nrm('r.client_id')} = ${nrm('$1')} THEN uf.avatar ELSE uc.avatar END as other_user_avatar
          FROM chat_rooms r
          LEFT JOIN jobs j ON j.id = r.job_id
          LEFT JOIN users uc ON uc.id = r.client_id
          LEFT JOIN users uf ON uf.id = r.freelancer_id
-         WHERE r.client_id = $1 OR r.freelancer_id = $1
+         WHERE ${memberOf('$1', 'r.')}
          ORDER BY last_message_at DESC NULLS LAST
          LIMIT $2 OFFSET $3`,
         [req.userId, limit, offset]
       ),
-      query('SELECT COUNT(*) FROM chat_rooms WHERE client_id = $1 OR freelancer_id = $1', [req.userId]),
+      query(`SELECT COUNT(*) FROM chat_rooms WHERE ${memberOf('$1')}`, [req.userId]),
     ]);
     res.json({ rooms: result.rows, total: parseInt(totalRes.rows[0].count), limit, offset });
   } catch (err) { serverError(err, res); }
@@ -71,7 +85,7 @@ router.post('/api/chat/rooms', auth, checkBlocked, messageLimiter, async (req, r
       if (!appCheck.rows.length) return res.status(403).json({ error: 'You are not a participant in this job' });
     }
     const existing = await query(
-      'SELECT * FROM chat_rooms WHERE job_id = $1 AND ((client_id = $2 AND freelancer_id = $3) OR (client_id = $3 AND freelancer_id = $2))',
+      `SELECT * FROM chat_rooms WHERE job_id = $1 AND ${pairIs('$2','$3')}`,
       [job_id, cId, freelancer_id]
     );
     if (existing.rows.length) return res.json({ room: existing.rows[0] });
@@ -129,7 +143,7 @@ router.get('/api/chat/rooms/:id/messages', auth, async (req, res) => {
   const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 100, 200));
   const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
-    const room = await query('SELECT * FROM chat_rooms WHERE id = $1 AND (client_id = $2 OR freelancer_id = $2)', [req.params.id, req.userId]);
+    const room = await query(`SELECT * FROM chat_rooms WHERE id = $1 AND ${memberOf('$2')}`, [req.params.id, req.userId]);
     if (!room.rows.length) return res.status(403).json({ error: 'Forbidden' });
     const [result, totalRes] = await Promise.all([
       query('SELECT * FROM chat_messages WHERE room_id = $1 ORDER BY created_at ASC LIMIT $2 OFFSET $3', [req.params.id, limit, offset]),
@@ -146,7 +160,7 @@ router.post('/api/chat/rooms/:id/messages', auth, checkBlocked, messageLimiter, 
   if (!message || !message.trim()) return res.status(400).json({ error: 'Message required' });
   if (message.length > 2000) return res.status(400).json({ error: 'Message too long (max 2000 chars)' });
   try {
-    const room = await query('SELECT * FROM chat_rooms WHERE id = $1 AND (client_id = $2 OR freelancer_id = $2)', [req.params.id, req.userId]);
+    const room = await query(`SELECT * FROM chat_rooms WHERE id = $1 AND ${memberOf('$2')}`, [req.params.id, req.userId]);
     if (!room.rows.length) return res.status(403).json({ error: 'Forbidden' });
     const userResult = await query('SELECT username FROM users WHERE id = $1', [req.userId]);
     const senderName = userResult.rows[0]?.username || req.userId;
@@ -185,11 +199,11 @@ router.post('/api/chat/start', auth, checkBlocked, messageLimiter, async (req, r
     }
     const existing = jobId
       ? await query(
-          'SELECT * FROM chat_rooms WHERE job_id = $3 AND ((client_id = $1 AND freelancer_id = $2) OR (client_id = $2 AND freelancer_id = $1))',
+          `SELECT * FROM chat_rooms WHERE job_id = $3 AND ${pairIs('$1','$2')}`,
           [req.userId, other_user_id, jobId]
         )
       : await query(
-          'SELECT * FROM chat_rooms WHERE job_id IS NULL AND ((client_id = $1 AND freelancer_id = $2) OR (client_id = $2 AND freelancer_id = $1))',
+          `SELECT * FROM chat_rooms WHERE job_id IS NULL AND ${pairIs('$1','$2')}`,
           [req.userId, other_user_id]
         );
     if (existing.rows.length) return res.json({ conversation: existing.rows[0], id: existing.rows[0].id });
@@ -216,19 +230,21 @@ router.get('/api/chat/conversations', auth, async (req, res) => {
             )
           ) as unread_count,
           j.title as job_title,
-          CASE WHEN r.client_id = $1 THEN r.freelancer_id ELSE r.client_id END as other_user_id,
-          CASE WHEN r.client_id = $1 THEN uf.username ELSE uc.username END as other_user_name,
-          CASE WHEN r.client_id = $1 THEN uf.avatar ELSE uc.avatar END as other_user_avatar
+          -- Normalised like the membership test below: a raw match here picks
+          -- the wrong side, showing the viewer themselves as "the other user".
+          CASE WHEN ${nrm('r.client_id')} = ${nrm('$1')} THEN r.freelancer_id ELSE r.client_id END as other_user_id,
+          CASE WHEN ${nrm('r.client_id')} = ${nrm('$1')} THEN uf.username ELSE uc.username END as other_user_name,
+          CASE WHEN ${nrm('r.client_id')} = ${nrm('$1')} THEN uf.avatar ELSE uc.avatar END as other_user_avatar
          FROM chat_rooms r
          LEFT JOIN jobs j ON j.id = r.job_id
          LEFT JOIN users uc ON uc.id = r.client_id
          LEFT JOIN users uf ON uf.id = r.freelancer_id
-         WHERE r.client_id = $1 OR r.freelancer_id = $1
+         WHERE ${memberOf('$1', 'r.')}
          ORDER BY last_message_at DESC NULLS LAST
          LIMIT $2 OFFSET $3`,
         [req.userId, limit, offset]
       ),
-      query('SELECT COUNT(*) FROM chat_rooms WHERE client_id = $1 OR freelancer_id = $1', [req.userId]),
+      query(`SELECT COUNT(*) FROM chat_rooms WHERE ${memberOf('$1')}`, [req.userId]),
     ]);
     res.json({ conversations: result.rows, rooms: result.rows, total: parseInt(totalRes.rows[0].count), limit, offset });
   } catch (err) { serverError(err, res); }
@@ -253,7 +269,7 @@ router.post('/api/chat/conversations', auth, checkBlocked, messageLimiter, async
       const appCheck = await query('SELECT id FROM applications WHERE job_id = $1 AND freelancer_id = $2 LIMIT 1', [job_id, cId]);
       if (!appCheck.rows.length) return res.status(403).json({ error: 'You are not a participant in this job' });
     }
-    const existing = await query('SELECT * FROM chat_rooms WHERE job_id = $1 AND ((client_id = $2 AND freelancer_id = $3) OR (client_id = $3 AND freelancer_id = $2))', [job_id, cId, fId]);
+    const existing = await query(`SELECT * FROM chat_rooms WHERE job_id = $1 AND ${pairIs('$2','$3')}`, [job_id, cId, fId]);
     if (existing.rows.length) return res.json({ conversation: existing.rows[0], room: existing.rows[0] });
     const roomId = 'room_' + crypto.randomUUID();
     const result = await query('INSERT INTO chat_rooms (id, client_id, freelancer_id, job_id) VALUES ($1, $2, $3, $4) RETURNING *', [roomId, cId, fId, job_id]);
@@ -266,7 +282,7 @@ router.get('/api/chat/conversations/:id/messages', auth, async (req, res) => {
   const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 100, 200));
   const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
-    const room = await query('SELECT * FROM chat_rooms WHERE id = $1 AND (client_id = $2 OR freelancer_id = $2)', [req.params.id, req.userId]);
+    const room = await query(`SELECT * FROM chat_rooms WHERE id = $1 AND ${memberOf('$2')}`, [req.params.id, req.userId]);
     if (!room.rows.length) return res.status(403).json({ error: 'Forbidden' });
     const [result, totalRes] = await Promise.all([
       query('SELECT * FROM chat_messages WHERE room_id = $1 ORDER BY created_at ASC LIMIT $2 OFFSET $3', [req.params.id, limit, offset]),
@@ -283,7 +299,7 @@ router.post('/api/chat/conversations/:id/messages', auth, checkBlocked, messageL
   if (!msg || !msg.trim()) return res.status(400).json({ error: 'Message required' });
   if (msg.length > 2000) return res.status(400).json({ error: 'Message too long (max 2000 chars)' });
   try {
-    const room = await query('SELECT * FROM chat_rooms WHERE id = $1 AND (client_id = $2 OR freelancer_id = $2)', [req.params.id, req.userId]);
+    const room = await query(`SELECT * FROM chat_rooms WHERE id = $1 AND ${memberOf('$2')}`, [req.params.id, req.userId]);
     if (!room.rows.length) return res.status(403).json({ error: 'Forbidden' });
     const userResult = await query('SELECT username FROM users WHERE id = $1', [req.userId]);
     const senderName = userResult.rows[0]?.username || req.userId;
@@ -323,7 +339,7 @@ router.get('/api/chat/unread', auth, async (req, res) => {
     const result = await query(
       `SELECT COUNT(*) FROM chat_messages cm
        JOIN chat_rooms r ON r.id = cm.room_id
-       WHERE (r.client_id = $1 OR r.freelancer_id = $1) AND cm.sender_id != $1
+       WHERE ${memberOf('$1', 'r.')} AND cm.sender_id != $1
        AND cm.created_at > COALESCE(
          (SELECT last_read_at FROM chat_room_reads WHERE room_id = r.id AND user_id = $1),
          NOW() - INTERVAL '7 days'
@@ -340,7 +356,7 @@ router.get('/api/chat/unread', auth, async (req, res) => {
 // GET /api/chat/unread/:roomId
 router.get('/api/chat/unread/:roomId', auth, async (req, res) => {
   try {
-    const access = await query('SELECT id FROM chat_rooms WHERE id=$1 AND (client_id=$2 OR freelancer_id=$2)', [req.params.roomId, req.userId]);
+    const access = await query(`SELECT id FROM chat_rooms WHERE id=$1 AND ${memberOf('$2')}`, [req.params.roomId, req.userId]);
     if (!access.rows.length) return res.status(403).json({ error: 'Forbidden' });
     const result = await query(
       `SELECT COUNT(*) FROM chat_messages
@@ -360,7 +376,7 @@ router.post('/api/chat/read-all', auth, messageLimiter, async (req, res) => {
   try {
     const { room_id } = req.body;
     if (room_id) {
-      const access = await query('SELECT id FROM chat_rooms WHERE id=$1 AND (client_id=$2 OR freelancer_id=$2)', [room_id, req.userId]);
+      const access = await query(`SELECT id FROM chat_rooms WHERE id=$1 AND ${memberOf('$2')}`, [room_id, req.userId]);
       if (access.rows.length) {
         await query(
           `INSERT INTO chat_room_reads (room_id, user_id, last_read_at) VALUES ($1,$2,NOW())
@@ -369,7 +385,7 @@ router.post('/api/chat/read-all', auth, messageLimiter, async (req, res) => {
         );
       }
     } else {
-      const rooms = await query('SELECT id FROM chat_rooms WHERE client_id=$1 OR freelancer_id=$1', [req.userId]);
+      const rooms = await query(`SELECT id FROM chat_rooms WHERE ${memberOf('$1')}`, [req.userId]);
       for (const row of rooms.rows) {
         await query(
           `INSERT INTO chat_room_reads (room_id, user_id, last_read_at) VALUES ($1,$2,NOW())
@@ -389,7 +405,7 @@ router.post('/api/chat/:roomId/messages', auth, messageLimiter, checkBlocked, as
   if (!msg.trim()) return res.status(400).json({ error: 'Message content required' });
   if (msg.length > 2000) return res.status(400).json({ error: 'Message too long (max 2000 chars)' });
   try {
-    const roomCheck = await query('SELECT * FROM chat_rooms WHERE id = $1 AND (client_id = $2 OR freelancer_id = $2)', [req.params.roomId, req.userId]);
+    const roomCheck = await query(`SELECT * FROM chat_rooms WHERE id = $1 AND ${memberOf('$2')}`, [req.params.roomId, req.userId]);
     if (!roomCheck.rows.length) return res.status(403).json({ error: 'Not in this room' });
     const userRes = await query('SELECT username FROM users WHERE id = $1', [req.userId]);
     const senderName = userRes.rows[0]?.username || req.userId;
@@ -429,7 +445,7 @@ router.get('/api/chat/:roomId/messages', auth, async (req, res) => {
   const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
     const roomCheck = await query(
-      'SELECT id FROM chat_rooms WHERE id = $1 AND (client_id = $2 OR freelancer_id = $2)',
+      `SELECT id FROM chat_rooms WHERE id = $1 AND ${memberOf('$2')}`,
       [req.params.roomId, req.userId]
     );
     if (!roomCheck.rows.length) return res.status(403).json({ error: 'Access denied' });
@@ -460,7 +476,7 @@ const uploadSingle = (req, res, next) => upload.single('file')(req, res, (err) =
 router.post('/api/chat/rooms/:id/upload', auth, checkBlocked, messageLimiter, uploadSingle, async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded (field name must be "file")' });
-    const roomCheck = await query('SELECT * FROM chat_rooms WHERE id = $1 AND (client_id = $2 OR freelancer_id = $2)', [req.params.id, req.userId]);
+    const roomCheck = await query(`SELECT * FROM chat_rooms WHERE id = $1 AND ${memberOf('$2')}`, [req.params.id, req.userId]);
     if (!roomCheck.rows.length) return res.status(403).json({ error: 'Not in this room' });
     const attId = 'att_' + crypto.randomBytes(12).toString('hex');
     await query(
@@ -489,7 +505,7 @@ router.get('/api/chat/attachments/:attId', auth, async (req, res) => {
     const r = await query('SELECT * FROM chat_attachments WHERE id = $1', [req.params.attId]);
     if (!r.rows.length) return res.status(404).json({ error: 'Attachment not found' });
     const att = r.rows[0];
-    const member = await query('SELECT id FROM chat_rooms WHERE id = $1 AND (client_id = $2 OR freelancer_id = $2)', [att.room_id, req.userId]);
+    const member = await query(`SELECT id FROM chat_rooms WHERE id = $1 AND ${memberOf('$2')}`, [att.room_id, req.userId]);
     if (!member.rows.length) return res.status(403).json({ error: 'Access denied' });
     res.setHeader('Content-Type', att.mimetype || 'application/octet-stream');
     res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(att.filename)}"`);
