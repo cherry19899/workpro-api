@@ -515,9 +515,13 @@ async function ensureNotificationsTable() {
 // ─── Start ──────────────────────────────────────────────
 initDb().then(async () => {
   await ensureNotificationsTable();
-  // Ensure the canonical owner always has admin role (by uid AND by username, case-insensitive)
+  // Ensure the canonical owner always has admin role — by uid only.
   await query(`UPDATE users SET role = 'admin' WHERE id IN ('pi_cherry19899','pi_a2b617f7-f510-4502-a046-805facedcc29') AND role != 'admin'`).catch(() => {});
-  await query(`UPDATE users SET role = 'admin' WHERE LOWER(username) = 'cherry19899' AND role != 'admin'`).catch(() => {});
+  // A by-username twin of the line above used to run here as well. It promoted
+  // EVERY row named 'cherry19899' on every boot — usernames are not unique and
+  // were settable from the login body, so a restart alone re-granted admin to
+  // any impostor row, undoing the fixes in adminAuth and the login routes. The
+  // uid check above already covers the real owner.
   // Fix double-prefix corruption from old registration bug (idempotent)
   await query(`UPDATE jobs SET posted_by = 'pi_cherry19899' WHERE posted_by = 'pi_pi_cherry19899'`).catch(() => {});
   await query(`UPDATE applications SET freelancer_id = 'pi_cherry19899' WHERE freelancer_id = 'pi_pi_cherry19899'`).catch(() => {});

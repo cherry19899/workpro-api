@@ -125,8 +125,11 @@ router.post('/api/admin/users/:id/block', adminAuth, async (req, res) => {
     // blocked by automated callers. Mirror the owner identities used in middleware adminAuth.
     const OWNER_IDS = ['cherry19899', 'pi_cherry19899', 'a2b617f7-f510-4502-a046-805facedcc29', 'pi_a2b617f7-f510-4502-a046-805facedcc29'];
     const target = await query('SELECT username, role FROM users WHERE id IN ($1, $2)', [req.params.id, twin]);
-    const isOwner = OWNER_IDS.includes(req.params.id) || OWNER_IDS.includes(twin) ||
-      target.rows.some(r => (r.username || '').toLowerCase() === 'cherry19899');
+    // Uid only. The old `|| username === 'cherry19899'` fallback meant anyone who
+    // took that name became permanently un-blockable and un-demotable — an abuser
+    // could immunise themselves against moderation by renaming. OWNER_IDS already
+    // covers the real owner, so the fallback was redundant as well as exploitable.
+    const isOwner = OWNER_IDS.includes(req.params.id) || OWNER_IDS.includes(twin);
     if (isOwner) {
       return res.status(403).json({ error: 'Cannot block owner' });
     }
@@ -171,8 +174,11 @@ router.post('/api/admin/users/:id/remove-admin', adminAuth, async (req, res) => 
     const twin = twinId(req.params.id);
     const OWNER_IDS = ['cherry19899', 'pi_cherry19899', 'a2b617f7-f510-4502-a046-805facedcc29', 'pi_a2b617f7-f510-4502-a046-805facedcc29'];
     const target = await query('SELECT username, role FROM users WHERE id IN ($1, $2)', [req.params.id, twin]);
-    const isOwner = OWNER_IDS.includes(req.params.id) || OWNER_IDS.includes(twin) ||
-      target.rows.some(r => (r.username || '').toLowerCase() === 'cherry19899');
+    // Uid only. The old `|| username === 'cherry19899'` fallback meant anyone who
+    // took that name became permanently un-blockable and un-demotable — an abuser
+    // could immunise themselves against moderation by renaming. OWNER_IDS already
+    // covers the real owner, so the fallback was redundant as well as exploitable.
+    const isOwner = OWNER_IDS.includes(req.params.id) || OWNER_IDS.includes(twin);
     if (isOwner) {
       return res.status(403).json({ error: 'Cannot remove owner admin' });
     }
@@ -600,28 +606,30 @@ router.get('/api/admin/verify', async (req, res) => {
   if (authHeader.startsWith('Bearer ')) {
     try {
       const decoded = jwt.verify(authHeader.slice(7), JWT_SECRET);
-      const jwtUsername = (decoded.username || '').toLowerCase();
       const jwtId = decoded.id || '';
 
-      // Fast path: JWT itself identifies the owner — no DB needed.
-      // JWT is signed with JWT_SECRET so this is safe.
-      const isOwnerByJwt = jwtUsername === 'cherry19899' ||
-        jwtId === 'cherry19899' || jwtId === 'pi_cherry19899' ||
-        jwtId === 'pi_a2b617f7-f510-4502-a046-805facedcc29';
-      if (isOwnerByJwt) {
-        // Self-heal in background — don't wait
-        query("UPDATE users SET role = 'admin' WHERE LOWER(username) = 'cherry19899' AND role != 'admin'").catch(() => {});
+      // Keyed on the JWT's *id*, never its username. Ids come from the
+      // Pi-verified uid; the username claim was settable from the login request
+      // body, and a signature only proves we issued the token. The old code also
+      // promoted every row named 'cherry19899' from here, which handed a
+      // permanent admin role to any impostor row and re-opened the hole that
+      // middleware adminAuth had just been fixed to close.
+      const isOwnerUidValue = (id) =>
+        id === 'cherry19899' || id === 'pi_cherry19899' ||
+        id === 'pi_a2b617f7-f510-4502-a046-805facedcc29';
+      if (isOwnerUidValue(jwtId)) {
+        // Self-heal this row only — never a name-wide promote.
+        query("UPDATE users SET role = 'admin' WHERE id = $1 AND role != 'admin'", [jwtId]).catch(() => {});
         return res.json({ valid: true });
       }
 
       const userRow = await query(
-        "SELECT id, role, username FROM users WHERE id = $1 OR (LOWER(username) = $2 AND $2 <> '') LIMIT 1",
-        [jwtId, jwtUsername]
+        'SELECT id, role FROM users WHERE id = $1 OR id = $2 LIMIT 1',
+        [jwtId, 'pi_' + jwtId]
       );
       const ur = userRow.rows[0];
       if (!ur) return res.json({ valid: false });
-      const isOwner = ur.username?.toLowerCase() === 'cherry19899' ||
-        ur.id === 'pi_cherry19899' || ur.id === 'pi_a2b617f7-f510-4502-a046-805facedcc29';
+      const isOwner = isOwnerUidValue(ur.id);
       if (ur.role === 'admin' || isOwner) {
         if (ur.role !== 'admin' && isOwner) {
           await query("UPDATE users SET role = 'admin' WHERE id = $1", [ur.id]).catch(() => {});
@@ -633,17 +641,21 @@ router.get('/api/admin/verify', async (req, res) => {
   res.json({ valid: false });
 });
 
-// POST /api/admin/bootstrap-owner — one-time: grant admin to cherry19899 (any case, any uid).
-// Safe: only promotes, never demotes; does nothing if already admin; idempotent.
+// POST /api/admin/bootstrap-owner — one-time: grant admin to the owner's uid.
+// Only promotes, never demotes; does nothing if already admin; idempotent.
+// Targets the uid allowlist, NOT the username: usernames are not unique and were
+// settable, so "promote everyone called cherry19899" handed admin to impostors.
+const OWNER_UID_LIST = ['pi_cherry19899', 'pi_a2b617f7-f510-4502-a046-805facedcc29'];
 router.post('/api/admin/bootstrap-owner', adminAuth, async (req, res) => {
   try {
     const result = await query(
       `UPDATE users SET role = 'admin', updated_at = NOW()
-       WHERE LOWER(username) = 'cherry19899' AND role != 'admin'
-       RETURNING id, username, role`
+       WHERE id = ANY($1) AND role != 'admin'
+       RETURNING id, username, role`,
+      [OWNER_UID_LIST]
     );
     if (result.rows.length === 0) {
-      const already = await query(`SELECT id, username, role FROM users WHERE LOWER(username) = 'cherry19899' LIMIT 3`);
+      const already = await query('SELECT id, username, role FROM users WHERE id = ANY($1)', [OWNER_UID_LIST]);
       return res.json({ message: 'Already admin or user not found', rows: already.rows });
     }
     res.json({ message: 'Owner promoted to admin', updated: result.rows });
