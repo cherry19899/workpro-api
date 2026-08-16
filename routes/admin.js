@@ -466,7 +466,7 @@ router.post('/api/admin/escrows/:id/resolve', adminAuth, async (req, res) => {
 
 // POST /api/admin/users/:id/payout-owed — send the user's accumulated balance_pi
 // (amounts owed from releases where the real A2U transfer failed) as one real
-// A2U payment, then deduct it. Safe to retry: deducts only what was paid.
+// A2U payment, then deduct it.
 router.post('/api/admin/users/:id/payout-owed', adminAuth, async (req, res) => {
   try {
     if (!a2uEnabled()) return res.status(400).json({ error: 'A2U is not configured (PI_WALLET_PRIVATE_SEED missing)' });
@@ -474,9 +474,25 @@ router.post('/api/admin/users/:id/payout-owed', adminAuth, async (req, res) => {
     if (!userRes.rows.length) return res.status(404).json({ error: 'User not found' });
     const owed = parseFloat(userRes.rows[0].balance_pi || 0);
     if (!(owed > 0)) return res.status(400).json({ error: 'Nothing to pay out (balance_pi is 0)' });
-    const { txid, paymentId } = await sendA2U(req.params.id, owed, 'WorkPro payout',
-      { type: 'owed_payout', by: req.userId });
-    await query('UPDATE users SET balance_pi = GREATEST(COALESCE(balance_pi,0) - $1, 0), updated_at = NOW() WHERE id = $2', [owed, req.params.id]);
+    // Reserve (deduct) the exact amount just read BEFORE sending it, guarded by
+    // the balance still being at least that much. Without this, two overlapping
+    // calls (double-click, retry-on-timeout, two admin tabs) both read the same
+    // starting balance, both send the full amount via sendA2U — a real,
+    // irreversible transfer — and only then both deduct, paying the user twice.
+    const reserved = await query(
+      'UPDATE users SET balance_pi = GREATEST(COALESCE(balance_pi,0) - $1, 0), updated_at = NOW() WHERE id = $2 AND COALESCE(balance_pi,0) >= $1 RETURNING id',
+      [owed, req.params.id]
+    );
+    if (!reserved.rows.length) return res.status(409).json({ error: 'Balance changed — retry' });
+    let txid, paymentId;
+    try {
+      ({ txid, paymentId } = await sendA2U(req.params.id, owed, 'WorkPro payout', { type: 'owed_payout', by: req.userId }));
+    } catch (a2uErr) {
+      // Nothing was sent — give the reservation back so the amount isn't lost.
+      await query('UPDATE users SET balance_pi = COALESCE(balance_pi,0) + $1, updated_at = NOW() WHERE id = $2', [owed, req.params.id])
+        .catch((e) => logger.error(`[a2u] RESERVED BUT NOT REFUNDED — user ${req.params.id}, ${owed}π: ${e.message}`));
+      throw a2uErr;
+    }
     await audit('admin_owed_payout', { user_id: req.params.id, amount: owed, txid, payment_id: paymentId, by: req.userId });
     await notify(req.params.id, 'payment', 'Выплата получена', `${owed}π отправлено на ваш Pi-кошелёк.`, null, null, { key: 'nPayoutSent', params: { amount: owed } }).catch(() => {});
     res.json({ success: true, paid: owed, txid });
