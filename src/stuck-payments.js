@@ -55,6 +55,55 @@ async function creditConnects(pay, txid, amount) {
   }
 }
 
+// Settle an escrow-type payment: mark it completed AND create the escrow it paid
+// for, in one transaction. handlePaymentComplete does this when the user is
+// present; without it here a payment recovered by the sweep read 'completed'
+// while no escrow existed, so the client's Pi had moved and the freelancer was
+// never funded — and the sweep runs precisely for users who do not come back.
+// Same shape as handlePaymentComplete: existence checks, the job-budget sanity
+// bound, and ON CONFLICT (payment_id) so a concurrent settle cannot double-fund.
+async function settleEscrow(pay, txid, amount) {
+  const meta = pay.metadata || {};
+  const client = await getPool().connect();
+  try {
+    await client.query('BEGIN');
+    const claimed = await client.query(
+      "UPDATE payments SET status='completed', txid=$1, updated_at=NOW() WHERE id=$2 AND status='pending' RETURNING id",
+      [txid, pay.id]
+    );
+    if (!claimed.rows.length) { await client.query('ROLLBACK'); return false; }
+
+    const existing = await client.query('SELECT id FROM escrows WHERE payment_id = $1 LIMIT 1', [pay.id]);
+    if (!existing.rows.length) {
+      const [job, freelancer] = await Promise.all([
+        client.query('SELECT id, budget, posted_by FROM jobs WHERE id = $1 LIMIT 1', [meta.job_id]),
+        client.query('SELECT id FROM users WHERE id = $1 LIMIT 1', [meta.freelancer_id]),
+      ]);
+      if (job.rows.length && freelancer.rows.length) {
+        const budget = parseFloat(job.rows[0].budget || 0);
+        // Refuse an amount well past the job's budget rather than funding it —
+        // the same bound handlePaymentComplete applies.
+        if (budget > 0 && amount > budget * 1.01) {
+          await client.query('ROLLBACK');
+          return false;
+        }
+        await client.query(
+          `INSERT INTO escrows (job_id, client_id, freelancer_id, amount, payment_id, status)
+           VALUES ($1,$2,$3,$4,$5,'funded') ON CONFLICT (payment_id) DO NOTHING`,
+          [meta.job_id, pay.user_id || job.rows[0].posted_by, meta.freelancer_id, amount, pay.id]
+        );
+      }
+    }
+    await client.query('COMMIT');
+    return true;
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
 async function sweepStuckPayments(logger = console) {
   if (!PI_API_KEY) return { skipped: 'no PI_API_KEY' };
 
@@ -124,6 +173,26 @@ async function sweepStuckPayments(logger = console) {
           }
         }
 
+        // An escrow payment needs the escrow created, not just a status flip.
+        const metaS = pay.metadata || {};
+        if (metaS.type === 'escrow' && metaS.job_id && metaS.freelancer_id) {
+          const escrowAmount = parseFloat(piPayment.amount || pay.amount || 0);
+          if (await settleEscrow(pay, txid, escrowAmount)) {
+            stats.completed++;
+            stats.escrows = (stats.escrows || 0) + 1;
+            await notify(pay.user_id, 'payment', 'Эскроу создан',
+              `Платёж завершён автоматически — эскроу на ${escrowAmount}π создан.`, metaS.job_id, null,
+              { key: 'nEscrowFunded', params: { amount: escrowAmount } });
+            await audit('stuck_payment_recovered', { payment_id: pay.id, user_id: pay.user_id, type: 'escrow', job_id: metaS.job_id, amount: escrowAmount, txid });
+            logger.info(`[stuck-payments] recovered escrow ${pay.id} → job ${metaS.job_id} (${escrowAmount}π)`);
+            continue;
+          }
+          // Fell through: already settled, or the amount failed the budget bound.
+          // Leave it pending for a human rather than marking it done.
+          stats.failed++;
+          logger.error(`[stuck-payments] escrow settle refused for ${pay.id} (job ${metaS.job_id}, ${escrowAmount}π)`);
+          continue;
+        }
         await query("UPDATE payments SET status='completed', txid=$1, updated_at=NOW() WHERE id=$2 AND status='pending'", [txid, pay.id]);
         stats.completed++;
         await audit('stuck_payment_recovered', { payment_id: pay.id, user_id: pay.user_id, type: pay.type, txid });
