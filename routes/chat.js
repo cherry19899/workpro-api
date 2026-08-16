@@ -54,14 +54,19 @@ router.post('/api/chat/rooms', auth, checkBlocked, messageLimiter, async (req, r
   const { freelancer_id, job_id } = req.body;
   const cId = req.userId;
   if (!freelancer_id || !job_id) return res.status(400).json({ error: 'freelancer_id and job_id required' });
-  if (freelancer_id === cId) return res.status(400).json({ error: 'Cannot create a chat room with yourself' });
+  // normalizeId, not ===: strict here fails *open*, so passing your own id with
+  // different casing or a stripped pi_ prefix opened a room with yourself. Same
+  // fix POST /api/chat/start already carries.
+  if (normalizeId(freelancer_id) === normalizeId(cId)) return res.status(400).json({ error: 'Cannot create a chat room with yourself' });
   try {
     const targetExists = await query('SELECT id FROM users WHERE id = $1 LIMIT 1', [freelancer_id]);
     if (!targetExists.rows.length) return res.status(404).json({ error: 'User not found' });
     const jobCheck = await query('SELECT posted_by, hired_freelancer_id FROM jobs WHERE id = $1', [job_id]);
     if (!jobCheck.rows.length) return res.status(404).json({ error: 'Job not found' });
     const job = jobCheck.rows[0];
-    if (job.posted_by !== cId) {
+    // normalizeId here too: strict only fails closed (a spurious 403 for the
+    // job's own poster), but it is the same id comparison and should not drift.
+    if (normalizeId(job.posted_by) !== normalizeId(cId)) {
       const appCheck = await query('SELECT id FROM applications WHERE job_id = $1 AND freelancer_id = $2 LIMIT 1', [job_id, cId]);
       if (!appCheck.rows.length) return res.status(403).json({ error: 'You are not a participant in this job' });
     }
@@ -235,14 +240,15 @@ router.post('/api/chat/conversations', auth, checkBlocked, messageLimiter, async
   const cId = req.userId;
   const fId = freelancer_id || other_user_id;
   if (!fId || !job_id) return res.status(400).json({ error: 'freelancer_id and job_id required' });
-  if (fId === cId) return res.status(400).json({ error: 'Cannot create a conversation with yourself' });
+  // normalizeId, not ===: see POST /api/chat/rooms — strict fails open.
+  if (normalizeId(fId) === normalizeId(cId)) return res.status(400).json({ error: 'Cannot create a conversation with yourself' });
   try {
     const targetExists = await query('SELECT id FROM users WHERE id = $1 LIMIT 1', [fId]);
     if (!targetExists.rows.length) return res.status(404).json({ error: 'User not found' });
     const jobCheck = await query('SELECT posted_by, hired_freelancer_id FROM jobs WHERE id = $1', [job_id]);
     if (!jobCheck.rows.length) return res.status(404).json({ error: 'Job not found' });
     const job = jobCheck.rows[0];
-    const isJobPoster = job.posted_by === cId;
+    const isJobPoster = normalizeId(job.posted_by) === normalizeId(cId);
     if (!isJobPoster) {
       const appCheck = await query('SELECT id FROM applications WHERE job_id = $1 AND freelancer_id = $2 LIMIT 1', [job_id, cId]);
       if (!appCheck.rows.length) return res.status(403).json({ error: 'You are not a participant in this job' });

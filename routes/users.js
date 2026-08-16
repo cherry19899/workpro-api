@@ -267,7 +267,10 @@ router.get('/api/users/:id/connects', auth, async (req, res) => {
   try {
     const result = await query('SELECT balance_connects FROM users WHERE id = $1', [req.params.id]);
     res.json({ balance: result.rows[0]?.balance_connects || 0, connects: result.rows[0]?.balance_connects || 0 });
-  } catch (err) { res.json({ balance: 0, connects: 0 }); }
+    // Was `res.json({ balance: 0, connects: 0 })`: a failed query was served as a
+    // 200 with a zero balance and logged nothing, so someone who owned connects
+    // was told they had none and sent off to buy more.
+  } catch (err) { serverError(err, res); }
 });
 
 // ─── Reviews (= ratings alias) ──────────────────────────────────────────────
