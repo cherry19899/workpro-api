@@ -188,6 +188,12 @@ async function handleEscrowRelease(req, res) {
     const escrow = result.rows[0];
     if (normalizeId(escrow.client_id) !== normalizeId(req.userId)) return res.status(403).json({ error: 'Not your escrow' });
     if (escrow.status !== 'funded') return res.status(400).json({ error: 'Escrow is not funded' });
+    // An escrow with milestones stays 'funded' until every milestone is
+    // approved — releasing the full amount here on top of whatever milestones
+    // already paid out would double-pay the freelancer.
+    if (escrow.milestone_count > 0) {
+      return res.status(400).json({ error: 'This escrow uses milestones — approve them individually instead of a full release' });
+    }
     const fee = await getPlatformFee();
     const net = parseFloat((escrow.amount * (1 - fee)).toFixed(8)); // platform commission
     const pgClient3 = await getPool().connect();
@@ -1195,10 +1201,17 @@ router.post('/api/offers/:id/accept', auth, checkBlocked, async (req, res) => {
         await pgOffer.query("INSERT INTO escrows (job_id, client_id, freelancer_id, amount, status) VALUES ($1,$2,$3,$4,'pending')",
           [offer.job_id, offer.posted_by, req.userId, escrowAmt]);
       }
-      await pgOffer.query(
-        "UPDATE jobs SET status='in_progress', hired_freelancer_id=$1, hired_freelancer_name=$2, updated_at=NOW() WHERE id=$3 AND status='open'",
+      const jobUpd = await pgOffer.query(
+        "UPDATE jobs SET status='in_progress', hired_freelancer_id=$1, hired_freelancer_name=$2, updated_at=NOW() WHERE id=$3 AND status='open' RETURNING id",
         [req.userId, acceptedOffer.freelancer_name, offer.job_id]
       );
+      if (!jobUpd.rows.length) {
+        // Job was already hired out from under this offer (another accept won
+        // the race) — don't report success on an application that isn't
+        // actually the one working the job.
+        await pgOffer.query('ROLLBACK');
+        return res.status(409).json({ error: 'Job is no longer open — already hired' });
+      }
       await pgOffer.query('COMMIT');
     } catch (txErr) { await pgOffer.query('ROLLBACK').catch(() => {}); throw txErr; }
     finally { pgOffer.release(); }
@@ -1296,7 +1309,7 @@ router.get('/api/escrows/:id/milestones', auth, async (req, res) => {
 });
 
 // POST /api/escrows/:id/milestones — create milestones (on fund, auto-created)
-router.post('/api/escrows/:id/milestones', auth, async (req, res) => {
+router.post('/api/escrows/:id/milestones', auth, checkBlocked, async (req, res) => {
   // This route deletes the escrow's pending milestones and writes new ones, so
   // parseInt's prefix parsing let `/escrows/5abc/milestones` rewrite the
   // milestones of escrow 5.
