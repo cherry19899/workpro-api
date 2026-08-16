@@ -62,6 +62,23 @@ router.post('/api/ads/reward', auth, checkBlocked, async (req, res) => {
     let balance = null;
     try {
       await pgAds.query('BEGIN');
+      // Serialize this user's reward transactions before re-counting. The count
+      // above was read before an awaited round-trip to Pi, so two requests
+      // carrying DIFFERENT valid adIds both saw the same pre-cap count and both
+      // proceeded — the primary key stops a replayed adId but nothing stopped the
+      // per-user daily cap itself from being overshot in parallel. Re-counting
+      // alone would not fix it either: under READ COMMITTED neither transaction
+      // can see the other's uncommitted insert, so both would still pass. Taking
+      // the user row makes the second call wait for the first to commit.
+      await pgAds.query('SELECT id FROM users WHERE id = $1 FOR UPDATE', [req.userId]);
+      const capNow = await pgAds.query(
+        "SELECT COUNT(*) FROM ad_rewards WHERE user_id = $1 AND created_at > NOW() - INTERVAL '24 hours'",
+        [req.userId]
+      );
+      if (parseInt(capNow.rows[0].count, 10) >= DAILY_AD_LIMIT) {
+        await pgAds.query('ROLLBACK');
+        return res.status(429).json({ error: 'Daily ad reward limit reached', limit: DAILY_AD_LIMIT });
+      }
       await pgAds.query('INSERT INTO ad_rewards (ad_id, user_id, connects, created_at) VALUES ($1,$2,$3,NOW())',
         [adId, req.userId, REWARD_CONNECTS]);
       const upd = await pgAds.query(

@@ -73,12 +73,18 @@ async function normalizeLoginUid(incomingUid) {
          avatar  = COALESCE(NULLIF(avatar,''), $7),
          rating  = CASE WHEN rating = 0 THEN $8 ELSE rating END,
          kyc_verified = (kyc_verified OR $9),
+         -- A ban or deletion must survive the merge. Without these the twin row
+         -- carrying the ban was folded in and then DELETEd below, so logging in
+         -- with a blocked non-canonical uid cleared the block outright.
+         is_blocked = (COALESCE(is_blocked,false) OR $11),
+         status = CASE WHEN $12 = 'deleted' THEN 'deleted' ELSE status END,
          updated_at = NOW()
        WHERE id = $10`,
       [from.balance_connects||0, parseFloat(from.balance_pi||0),
        from.total_jobs_posted||0, from.total_jobs_completed||0,
        from.bio||'', from.skills||'', from.avatar||'',
-       parseFloat(from.rating||0), from.kyc_verified||false, canonical]
+       parseFloat(from.rating||0), from.kyc_verified||false, canonical,
+       from.is_blocked||false, from.status||'']
     );
 
     const safeUpd = async (tbl, col) => {
@@ -160,9 +166,11 @@ router.get('/api/me', auth, async (req, res) => {
       query('UPDATE users SET lang = $1 WHERE id = $2 AND lang IS DISTINCT FROM $1', [uiLang, req.userId]).catch(() => {});
     }
     let u = result.rows[0];
-    // Owner self-heal on returning-user path (GET hit via stored JWT, never POST /api/me)
+    // Owner self-heal on returning-user path (GET hit via stored JWT, never POST /api/me).
+    // Keyed on uid alone: the stored username used to be settable from the login
+    // request body, so any row that got poisoned with 'cherry19899' before that was
+    // closed would otherwise be re-granted admin here on every single call.
     if (u.role !== 'admin' && (
-        (u.username && u.username.toLowerCase() === 'cherry19899') ||
         u.id === 'pi_cherry19899' ||
         u.id === 'pi_a2b617f7-f510-4502-a046-805facedcc29')) {
       await query(`UPDATE users SET role = 'admin' WHERE id = $1`, [u.id]).catch(() => {});
@@ -221,7 +229,12 @@ router.post('/api/me', authLimiter, async (req, res) => {
     const uid = await normalizeLoginUid(rawUid);
     const uname = verifiedUsername || username || uid.replace(/^pi_/, '') || uid;
 
-    if (accessToken) {
+    // Only a Pi-vouched username may overwrite the stored one. When Pi returns a
+    // uid but no username (the username scope wasn't granted) `uname` falls back
+    // to the request body, and a body value must never reach the stored username:
+    // role is granted by matching that name, so persisting it is a privilege
+    // escalation that survives into every later request.
+    if (accessToken && verifiedUsername) {
       await query(
         `INSERT INTO users (id, username, role, balance_connects, created_at, updated_at)
          VALUES ($1, $2, 'freelancer', 10, NOW(), NOW())
@@ -243,8 +256,11 @@ router.post('/api/me', authLimiter, async (req, res) => {
         [uid]
       ).catch(() => {});
     }
-    // Owner self-heal: any uid whose username is cherry19899 (any case) always gets admin.
-    if ((uname && uname.toLowerCase() === 'cherry19899') ||
+    // Owner self-heal. Matches only a Pi-vouched username or the owner's own uid —
+    // never `uname`, which falls back to the request body when Pi returns no
+    // username, and so let anyone with a valid token for their OWN account post
+    // username='cherry19899' and be handed admin.
+    if ((verifiedUsername && verifiedUsername.toLowerCase() === 'cherry19899') ||
         uid === 'pi_cherry19899' ||
         uid === 'pi_a2b617f7-f510-4502-a046-805facedcc29') {
       await query(`UPDATE users SET role = 'admin' WHERE id = $1 AND role != 'admin'`, [uid]).catch(() => {});
@@ -275,12 +291,18 @@ router.post('/api/auth/refresh', async (req, res) => {
   const token = authHeader.slice(7);
   try {
     const decoded = jwt.verify(token, JWT_SECRET, { ignoreExpiration: true });
-    const jwtUsername = (decoded.username || '').toLowerCase();
-    // Look up by id OR by username — handles old JWTs where id='cherry19899' but DB has 'pi_cherry19899'
+    // Look up by id only. There used to be an `OR LOWER(username) = <jwt username>`
+    // branch here, for old JWTs carrying id='cherry19899' where the DB row is
+    // 'pi_cherry19899' — but that case is already the `'pi_' + decoded.id` branch
+    // below, so the username branch bought nothing and handed out an account
+    // takeover: username has no UNIQUE index, and the JWT's username claim can be
+    // an attacker-chosen value (see the login routes), so a token for one's own
+    // account carrying someone else's username matched THEIR row under LIMIT 1
+    // and this endpoint then minted a fresh 30-day token for it.
     const user = await query(
       `SELECT id, username, role, status, is_blocked FROM users
-       WHERE id = $1 OR id = $2 OR (LOWER(username) = $3 AND $3 <> '') LIMIT 1`,
-      [decoded.id, 'pi_' + decoded.id, jwtUsername]
+       WHERE id = $1 OR id = $2 LIMIT 1`,
+      [decoded.id, 'pi_' + decoded.id]
     );
     if (!user.rows.length) return res.status(401).json({ error: 'User not found' });
     const u = user.rows[0];
@@ -332,7 +354,10 @@ router.post('/api/auth/login', async (req, res) => {
         'INSERT INTO users (id, username, role, balance_connects, created_at, updated_at) VALUES ($1, $2, $3, 10, NOW(), NOW())',
         [uid, uname, 'freelancer']
       );
-    } else if (piUser) {
+    } else if (piUser && piUser.username) {
+      // Only when Pi actually vouched for a username — `uname` otherwise falls
+      // back to the request body, which must never overwrite the stored name
+      // (role is granted by matching it).
       await query('UPDATE users SET username = $1, updated_at = NOW() WHERE id = $2', [uname, uid]);
     } else {
       await query('UPDATE users SET updated_at = NOW() WHERE id = $1', [uid]);
