@@ -169,33 +169,41 @@ async function adminAuth(req, res, next) {
     req.isAdmin = true;
     return next();
   }
-  // Path 2: valid JWT from a user with role='admin' (for the in-app admin panel)
+  // Path 2: valid JWT from a user with role='admin' (for the in-app admin panel).
+  //
+  // Nothing below may key off a username. A username is not a credential here:
+  // there is no UNIQUE index on users.username, and the login routes used to
+  // copy a request-BODY username straight into the JWT claim and into the stored
+  // row. So neither the claim (a signature proves only that we issued the token,
+  // not that the name inside it is true) nor the stored name can be trusted, and
+  // tokens minted before that was fixed stay valid for 30 days. Admin is decided
+  // by the shared key above, by role='admin' on a row found BY ID, or by the
+  // owner's own uid — never by a name.
   if (authHeader.startsWith('Bearer ')) {
     try {
       const decoded = jwt.verify(authHeader.slice(7), JWT_SECRET);
-      // Also check by decoded.username in case the DB uid differs from JWT uid (migration edge case)
-      const jwtUsername = decoded.username || '';
       const jwtId = decoded.id || '';
-      // Fast-path: JWT itself identifies the owner (signed → safe)
-      const isOwnerByJwt = jwtUsername.toLowerCase() === 'cherry19899' ||
-        jwtId === 'cherry19899' || jwtId === 'pi_cherry19899' ||
-        jwtId === 'pi_a2b617f7-f510-4502-a046-805facedcc29';
-      if (isOwnerByJwt) {
-        // Self-heal role in background
-        query("UPDATE users SET role='admin' WHERE LOWER(username)='cherry19899' AND role!='admin'").catch(() => {});
+      const isOwnerUidValue = (id) =>
+        id === 'cherry19899' || id === 'pi_cherry19899' ||
+        id === 'pi_a2b617f7-f510-4502-a046-805facedcc29';
+      // Fast-path: the JWT's *id* is the owner's. Ids come from the Pi-verified
+      // uid, unlike the username claim, so this one is safe to trust.
+      if (isOwnerUidValue(jwtId)) {
+        // Self-heal this row only. The old statement promoted every row whose
+        // username was 'cherry19899', which handed admin to impostor rows.
+        query("UPDATE users SET role='admin' WHERE id = $1 AND role != 'admin'", [jwtId]).catch(() => {});
         req.isAdmin = true;
         req.userId = jwtId;
         return next();
       }
       const userRow = await query(
         // Also try pi_+id so old JWTs with id='cherry19899' find row stored as 'pi_cherry19899'
-        "SELECT id, role, username FROM users WHERE id = $1 OR id = $2 OR (LOWER(username) = $3 AND $3 <> '') LIMIT 1",
-        [jwtId, 'pi_' + jwtId, jwtUsername.toLowerCase()]
+        'SELECT id, role FROM users WHERE id = $1 OR id = $2 LIMIT 1',
+        [jwtId, 'pi_' + jwtId]
       );
       const ur = userRow.rows[0];
       if (ur) {
-        const isOwner = (ur.username && ur.username.toLowerCase() === 'cherry19899') ||
-          ur.id === 'pi_cherry19899' || ur.id === 'pi_a2b617f7-f510-4502-a046-805facedcc29';
+        const isOwner = isOwnerUidValue(ur.id);
         if (ur.role === 'admin' || isOwner) {
           if (ur.role !== 'admin' && isOwner) {
             await query("UPDATE users SET role = 'admin' WHERE id = $1", [ur.id]).catch(() => {});
