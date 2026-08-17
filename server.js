@@ -242,6 +242,19 @@ app.get('/.well-known/pi-network', (req, res) => {
 });
 
 const _serverStartTime = Date.now();
+// Which commit is actually running. Without this the only way to tell whether a
+// deploy had landed was to compare uptime against the push time and hope, since
+// the version string above is hand-edited and goes stale. Render exposes the
+// deployed SHA; the git fallback covers local runs.
+const _buildSha = (() => {
+  const fromEnv = process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || process.env.SOURCE_VERSION;
+  if (fromEnv) return String(fromEnv).slice(0, 7);
+  try {
+    return require('child_process').execSync('git rev-parse --short HEAD', {
+      cwd: __dirname, stdio: ['ignore', 'pipe', 'ignore'], timeout: 2000,
+    }).toString().trim() || 'unknown';
+  } catch { return 'unknown'; }
+})();
 let _lastError = null; // set by the global error handler
 let _piHealthCache = null; // { ts, reachable, latency_ms } — 60s TTL
 
@@ -249,6 +262,7 @@ app.get('/api/health', async (req, res) => {
   const result = {
     status: 'ok',
     version: '3.2.0',
+    build: _buildSha,
     timestamp: new Date().toISOString(),
     uptime_seconds: Math.floor((Date.now() - _serverStartTime) / 1000),
     memory_mb: parseFloat((process.memoryUsage().rss / 1024 / 1024).toFixed(1)),
