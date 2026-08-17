@@ -6,7 +6,7 @@ const router = require('express').Router();
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const { query, getPool } = require('../src/db');
-const { isIdParam, notify, audit, serverError, getPlatformFee, getDeveloperFee, invalidatePlatformFeeCache, invalidateConnectsEconomyCache, invalidateSupportUrlCache, FEE_MAX, DEV_FEE_MAX } = require('../src/helpers');
+const { isOwnerId, OWNER_UIDS, isIdParam, notify, audit, serverError, getPlatformFee, getDeveloperFee, invalidatePlatformFeeCache, invalidateConnectsEconomyCache, invalidateSupportUrlCache, FEE_MAX, DEV_FEE_MAX } = require('../src/helpers');
 const { adminAuth, twinId, JWT_SECRET, ADMIN_API_KEY, timingSafeStrEqual, _rlBlocks } = require('../src/middleware');
 const { a2uEnabled, sendA2U } = require('../src/pi-a2u');
 
@@ -123,13 +123,12 @@ router.post('/api/admin/users/:id/block', adminAuth, async (req, res) => {
     // owner account is id 'pi_a2b617f7-…' username 'Cherry19899' (capital C) — the old
     // guard only matched lowercase 'cherry19899' and missed it, so the owner kept getting
     // blocked by automated callers. Mirror the owner identities used in middleware adminAuth.
-    const OWNER_IDS = ['cherry19899', 'pi_cherry19899', 'a2b617f7-f510-4502-a046-805facedcc29', 'pi_a2b617f7-f510-4502-a046-805facedcc29'];
     const target = await query('SELECT username, role FROM users WHERE id IN ($1, $2)', [req.params.id, twin]);
     // Uid only. The old `|| username === 'cherry19899'` fallback meant anyone who
     // took that name became permanently un-blockable and un-demotable — an abuser
     // could immunise themselves against moderation by renaming. OWNER_IDS already
     // covers the real owner, so the fallback was redundant as well as exploitable.
-    const isOwner = OWNER_IDS.includes(req.params.id) || OWNER_IDS.includes(twin);
+    const isOwner = isOwnerId(req.params.id) || isOwnerId(twin);
     if (isOwner) {
       return res.status(403).json({ error: 'Cannot block owner' });
     }
@@ -172,13 +171,12 @@ router.post('/api/admin/users/:id/remove-admin', adminAuth, async (req, res) => 
     // that casing, so the owner's admin role could be stripped by an id or
     // username this check didn't recognize as the owner.
     const twin = twinId(req.params.id);
-    const OWNER_IDS = ['cherry19899', 'pi_cherry19899', 'a2b617f7-f510-4502-a046-805facedcc29', 'pi_a2b617f7-f510-4502-a046-805facedcc29'];
     const target = await query('SELECT username, role FROM users WHERE id IN ($1, $2)', [req.params.id, twin]);
     // Uid only. The old `|| username === 'cherry19899'` fallback meant anyone who
     // took that name became permanently un-blockable and un-demotable — an abuser
     // could immunise themselves against moderation by renaming. OWNER_IDS already
     // covers the real owner, so the fallback was redundant as well as exploitable.
-    const isOwner = OWNER_IDS.includes(req.params.id) || OWNER_IDS.includes(twin);
+    const isOwner = isOwnerId(req.params.id) || isOwnerId(twin);
     if (isOwner) {
       return res.status(403).json({ error: 'Cannot remove owner admin' });
     }
@@ -614,10 +612,7 @@ router.get('/api/admin/verify', async (req, res) => {
       // promoted every row named 'cherry19899' from here, which handed a
       // permanent admin role to any impostor row and re-opened the hole that
       // middleware adminAuth had just been fixed to close.
-      const isOwnerUidValue = (id) =>
-        id === 'cherry19899' || id === 'pi_cherry19899' ||
-        id === 'pi_a2b617f7-f510-4502-a046-805facedcc29';
-      if (isOwnerUidValue(jwtId)) {
+      if (isOwnerId(jwtId)) {
         // Self-heal this row only — never a name-wide promote.
         query("UPDATE users SET role = 'admin' WHERE id = $1 AND role != 'admin'", [jwtId]).catch(() => {});
         return res.json({ valid: true });
@@ -629,7 +624,7 @@ router.get('/api/admin/verify', async (req, res) => {
       );
       const ur = userRow.rows[0];
       if (!ur) return res.json({ valid: false });
-      const isOwner = isOwnerUidValue(ur.id);
+      const isOwner = isOwnerId(ur.id);
       if (ur.role === 'admin' || isOwner) {
         if (ur.role !== 'admin' && isOwner) {
           await query("UPDATE users SET role = 'admin' WHERE id = $1", [ur.id]).catch(() => {});
@@ -645,17 +640,16 @@ router.get('/api/admin/verify', async (req, res) => {
 // Only promotes, never demotes; does nothing if already admin; idempotent.
 // Targets the uid allowlist, NOT the username: usernames are not unique and were
 // settable, so "promote everyone called cherry19899" handed admin to impostors.
-const OWNER_UID_LIST = ['pi_cherry19899', 'pi_a2b617f7-f510-4502-a046-805facedcc29'];
 router.post('/api/admin/bootstrap-owner', adminAuth, async (req, res) => {
   try {
     const result = await query(
       `UPDATE users SET role = 'admin', updated_at = NOW()
        WHERE id = ANY($1) AND role != 'admin'
        RETURNING id, username, role`,
-      [OWNER_UID_LIST]
+      [OWNER_UIDS]
     );
     if (result.rows.length === 0) {
-      const already = await query('SELECT id, username, role FROM users WHERE id = ANY($1)', [OWNER_UID_LIST]);
+      const already = await query('SELECT id, username, role FROM users WHERE id = ANY($1)', [OWNER_UIDS]);
       return res.json({ message: 'Already admin or user not found', rows: already.rows });
     }
     res.json({ message: 'Owner promoted to admin', updated: result.rows });
@@ -1198,8 +1192,10 @@ router.post('/api/admin/users/bulk-block', adminAuth, async (req, res) => {
   const { user_ids } = req.body;
   if (!Array.isArray(user_ids) || user_ids.length === 0) return res.status(400).json({ error: 'user_ids array required' });
   if (user_ids.length > 100) return res.status(400).json({ error: 'Max 100 users per request' });
-  const OWNER_IDS = ['cherry19899', 'pi_cherry19899', 'a2b617f7-f510-4502-a046-805facedcc29', 'pi_a2b617f7-f510-4502-a046-805facedcc29'];
-  const safe = user_ids.filter(id => !OWNER_IDS.includes(id));
+  // isOwnerId, not a local copy of the list: the copies drifted apart and one
+  // went stale, which is how two of the owner's real uids ended up outside every
+  // owner check in the codebase.
+  const safe = user_ids.filter(id => !isOwnerId(id));
   const skipped = user_ids.length - safe.length;
   if (safe.length === 0) return res.status(403).json({ error: 'Cannot block owner account(s)' });
   // The single-user block route also blocks the id's "pi_" twin (same person,

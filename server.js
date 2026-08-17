@@ -29,7 +29,7 @@ const helmet = require('helmet');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const { query, initDb } = require('./db');
-const { PI_API_KEY: piKey } = require('./src/helpers');
+const { PI_API_KEY: piKey, OWNER_UIDS } = require('./src/helpers');
 
 const app = express();
 const httpServer = http.createServer(app);
@@ -530,7 +530,7 @@ async function ensureNotificationsTable() {
 initDb().then(async () => {
   await ensureNotificationsTable();
   // Ensure the canonical owner always has admin role — by uid only.
-  await query(`UPDATE users SET role = 'admin' WHERE id IN ('pi_cherry19899','pi_a2b617f7-f510-4502-a046-805facedcc29') AND role != 'admin'`).catch(() => {});
+  await query(`UPDATE users SET role = 'admin' WHERE id = ANY($1) AND role != 'admin'`, [OWNER_UIDS]).catch(() => {});
   // A by-username twin of the line above used to run here as well. It promoted
   // EVERY row named 'cherry19899' on every boot — usernames are not unique and
   // were settable from the login body, so a restart alone re-granted admin to

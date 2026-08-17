@@ -25,10 +25,9 @@
  * The owner's own uids are never touched in any mode.
  */
 const { Pool } = require('pg');
-
-// The real owner. Everything else claiming this name is an impostor.
-const OWNER_UIDS = ['pi_cherry19899', 'pi_a2b617f7-f510-4502-a046-805facedcc29'];
-const OWNER_USERNAME = 'cherry19899';
+// Imported, never re-declared: a local copy of this list is exactly what went
+// stale and made an earlier run of this script propose demoting the owner.
+const { OWNER_UIDS, OWNER_USERNAME } = require('../src/helpers');
 
 const APPLY = process.argv.includes('--apply');
 const ADD_INDEX = process.argv.includes('--add-unique-index');

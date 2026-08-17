@@ -305,11 +305,43 @@ function resolveWebhookStatus(piPayment) {
 }
 
 // ─── Owner identity ────────────────────────────────────────────────
-// Several places grant the admin role by matching a username, so the owner's
-// name is effectively a credential and no other account may hold it. These are
-// the two real uids the owner logs in with (see routes/auth.js self-heal).
-const OWNER_UIDS = ['pi_cherry19899', 'pi_a2b617f7-f510-4502-a046-805facedcc29'];
+// THE single source of truth for "which uids are the owner". Authority is a uid
+// question, never a username one.
+//
+// This list was duplicated, in three different shapes, across middleware.js,
+// admin.js (x4), auth.js (x2), server.js and scripts/audit-owner-rows.js — and
+// then went stale. A 2026-08-17 audit of production found FOUR admin rows named
+// Cherry19899, all genuinely the owner's (real balances, posted and completed
+// jobs; no other admin account exists), but only two were listed here. The two
+// missing ones were the owner's most recently used logins, so the owner held
+// admin only because role='admin' already happened to sit in their row — the
+// self-heal could never have restored it, and a remediation keyed on this list
+// would have demoted them. Everything imports from here now.
+//
+// 'pi_a2b617f7' is a truncated form of the uid above it, left by an old
+// registration bug. It is matched exactly, never as a prefix.
+const OWNER_UIDS = [
+  'pi_cherry19899',
+  'pi_a2b617f7-f510-4502-a046-805facedcc29',
+  'pi_a2b617f7',
+  'pi_e85a1c9b-9bdf-42cd-a4d0-11b4b278df78',
+];
+// The same uids with the pi_ prefix stripped: some call sites compare against a
+// twin id that can arrive in either spelling.
+const OWNER_UIDS_ANY_PREFIX = [...new Set(OWNER_UIDS.flatMap(u => [u, u.replace(/^pi_/, '')]))];
 const OWNER_USERNAME = 'cherry19899';
+
+/**
+ * True when `id` is one of the owner's uids, in either the pi_-prefixed or the
+ * bare spelling, case-insensitively. This is the one to use for authority.
+ *
+ * Deliberately looser than isOwnerUid below, which answers a different question
+ * — "may this account claim the owner's username?" — and must stay strict.
+ */
+function isOwnerId(id) {
+  if (typeof id !== 'string') return false;
+  return OWNER_UIDS_ANY_PREFIX.includes(id.toLowerCase());
+}
 
 /** True when this uid is entitled to the owner's username. */
 function isOwnerUid(uid) {
@@ -442,6 +474,9 @@ module.exports = {
   safeHttpUrl,
   MAX_URL_LEN,
   isOwnerUid,
+  isOwnerId,
+  OWNER_UIDS,
+  OWNER_UIDS_ANY_PREFIX,
   OWNER_USERNAME,
   piGetPayment,
   notify,

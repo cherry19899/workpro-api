@@ -5,6 +5,7 @@ const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
 const { query } = require('./db');
+const { isOwnerId } = require('./helpers');
 
 const _isProd = (process.env.NODE_ENV || 'production') === 'production';
 const _isSandbox = !!process.env.SANDBOX_MODE;
@@ -183,12 +184,9 @@ async function adminAuth(req, res, next) {
     try {
       const decoded = jwt.verify(authHeader.slice(7), JWT_SECRET);
       const jwtId = decoded.id || '';
-      const isOwnerUidValue = (id) =>
-        id === 'cherry19899' || id === 'pi_cherry19899' ||
-        id === 'pi_a2b617f7-f510-4502-a046-805facedcc29';
       // Fast-path: the JWT's *id* is the owner's. Ids come from the Pi-verified
       // uid, unlike the username claim, so this one is safe to trust.
-      if (isOwnerUidValue(jwtId)) {
+      if (isOwnerId(jwtId)) {
         // Self-heal this row only. The old statement promoted every row whose
         // username was 'cherry19899', which handed admin to impostor rows.
         query("UPDATE users SET role='admin' WHERE id = $1 AND role != 'admin'", [jwtId]).catch(() => {});
@@ -203,7 +201,7 @@ async function adminAuth(req, res, next) {
       );
       const ur = userRow.rows[0];
       if (ur) {
-        const isOwner = isOwnerUidValue(ur.id);
+        const isOwner = isOwnerId(ur.id);
         if (ur.role === 'admin' || isOwner) {
           if (ur.role !== 'admin' && isOwner) {
             await query("UPDATE users SET role = 'admin' WHERE id = $1", [ur.id]).catch(() => {});

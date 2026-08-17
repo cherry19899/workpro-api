@@ -5,7 +5,7 @@ const logger = require('../src/logger');
 const router = require('express').Router();
 const jwt = require('jsonwebtoken');
 const { query, getPool } = require('../src/db');
-const { isIdParam, piApiRequest, audit, serverError, SANDBOX_MODE } = require('../src/helpers');
+const { isIdParam, piApiRequest, audit, serverError, SANDBOX_MODE, isOwnerId, OWNER_USERNAME } = require('../src/helpers');
 const { auth, softAuth, checkBlocked, authLimiter, JWT_SECRET } = require('../src/middleware');
 
 // ─── UID normalisation ────────────────────────────────────────────────────────
@@ -170,9 +170,7 @@ router.get('/api/me', auth, async (req, res) => {
     // Keyed on uid alone: the stored username used to be settable from the login
     // request body, so any row that got poisoned with 'cherry19899' before that was
     // closed would otherwise be re-granted admin here on every single call.
-    if (u.role !== 'admin' && (
-        u.id === 'pi_cherry19899' ||
-        u.id === 'pi_a2b617f7-f510-4502-a046-805facedcc29')) {
+    if (u.role !== 'admin' && isOwnerId(u.id)) {
       await query(`UPDATE users SET role = 'admin' WHERE id = $1`, [u.id]).catch(() => {});
       u.role = 'admin';
     }
@@ -260,9 +258,7 @@ router.post('/api/me', authLimiter, async (req, res) => {
     // never `uname`, which falls back to the request body when Pi returns no
     // username, and so let anyone with a valid token for their OWN account post
     // username='cherry19899' and be handed admin.
-    if ((verifiedUsername && verifiedUsername.toLowerCase() === 'cherry19899') ||
-        uid === 'pi_cherry19899' ||
-        uid === 'pi_a2b617f7-f510-4502-a046-805facedcc29') {
+    if ((verifiedUsername && verifiedUsername.toLowerCase() === OWNER_USERNAME) || isOwnerId(uid)) {
       await query(`UPDATE users SET role = 'admin' WHERE id = $1 AND role != 'admin'`, [uid]).catch(() => {});
     }
     await query(`UPDATE users SET total_jobs_posted = (SELECT COUNT(*) FROM jobs WHERE posted_by = $1), updated_at = NOW() WHERE id = $1`, [uid]).catch(() => {});
