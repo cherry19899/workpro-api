@@ -189,10 +189,22 @@ async function handleEscrowRelease(req, res) {
     if (normalizeId(escrow.client_id) !== normalizeId(req.userId)) return res.status(403).json({ error: 'Not your escrow' });
     if (escrow.status !== 'funded') return res.status(400).json({ error: 'Escrow is not funded' });
     // An escrow with milestones stays 'funded' until every milestone is
-    // approved — releasing the full amount here on top of whatever milestones
-    // already paid out would double-pay the freelancer.
-    if (escrow.milestone_count > 0) {
-      return res.status(400).json({ error: 'This escrow uses milestones — approve them individually instead of a full release' });
+    // approved, so a full release on top of milestones that ALREADY paid out
+    // would pay the freelancer twice for the same work.
+    //
+    // Only already-*released* milestones make it unsafe, though. Refusing on
+    // `milestone_count > 0` was too blunt and broke the ordinary case the
+    // "Выплатить всё" button exists for: milestones planned, none approved yet,
+    // client decides to pay the whole thing at once. Nothing has been paid then,
+    // so there is nothing to double up.
+    const paidMs = await query(
+      "SELECT COUNT(*) FROM escrow_milestones WHERE escrow_id = $1 AND status = 'released'",
+      [req.params.id]
+    );
+    if (parseInt(paidMs.rows[0].count, 10) > 0) {
+      return res.status(400).json({
+        error: 'Some milestones are already paid — approve the remaining ones individually instead of a full release',
+      });
     }
     const fee = await getPlatformFee();
     const net = parseFloat((escrow.amount * (1 - fee)).toFixed(8)); // platform commission
@@ -204,6 +216,14 @@ async function handleEscrowRelease(req, res) {
         [req.params.id]
       );
       if (!updated.rows.length) { await pgClient3.query('ROLLBACK'); return res.status(400).json({ error: 'Escrow already processed' }); }
+      // The whole amount has just been paid, so any milestone still open is
+      // settled by definition. Left 'pending' they could be approved afterwards
+      // and pay the freelancer a second time — the same double-payment this
+      // route guards against above, only from the other direction.
+      await pgClient3.query(
+        "UPDATE escrow_milestones SET status='cancelled', updated_at=NOW() WHERE escrow_id=$1 AND status IN ('pending','requested')",
+        [req.params.id]
+      );
       await pgClient3.query('UPDATE users SET balance_pi = COALESCE(balance_pi, 0) + $1, total_jobs_completed = total_jobs_completed + 1, updated_at = NOW() WHERE id = $2', [net, escrow.freelancer_id]);
       await pgClient3.query('UPDATE jobs SET status = $1, updated_at = NOW() WHERE id = $2', ['completed', escrow.job_id]);
       await pgClient3.query('COMMIT');

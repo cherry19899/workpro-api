@@ -770,6 +770,7 @@ initDb().then(async () => {
   }
   const { checkSavedSearchAlerts } = require('./src/saved-search-alerts');
   const { sweepStuckPayments } = require('./src/stuck-payments');
+  const { retryOwedPayouts } = require('./src/payout-retry');
   async function hourlySweep() {
     await autoReleaseExpiredEscrows();
     await checkSavedSearchAlerts().then(r => {
@@ -778,6 +779,13 @@ initDb().then(async () => {
     await sweepStuckPayments(logger).then(r => {
       if (r.checked) logger.info(`[stuck-payments] checked ${r.checked} → completed ${r.completed}, credited ${r.credited}, cancelled ${r.cancelled}, failed ${r.failed}`);
     }).catch(e => logger.error('[stuck-payments] sweep error:', e.message));
+    // Money owed to freelancers whose payout failed to send. Every payout path
+    // swallows a send failure on purpose so the amount is never lost, but until
+    // now nothing retried, so a failure became a permanent debt. logger.error
+    // for the summary as well: info is a no-op in production here.
+    await retryOwedPayouts(logger).then(r => {
+      if (r.owed) logger.error(`[payout-retry] owed ${r.owed} → paid ${r.paid} (${r.pi_sent}π), failed ${r.failed}${r.gave_up ? ' [stopped early]' : ''}${r.last_error ? ' last: ' + r.last_error : ''}`);
+    }).catch(e => logger.error('[payout-retry] sweep error:', e.message));
   }
   if (NODE_ENV === 'production') {
     setInterval(hourlySweep, 60 * 60 * 1000); // hourly sweep
