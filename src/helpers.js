@@ -143,6 +143,40 @@ async function getSupportUrl() {
 
 function invalidateSupportUrlCache() { _supportCache = null; }
 
+// ─── Support email ─────────────────────────────────────────────
+// A separate setting rather than a mailto: in support_url, because that field
+// is http(s)-only on both write and read — a mailto: stored there is filtered
+// out above and the support row disappears entirely. An address is also not a
+// link: the app shows it as text to copy, since Pi Browser frequently has no
+// mail app registered and a mailto: either does nothing or lands the user on
+// a Gmail sign-in page.
+let _supportEmailCache = null;
+
+// Deliberately strict and deliberately not RFC 5322: this string is shown to
+// every user as the way to reach a human, so a typo that renders as a broken
+// address is worse than refusing to store it.
+//
+// `:` and `/` are excluded from the local part on purpose. Allowing them let a
+// whole URL masquerade as an address — `https://support.workpro@gmail.com` and
+// `mailto:a@b.co` both matched, and the first is exactly the value that was
+// already in production sending users to a Gmail sign-in page.
+const EMAIL_RE = /^[^\s@<>"'\\/:,;]+@[^\s@<>"'.\\/:,;]+(\.[^\s@<>"'.\\/:,;]+)+$/;
+
+async function getSupportEmail() {
+  const now = Date.now();
+  if (_supportEmailCache && now < _supportEmailCache.expiresAt) return _supportEmailCache.value;
+  let value = '';
+  try {
+    const row = await query("SELECT value FROM platform_settings WHERE key = 'support_email' LIMIT 1");
+    const v = (row.rows[0]?.value || '').trim();
+    if (v.length <= 254 && EMAIL_RE.test(v)) value = v;
+  } catch (_) {}
+  _supportEmailCache = { value, expiresAt: now + 60000 };
+  return value;
+}
+
+function invalidateSupportEmailCache() { _supportEmailCache = null; }
+
 // ─── Connects pricing ──────────────────────────────────────────────
 // Server-side package catalog — mirrors frontend packages. Never trust client-supplied quantity.
 const CONNECT_PACKAGES = [
@@ -492,6 +526,9 @@ module.exports = {
   getConnectsEconomy,
   getSupportUrl,
   invalidateSupportUrlCache,
+  getSupportEmail,
+  invalidateSupportEmailCache,
+  EMAIL_RE,
   invalidateConnectsEconomyCache,
   applyCostFor,
   FEE_MIN,

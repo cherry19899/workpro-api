@@ -6,7 +6,7 @@ const router = require('express').Router();
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const { query, getPool } = require('../src/db');
-const { isOwnerId, OWNER_UIDS, isIdParam, notify, audit, serverError, getPlatformFee, getDeveloperFee, invalidatePlatformFeeCache, invalidateConnectsEconomyCache, invalidateSupportUrlCache, FEE_MAX, DEV_FEE_MAX } = require('../src/helpers');
+const { isOwnerId, OWNER_UIDS, isIdParam, notify, audit, serverError, getPlatformFee, getDeveloperFee, invalidatePlatformFeeCache, invalidateConnectsEconomyCache, invalidateSupportUrlCache, invalidateSupportEmailCache, EMAIL_RE, FEE_MAX, DEV_FEE_MAX } = require('../src/helpers');
 const { adminAuth, twinId, JWT_SECRET, ADMIN_API_KEY, timingSafeStrEqual, _rlBlocks } = require('../src/middleware');
 const { a2uEnabled, sendA2U } = require('../src/pi-a2u');
 
@@ -833,6 +833,15 @@ const TEXT_SETTINGS = {
     validate: (v) => v === '' || /^https?:\/\/[^\s]+$/i.test(v),
     hint: 'must start with http:// or https://',
   },
+  support_email: {
+    label: 'Support email',
+    maxLength: 254,
+    // A bare address, never a mailto:. The app renders it as copyable text,
+    // and a scheme baked in here would be shown to users verbatim.
+    validate: (v) => v === '' || EMAIL_RE.test(v),
+    hint: 'must be an address like name@example.com, with no mailto:',
+    invalidate: invalidateSupportEmailCache,
+  },
 };
 router.patch('/api/admin/settings', adminAuth, async (req, res) => {
   const { key, value } = req.body;
@@ -855,7 +864,10 @@ router.patch('/api/admin/settings', adminAuth, async (req, res) => {
          ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW(), updated_by = EXCLUDED.updated_by`,
         [key, raw, req.userId || 'admin']
       );
-      invalidateSupportUrlCache();
+      // Each text setting drops its own cache. This used to always clear the
+      // support-URL one, so saving any other text setting left its cached
+      // value serving the old string for up to a minute.
+      (textRule.invalidate || invalidateSupportUrlCache)();
       await audit('admin_setting_changed', { key, new_value: raw, by: req.userId });
       return res.json({ success: true, key, value: raw });
     } catch (err) { return serverError(err, res); }

@@ -5,7 +5,7 @@ const router = require('express').Router();
 const crypto = require('crypto');
 const { query, getPool } = require('../src/db');
 const logger = require('../src/logger');
-const { isIdParam, notify, audit, serverError, getPlatformFee , getConnectsEconomy, applyCostFor, getSupportUrl } = require('../src/helpers');
+const { isIdParam, notify, audit, serverError, getPlatformFee , getConnectsEconomy, applyCostFor, getSupportUrl, getSupportEmail } = require('../src/helpers');
 const { auth, softAuth, checkBlocked, jobPostLimiter } = require('../src/middleware');
 const { processJobImages } = require('../src/github-images');
 const { a2uEnabled, sendA2U } = require('../src/pi-a2u');
@@ -53,7 +53,7 @@ function parseJobRow(job, { stripBase64 = false } = {}) {
 // GET /api/config — public, lets the frontend show the real admin-configured
 // platform fee (e.g. on the post-job preview) instead of a hardcoded percent.
 router.get('/api/config', async (req, res) => {
-  const [fee, econ, supportUrl] = await Promise.all([getPlatformFee(), getConnectsEconomy(), getSupportUrl()]);
+  const [fee, econ, supportUrl, supportEmail] = await Promise.all([getPlatformFee(), getConnectsEconomy(), getSupportUrl(), getSupportEmail()]);
   res.json({
     platform_fee_percent: parseFloat((fee * 100).toFixed(4)),
     // The client used to hardcode these, which is how a displayed number drifts
@@ -61,6 +61,9 @@ router.get('/api/config', async (req, res) => {
     apply_cost_divisor: econ.applyCostDivisor,
     post_job_cost: econ.postJobCost,
     support_url: supportUrl,   // empty string when unset — the client hides the row
+    // An address, not a link: shown as copyable text. mailto: cannot live in
+    // support_url, which is http(s)-only on both write and read.
+    support_email: supportEmail,
   });
 });
 
