@@ -771,6 +771,7 @@ initDb().then(async () => {
   const { checkSavedSearchAlerts } = require('./src/saved-search-alerts');
   const { sweepStuckPayments } = require('./src/stuck-payments');
   const { retryOwedPayouts } = require('./src/payout-retry');
+  const { resyncRatings } = require('./src/rating-resync');
   async function hourlySweep() {
     await autoReleaseExpiredEscrows();
     await checkSavedSearchAlerts().then(r => {
@@ -786,6 +787,11 @@ initDb().then(async () => {
     await retryOwedPayouts(logger).then(r => {
       if (r.owed) logger.error(`[payout-retry] owed ${r.owed} → paid ${r.paid} (${r.pi_sent}π), failed ${r.failed}${r.gave_up ? ' [stopped early]' : ''}${r.last_error ? ' last: ' + r.last_error : ''}`);
     }).catch(e => logger.error('[payout-retry] sweep error:', e.message));
+    // Ratings written before the three rating routes shared one formula, and
+    // any later drift. Silent when there is nothing to fix.
+    await resyncRatings(logger).then(r => {
+      if (r.resynced || r.cleared) logger.error(`[rating-resync] fixed ${r.resynced}, cleared ${r.cleared}`);
+    }).catch(e => logger.error('[rating-resync] sweep error:', e.message));
   }
   if (NODE_ENV === 'production') {
     setInterval(hourlySweep, 60 * 60 * 1000); // hourly sweep
