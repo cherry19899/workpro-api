@@ -137,7 +137,11 @@ async function main() {
     // ctid is the tiebreaker because not every one of these tables has an id.
     const uniq = await client.query(`
       SELECT t.relname AS tbl,
-             array_agg(a.attname ORDER BY k.ord) AS cols,
+             -- ::text so the driver hands back a real array. attname has the
+             -- pg type "name", and node-pg has no parser for name[] — it
+             -- arrives as the raw string "{job_id,freelancer_id}" and the
+             -- .filter below blows up on it.
+             array_agg(a.attname::text ORDER BY k.ord) AS cols,
              pg_get_expr(x.indpred, x.indrelid) AS pred
         FROM pg_index x
         JOIN pg_class t ON t.oid = x.indrelid
