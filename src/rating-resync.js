@@ -13,20 +13,17 @@
 // touches rows that actually disagree with the ratings on record. Once
 // everything agrees it updates nothing and costs one grouped read.
 const { query } = require('./db');
+const { FEEDBACK_ALL, WEIGHT_SQL } = require('./feedback');
 
-// Same weighting as computeBadges in routes/users.js: feedback from the last
-// six months counts for one and a half, older feedback for one. Kept in SQL
-// here so the whole table is reconciled in a single statement instead of
-// fetching every user's ratings into Node.
-const WEIGHT = `CASE WHEN created_at > NOW() - INTERVAL '6 months' THEN 1.5 ELSE 1.0 END`;
-
+// The truth, from the same union every other consumer reads (src/feedback.js).
+// This used to group over `ratings` alone, so it reconciled users.rating
+// against a different set than the profile actually lists.
 const TRUTH = `
-  SELECT to_user_id,
+  SELECT uid,
          COUNT(*) AS n,
-         ROUND(SUM(rating * ${WEIGHT}) / SUM(${WEIGHT}), 2) AS w
-    FROM ratings
-   WHERE to_user_id IS NOT NULL
-   GROUP BY to_user_id`;
+         ROUND(SUM(rating * ${WEIGHT_SQL}) / SUM(${WEIGHT_SQL}), 2) AS w
+    FROM (${FEEDBACK_ALL}) f
+   GROUP BY uid`;
 
 async function resyncRatings(logger) {
   try {
@@ -37,7 +34,7 @@ async function resyncRatings(logger) {
       UPDATE users u
          SET rating = s.w, total_reviews = s.n, updated_at = NOW()
         FROM (${TRUTH}) s
-       WHERE u.id = s.to_user_id
+       WHERE u.id = s.uid
          AND (u.total_reviews IS DISTINCT FROM s.n OR u.rating IS DISTINCT FROM s.w)
       RETURNING u.id`);
 
@@ -48,7 +45,7 @@ async function resyncRatings(logger) {
       UPDATE users
          SET rating = NULL, total_reviews = 0, updated_at = NOW()
        WHERE (COALESCE(rating, 0) > 0 OR COALESCE(total_reviews, 0) > 0)
-         AND NOT EXISTS (SELECT 1 FROM ratings r WHERE r.to_user_id = users.id)
+         AND NOT EXISTS (SELECT 1 FROM (${FEEDBACK_ALL}) f WHERE f.uid = users.id)
       RETURNING id`);
 
     return { resynced: fixed.rowCount || 0, cleared: cleared.rowCount || 0 };

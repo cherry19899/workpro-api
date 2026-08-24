@@ -6,6 +6,7 @@ const router = require('express').Router();
 const { query } = require('../src/db');
 const { notify, serverError, safeHttpUrl, MAX_URL_LEN, isOwnerUid, OWNER_USERNAME, ratingTarget, parseJobId, isIdParam } = require('../src/helpers');
 const { auth, softAuth, checkBlocked, adminAuth } = require('../src/middleware');
+const { FEEDBACK_FOR_USER, weightFor } = require('../src/feedback');
 
 const normalizeId = (id) => (id || '').toString().toLowerCase().replace(/^pi_/, '');
 
@@ -543,7 +544,10 @@ async function computeBadges(userId) {
       // always undefined and the 'verified' badge could never be awarded to
       // anyone, no matter how many times badges were recomputed.
       query('SELECT total_jobs_completed, rating, total_reviews, repeat_client_count, kyc_verified FROM users WHERE id=$1', [userId]),
-      query('SELECT rating, created_at FROM ratings WHERE to_user_id=$1 ORDER BY created_at DESC', [userId]),
+      // Both tables, deduped — see src/feedback.js. Reading `ratings`
+      // alone made the rating depend on a mirror insert whose failure is
+      // swallowed, so a review could exist and never count.
+      query(`SELECT rating, created_at FROM (${FEEDBACK_FOR_USER}) f`, [userId]),
     ]);
     if (!user.rows.length) return;
     const u = user.rows[0];
@@ -559,9 +563,8 @@ async function computeBadges(userId) {
 
     // Weighted avg: last 6 months weight 1.5x, older 1.0x
     let weightedSum = 0, weightedCount = 0;
-    const sixMonthsAgo = Date.now() - 6 * 30 * 24 * 60 * 60 * 1000;
     for (const r of reviews.rows) {
-      const w = new Date(r.created_at).getTime() > sixMonthsAgo ? 1.5 : 1.0;
+      const w = weightFor(r.created_at);
       weightedSum += parseFloat(r.rating) * w;
       weightedCount += w;
     }
@@ -649,8 +652,13 @@ router.post('/api/reviews/v2', auth, checkBlocked, async (req, res) => {
       [jobIdV2, req.userId, revieweeId, ratingNumV2, safeText]
     );
     // Also insert into ratings for backward compat
+    // Kept so the older read paths still see new reviews. Nothing depends on
+    // it any more — the rating and the count come from both tables (see
+    // src/feedback.js) — but a failure here is still worth knowing about
+    // rather than being dropped on the floor.
     await query('INSERT INTO ratings (from_user_id, to_user_id, job_id, rating, comment) VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING',
-      [req.userId, revieweeId, jobIdV2, ratingNumV2, safeText]).catch(() => {});
+      [req.userId, revieweeId, jobIdV2, ratingNumV2, safeText])
+      .catch(e => logger.error('[reviews] legacy ratings mirror failed:', e.message));
     // Awaited, not fire-and-forget: this is what writes users.rating and
     // total_reviews, so letting it race meant the response could describe a
     // rating the profile had not been given yet.
@@ -671,27 +679,10 @@ router.get('/api/reviews/v2/user/:userId', async (req, res) => {
   const limit = Math.min(50, parseInt(req.query.limit) || 20);
   const offset = (page - 1) * limit;
   try {
-    // Feedback lives in two tables: `reviews` (written by /api/reviews/v2, the
-    // route the app uses) and the older `ratings`. Listing only the first hid
-    // every star left through /api/ratings or /api/reviews, and made the list
-    // shorter than the count computed over `ratings`. Legacy rows come back
-    // with a negated id so the two id spaces cannot collide.
-    const LIST = `
-      SELECT r.id, r.job_id, r.reviewer_id, r.rating, r.text, r.reply, r.created_at,
-             u.username AS reviewer_username, u.avatar AS reviewer_avatar
-        FROM reviews r LEFT JOIN users u ON u.id = r.reviewer_id
-       WHERE r.reviewee_id = $1 AND r.hidden = FALSE
-      UNION ALL
-      SELECT -g.id, g.job_id, g.from_user_id, g.rating, NULLIF(g.comment, ''), NULL, g.created_at,
-             u2.username, u2.avatar
-        FROM ratings g LEFT JOIN users u2 ON u2.id = g.from_user_id
-       WHERE g.to_user_id = $1
-         AND NOT EXISTS (
-           SELECT 1 FROM reviews r2
-            WHERE r2.reviewee_id = g.to_user_id
-              AND r2.reviewer_id = g.from_user_id
-              AND r2.job_id IS NOT DISTINCT FROM g.job_id
-         )`;
+    // One definition of the set, shared with computeBadges and the resync
+    // sweep, so the count can never describe a different list than it shows.
+    const LIST = `SELECT f.*, u.username AS reviewer_username, u.avatar AS reviewer_avatar
+                    FROM (${FEEDBACK_FOR_USER}) f LEFT JOIN users u ON u.id = f.reviewer_id`;
     const [reviews, total, user] = await Promise.all([
       query(`${LIST} ORDER BY created_at DESC LIMIT $2 OFFSET $3`, [userId, limit, offset]),
       query(`SELECT COUNT(*) FROM (${LIST}) AS all_feedback`, [userId]),
