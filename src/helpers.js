@@ -124,6 +124,15 @@ function applyCostFor(budget, divisor) {
 // ─── Support link ──────────────────────────────────────────────
 // Empty by default: better no link than a dead one. Only surfaced in the app
 // once an admin sets it.
+//
+// The authority may not contain `@`. A URL like `https://support.workpro@gmail.com`
+// reads to a person as a support site and resolves to gmail.com, because
+// everything before the `@` is userinfo — which is how an address typed into
+// this field by mistake silently became a link to someone else's site. The
+// same shape is the standard way to disguise a phishing destination, and this
+// link sits on a screen users trust, so it is refused outright.
+const SUPPORT_URL_RE = /^https?:\/\/[^\s/?#@]+(?:[/?#][^\s]*)?$/i;
+
 let _supportCache = null;
 
 async function getSupportUrl() {
@@ -135,7 +144,7 @@ async function getSupportUrl() {
     const v = (row.rows[0]?.value || '').trim();
     // Re-checked on read, not just on write: a value could predate the
     // validation, and this string is handed to every user's browser.
-    if (/^https?:\/\/[^\s]+$/i.test(v)) value = v;
+    if (SUPPORT_URL_RE.test(v)) value = v;
   } catch (_) {}
   _supportCache = { value, expiresAt: now + 60000 };
   return value;
@@ -526,6 +535,7 @@ module.exports = {
   getConnectsEconomy,
   getSupportUrl,
   invalidateSupportUrlCache,
+  SUPPORT_URL_RE,
   getSupportEmail,
   invalidateSupportEmailCache,
   EMAIL_RE,

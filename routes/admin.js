@@ -6,7 +6,7 @@ const router = require('express').Router();
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const { query, getPool } = require('../src/db');
-const { isOwnerId, OWNER_UIDS, isIdParam, notify, audit, serverError, getPlatformFee, getDeveloperFee, invalidatePlatformFeeCache, invalidateConnectsEconomyCache, invalidateSupportUrlCache, invalidateSupportEmailCache, EMAIL_RE, FEE_MAX, DEV_FEE_MAX } = require('../src/helpers');
+const { isOwnerId, OWNER_UIDS, isIdParam, notify, audit, serverError, getPlatformFee, getDeveloperFee, invalidatePlatformFeeCache, invalidateConnectsEconomyCache, invalidateSupportUrlCache, invalidateSupportEmailCache, EMAIL_RE, SUPPORT_URL_RE, FEE_MAX, DEV_FEE_MAX } = require('../src/helpers');
 const { adminAuth, twinId, JWT_SECRET, ADMIN_API_KEY, timingSafeStrEqual, _rlBlocks } = require('../src/middleware');
 const { a2uEnabled, sendA2U } = require('../src/pi-a2u');
 
@@ -828,10 +828,12 @@ const TEXT_SETTINGS = {
   support_url: {
     label: 'Support site URL',
     maxLength: 300,
-    // Only http(s). A javascript: or data: URL here would be handed straight to
-    // every user's browser from a screen they trust.
-    validate: (v) => v === '' || /^https?:\/\/[^\s]+$/i.test(v),
-    hint: 'must start with http:// or https://',
+    // Only http(s), and no userinfo in the authority — see SUPPORT_URL_RE. A
+    // javascript: or data: URL here would be handed straight to every user's
+    // browser from a screen they trust, and `https://anything@elsewhere.com`
+    // would send them somewhere other than what the link appears to say.
+    validate: (v) => v === '' || SUPPORT_URL_RE.test(v),
+    hint: 'must start with http:// or https:// and contain no "@"',
   },
   support_email: {
     label: 'Support email',
