@@ -20,6 +20,7 @@
  * any other id means the next sign-in recreates the split.
  */
 const { Pool } = require('pg');
+const { FEEDBACK_ALL, WEIGHT_SQL } = require('../src/feedback');
 
 const argv = process.argv.slice(2);
 const arg = (name) => { const i = argv.indexOf(name); return i >= 0 ? argv[i + 1] : null; };
@@ -202,6 +203,26 @@ async function main() {
       `UPDATE users SET status = 'deleted', balance_pi = 0, balance_connects = 0, updated_at = NOW()
         WHERE id = ANY($1)`, [SOURCES]);
     log(`[6] на целевой аккаунт: ${sums.rows[0].pi}π, ${sums.rows[0].cn} коннектов`);
+
+    // ── 6b. Rating and review count, recomputed here and now ──────────────
+    // The hourly sweep would get to this eventually, but "eventually" meant
+    // the merged profile advertised the old count for up to an hour — and the
+    // retired rows kept a rating with nothing behind it. Run inside the same
+    // transaction, on the same client, so a rehearsal rolls this back too:
+    // calling resyncRatings() would use its own pooled connection and commit
+    // for real while everything around it was still pending.
+    const fixed = await client.query(`
+      UPDATE users u SET rating = s.w, total_reviews = s.n, updated_at = NOW()
+        FROM (SELECT uid, COUNT(*) AS n,
+                     ROUND(SUM(rating * ${WEIGHT_SQL}) / SUM(${WEIGHT_SQL}), 2) AS w
+                FROM (${FEEDBACK_ALL}) f GROUP BY uid) s
+       WHERE u.id = s.uid
+         AND (u.total_reviews IS DISTINCT FROM s.n OR u.rating IS DISTINCT FROM s.w)`);
+    const cleared = await client.query(`
+      UPDATE users SET rating = NULL, total_reviews = 0, updated_at = NOW()
+       WHERE (COALESCE(rating, 0) > 0 OR COALESCE(total_reviews, 0) > 0)
+         AND NOT EXISTS (SELECT 1 FROM (${FEEDBACK_ALL}) f WHERE f.uid = users.id)`);
+    log(`[6b] рейтинг пересчитан: исправлено ${fixed.rowCount}, снято с пустых ${cleared.rowCount}`);
 
     // ── 7. Nothing may still point at a retired account ───────────────────
     let leftovers = 0;
