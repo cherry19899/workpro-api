@@ -313,9 +313,12 @@ router.post('/api/ratings', auth, checkBlocked, async (req, res) => {
       'INSERT INTO ratings (from_user_id, to_user_id, job_id, rating, comment) VALUES ($1, $2, $3, $4, $5) RETURNING *',
       [req.userId, targetId, jobId, ratingNum, comment || '']
     );
-    const avgResult = await query('SELECT AVG(rating) as avg FROM ratings WHERE to_user_id = $1', [targetId]);
-    const newAvg = Math.round(parseFloat(avgResult.rows[0].avg) * 10) / 10;
-    await query('UPDATE users SET rating = $1, updated_at = NOW() WHERE id = $2', [newAvg, targetId]);
+    // One formula for everyone. This used to write a plain AVG here while
+    // /api/reviews/v2 wrote a time-weighted one, so the same column meant two
+    // different things depending on which route last touched it — and this
+    // path never updated total_reviews or badges at all.
+    const stats = await computeBadges(targetId);
+    const newAvg = stats ? stats.rating : ratingNum;
     await notify(targetId, 'rating', 'Новый отзыв', `Вы получили оценку ${rating}/5. Средний рейтинг: ${newAvg}`, jobId, null, { key: 'nRating', params: { rating, avg: newAvg } });
     res.json({ rating: result.rows[0], success: true });
   } catch (err) { serverError(err, res); }
@@ -356,9 +359,12 @@ router.post('/api/reviews', auth, checkBlocked, async (req, res) => {
     );
     if (existing.rows.length) return res.status(400).json({ error: 'Already rated this job' });
     const result = await query('INSERT INTO ratings (from_user_id, to_user_id, job_id, rating, comment) VALUES ($1, $2, $3, $4, $5) RETURNING *', [req.userId, targetIdR, jobIdR, ratingNumR, reviewComment]);
-    const avgResult = await query('SELECT AVG(rating) as avg FROM ratings WHERE to_user_id = $1', [targetIdR]);
-    const newAvg = Math.round(parseFloat(avgResult.rows[0].avg) * 10) / 10;
-    await query('UPDATE users SET rating = $1, updated_at = NOW() WHERE id = $2', [newAvg, targetIdR]);
+    // Same single formula as the other two rating routes — see /api/ratings.
+    const statsR = await computeBadges(targetIdR);
+    const newAvgR = statsR ? statsR.rating : ratingNumR;
+    // This alias never notified the person being rated, so a review left
+    // through it arrived silently.
+    await notify(targetIdR, 'rating', 'Новый отзыв', `Вы получили оценку ${ratingNumR}/5. Средний рейтинг: ${newAvgR}`, jobIdR, null, { key: 'nRating', params: { rating: ratingNumR, avg: newAvgR } });
     res.json({ review: result.rows[0], rating: result.rows[0], success: true });
   } catch (err) { serverError(err, res); }
 });
@@ -539,7 +545,13 @@ async function computeBadges(userId) {
     if (!user.rows.length) return;
     const u = user.rows[0];
     const completed = parseInt(u.total_jobs_completed) || 0;
-    const totalReviews = parseInt(u.total_reviews) || reviews.rows.length;
+    // Count what is actually on record, not the column being recomputed. The
+    // old `u.total_reviews || rows.length`, written back through Math.max,
+    // was a ratchet: it could only ever climb, so a stored value that had
+    // drifted (or was seeded by the non-v2 rating routes, which never touch
+    // total_reviews at all) pinned the count forever. Production ended up with
+    // users showing rating 5.0 against total_reviews 0.
+    const totalReviews = reviews.rows.length;
     const repeatClients = parseInt(u.repeat_client_count) || 0;
 
     // Weighted avg: last 6 months weight 1.5x, older 1.0x
@@ -561,9 +573,13 @@ async function computeBadges(userId) {
     if (completed >= 100) badges.push('expert_level');
 
     await query(`UPDATE users SET badges=$1, rating=$2, total_reviews=$3, updated_at=NOW() WHERE id=$4`,
-      [badges, avgRating.toFixed(2), Math.max(totalReviews, reviews.rows.length), userId]);
+      [badges, avgRating.toFixed(2), totalReviews, userId]);
+    // Returned so the rating routes can quote the new average in their
+    // notification instead of computing a second, differently-rounded one.
+    return { rating: Math.round(avgRating * 10) / 10, totalReviews, badges };
   } catch (err) {
     logger.error('[badges] compute error:', err.message);
+    return null;
   }
 }
 
@@ -632,8 +648,15 @@ router.post('/api/reviews/v2', auth, checkBlocked, async (req, res) => {
     // Also insert into ratings for backward compat
     await query('INSERT INTO ratings (from_user_id, to_user_id, job_id, rating, comment) VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING',
       [req.userId, revieweeId, jobIdV2, ratingNumV2, safeText]).catch(() => {});
-    // Recompute badges async
-    computeBadges(revieweeId).catch(() => {});
+    // Awaited, not fire-and-forget: this is what writes users.rating and
+    // total_reviews, so letting it race meant the response could describe a
+    // rating the profile had not been given yet.
+    const statsV2 = await computeBadges(revieweeId);
+    const newAvgV2 = statsV2 ? statsV2.rating : ratingNumV2;
+    // v2 is the route the app actually calls, and it was the one route that
+    // never told the reviewee anything — 18 reviews landed in production
+    // without a single notification.
+    await notify(revieweeId, 'rating', 'Новый отзыв', `Вы получили оценку ${ratingNumV2}/5. Средний рейтинг: ${newAvgV2}`, jobIdV2, null, { key: 'nRating', params: { rating: ratingNumV2, avg: newAvgV2 } });
     res.json({ review: r.rows[0], success: true });
   } catch (err) { serverError(err, res); }
 });
@@ -645,12 +668,30 @@ router.get('/api/reviews/v2/user/:userId', async (req, res) => {
   const limit = Math.min(50, parseInt(req.query.limit) || 20);
   const offset = (page - 1) * limit;
   try {
+    // Feedback lives in two tables: `reviews` (written by /api/reviews/v2, the
+    // route the app uses) and the older `ratings`. Listing only the first hid
+    // every star left through /api/ratings or /api/reviews, and made the list
+    // shorter than the count computed over `ratings`. Legacy rows come back
+    // with a negated id so the two id spaces cannot collide.
+    const LIST = `
+      SELECT r.id, r.job_id, r.reviewer_id, r.rating, r.text, r.reply, r.created_at,
+             u.username AS reviewer_username, u.avatar AS reviewer_avatar
+        FROM reviews r LEFT JOIN users u ON u.id = r.reviewer_id
+       WHERE r.reviewee_id = $1 AND r.hidden = FALSE
+      UNION ALL
+      SELECT -g.id, g.job_id, g.from_user_id, g.rating, NULLIF(g.comment, ''), NULL, g.created_at,
+             u2.username, u2.avatar
+        FROM ratings g LEFT JOIN users u2 ON u2.id = g.from_user_id
+       WHERE g.to_user_id = $1
+         AND NOT EXISTS (
+           SELECT 1 FROM reviews r2
+            WHERE r2.reviewee_id = g.to_user_id
+              AND r2.reviewer_id = g.from_user_id
+              AND r2.job_id IS NOT DISTINCT FROM g.job_id
+         )`;
     const [reviews, total, user] = await Promise.all([
-      query(`SELECT r.*, u.username AS reviewer_username, u.avatar AS reviewer_avatar
-             FROM reviews r LEFT JOIN users u ON u.id=r.reviewer_id
-             WHERE r.reviewee_id=$1 AND r.hidden=FALSE
-             ORDER BY r.created_at DESC LIMIT $2 OFFSET $3`, [userId, limit, offset]),
-      query('SELECT COUNT(*) FROM reviews WHERE reviewee_id=$1 AND hidden=FALSE', [userId]),
+      query(`${LIST} ORDER BY created_at DESC LIMIT $2 OFFSET $3`, [userId, limit, offset]),
+      query(`SELECT COUNT(*) FROM (${LIST}) AS all_feedback`, [userId]),
       query('SELECT badges, rating, total_reviews FROM users WHERE id=$1', [userId]),
     ]);
     res.json({

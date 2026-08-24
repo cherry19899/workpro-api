@@ -372,7 +372,9 @@ router.post('/api/auth/login', async (req, res) => {
 router.get('/api/auth/me', auth, async (req, res) => {
   try {
     const result = await query(
-      'SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, terms_accepted, terms_accepted_at,balance_connects, balance_pi, is_blocked, status, created_at, updated_at FROM users WHERE id = $1',
+      // total_reviews and badges were missing here, so the profile read them
+      // as undefined and rendered "Reviews 0" for people who had several.
+      'SELECT id, username, role, rating, total_reviews, badges, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, terms_accepted, terms_accepted_at,balance_connects, balance_pi, is_blocked, status, created_at, updated_at FROM users WHERE id = $1',
       [req.userId]
     );
     if (!result.rows.length) return res.status(404).json({ error: 'User not found' });
