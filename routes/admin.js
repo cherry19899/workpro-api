@@ -508,6 +508,56 @@ router.post('/api/admin/users/:id/payout-owed', adminAuth, async (req, res) => {
   }
 });
 
+// POST /api/admin/users/:id/settle-manually — write off a balance that was
+// already paid outside the app.
+//
+// A2U is unavailable on Pi Mainnet, so payouts have been settled by hand from
+// the owner's own Pi Wallet. The app had no way to record that: the balance
+// stayed on the books, telling both sides money was still owed when it had
+// already changed hands, and inviting a second payment for the same work.
+//
+// This moves no Pi. It only records what happened elsewhere, so the amount and
+// the reference are mandatory and everything is audited — a write-off with no
+// trace is indistinguishable from quietly erasing what someone is owed.
+router.post('/api/admin/users/:id/settle-manually', adminAuth, async (req, res) => {
+  try {
+    const { amount, reference } = req.body || {};
+    const ref = String(reference || '').trim();
+    if (!ref) return res.status(400).json({ error: 'reference required (how it was paid, e.g. the Pi Wallet tx)' });
+    if (ref.length > 200) return res.status(400).json({ error: 'reference too long (max 200)' });
+
+    const userRes = await query('SELECT id, username, balance_pi FROM users WHERE id = $1', [req.params.id]);
+    if (!userRes.rows.length) return res.status(404).json({ error: 'User not found' });
+    const owed = parseFloat(userRes.rows[0].balance_pi || 0);
+    if (!(owed > 0)) return res.status(400).json({ error: 'Nothing to settle (balance_pi is 0)' });
+
+    // Default to the whole balance, but allow a partial settlement — a hand
+    // transfer may well have covered only part of it.
+    const amt = amount === undefined || amount === null || amount === ''
+      ? owed : Number(parseFloat(amount).toFixed(7));
+    if (!Number.isFinite(amt) || amt <= 0) return res.status(400).json({ error: 'amount must be a positive number' });
+    if (amt > owed) return res.status(400).json({ error: `amount exceeds the balance (${owed}π)` });
+
+    // Same guarded deduct as the real payout: two admin tabs must not write off
+    // the same balance twice and leave it looking like more was settled than
+    // ever was.
+    const done = await query(
+      'UPDATE users SET balance_pi = GREATEST(COALESCE(balance_pi,0) - $1, 0), updated_at = NOW() WHERE id = $2 AND COALESCE(balance_pi,0) >= $1 RETURNING balance_pi',
+      [amt, req.params.id]
+    );
+    if (!done.rows.length) return res.status(409).json({ error: 'Balance changed — reload and retry' });
+
+    await audit('admin_manual_settlement', {
+      user_id: req.params.id, amount: amt, reference: ref, by: req.userId,
+      remaining: done.rows[0].balance_pi,
+    });
+    await notify(req.params.id, 'payment', 'Выплата произведена',
+      `${amt}π выплачено вне приложения (${ref}).`, null, null,
+      { key: 'nManualSettlement', params: { amount: amt, reference: ref } }).catch(() => {});
+    res.json({ success: true, settled: amt, remaining: parseFloat(done.rows[0].balance_pi) });
+  } catch (err) { serverError(err, res); }
+});
+
 // GET /api/admin/earnings
 router.get('/api/admin/earnings', adminAuth, async (req, res) => {
   const timeout = new Promise(resolve => setTimeout(() => resolve(null), 12000));
