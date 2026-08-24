@@ -82,37 +82,92 @@ async function main() {
       `DELETE FROM reviews WHERE reviewer_id = ANY($1) AND reviewee_id = ANY($1) RETURNING id`, [ALL]);
     log(`\n[1] самооценки удалены: ratings ${selfR.rowCount}, reviews ${selfV.rowCount}`);
 
-    // ── 2. Rows that would collide on the one-per-pair-per-job indexes ─────
-    // Keep the earliest opinion, drop the rest, so the unique indexes still
-    // hold once every id has been rewritten to the target.
-    const dedupe = async (table, from, to) => {
-      const r = await client.query(`
-        DELETE FROM ${table} d USING (
-          SELECT id, ROW_NUMBER() OVER (
-                   PARTITION BY (CASE WHEN ${from} = ANY($1) THEN $2 ELSE ${from} END),
-                                (CASE WHEN ${to}   = ANY($1) THEN $2 ELSE ${to}   END),
-                                job_id
-                   ORDER BY created_at, id) AS rn
-            FROM ${table}
-           WHERE ${from} = ANY($1) OR ${to} = ANY($1)
-        ) x WHERE d.id = x.id AND x.rn > 1 RETURNING d.id`, [ALL, TARGET]);
-      log(`[2] ${table}: снято дублей после слияния — ${r.rowCount}`);
-    };
-    await dedupe('ratings', 'from_user_id', 'to_user_id');
-    await dedupe('reviews', 'reviewer_id', 'reviewee_id');
+    // ── 2. Duplicate chat rooms, merged rather than dropped ───────────────
+    // chat_rooms is unique on (client_id, freelancer_id[, job_id]). Two rooms
+    // that become the same pair after the remap must collapse into one — but
+    // deleting the loser would orphan its messages, so the conversation is
+    // moved across first and only the empty shell is removed. Losing a client's
+    // chat history to a bookkeeping merge would be worse than the split it
+    // fixes.
+    const roomGroups = await client.query(`
+      SELECT id, ROW_NUMBER() OVER (
+               PARTITION BY (CASE WHEN client_id = ANY($1) THEN $2 ELSE client_id END),
+                            (CASE WHEN freelancer_id = ANY($1) THEN $2 ELSE freelancer_id END),
+                            job_id
+               ORDER BY created_at, id) AS rn,
+             FIRST_VALUE(id) OVER (
+               PARTITION BY (CASE WHEN client_id = ANY($1) THEN $2 ELSE client_id END),
+                            (CASE WHEN freelancer_id = ANY($1) THEN $2 ELSE freelancer_id END),
+                            job_id
+               ORDER BY created_at, id) AS keeper
+        FROM chat_rooms
+       WHERE client_id = ANY($1) OR freelancer_id = ANY($1)`, [ALL, TARGET]);
+    const losers = roomGroups.rows.filter(r => r.rn > 1);
+    let movedMsgs = 0;
+    for (const l of losers) {
+      const m = await client.query('UPDATE chat_messages SET room_id = $1 WHERE room_id = $2', [l.keeper, l.id]);
+      movedMsgs += m.rowCount;
+      await client.query('UPDATE chat_attachments SET room_id = $1 WHERE room_id = $2', [l.keeper, l.id]).catch(() => {});
+      // Read markers are keyed on (room_id, user_id); the surviving room may
+      // already have one, so drop the loser's rather than collide. At worst a
+      // few messages show as unread again.
+      await client.query('DELETE FROM chat_room_reads WHERE room_id = $1', [l.id]);
+      await client.query('DELETE FROM chat_rooms WHERE id = $1', [l.id]);
+    }
+    log(`[2] дублей чат-комнат объединено: ${losers.length}, перенесено сообщений: ${movedMsgs}`);
 
-    // ── 3. One portfolio header per person ────────────────────────────────
-    // user_id is unique there, so only one can survive. "Richest" rather than
-    // "newest": an empty header created last would otherwise erase a
-    // filled-in one.
+    // ── 2b. The portfolio header worth keeping ────────────────────────────
+    // Run before the generic pass below, which would otherwise keep whichever
+    // row is oldest. Here the fullest one wins: an empty header written later
+    // must not erase a filled-in one.
     const port = await client.query(`
       DELETE FROM portfolios p USING (
         SELECT user_id, ROW_NUMBER() OVER (
                  ORDER BY (COALESCE(LENGTH(headline),0) + COALESCE(LENGTH(summary),0)) DESC,
                           user_id) AS rn
           FROM portfolios WHERE user_id = ANY($1)
-      ) x WHERE p.user_id = x.user_id AND x.rn > 1 RETURNING p.user_id`, [ALL]);
-    log(`[3] лишних заголовков портфолио удалено: ${port.rowCount}`);
+      ) x WHERE p.user_id = x.user_id AND x.rn > 1`, [ALL]);
+    log(`[2b] лишних заголовков портфолио удалено: ${port.rowCount}`);
+
+    // ── 3. Every other unique index, discovered rather than guessed ────────
+    // The first rehearsal died on applications(job_id, freelancer_id) — a
+    // constraint that was simply not on my list. Rather than fix that one and
+    // wait to trip over the next, the indexes are read from the catalog and
+    // each is pre-deduplicated against the ids it will hold after the remap.
+    // ctid is the tiebreaker because not every one of these tables has an id.
+    const uniq = await client.query(`
+      SELECT t.relname AS tbl,
+             array_agg(a.attname ORDER BY k.ord) AS cols,
+             pg_get_expr(x.indpred, x.indrelid) AS pred
+        FROM pg_index x
+        JOIN pg_class t ON t.oid = x.indrelid
+        JOIN pg_namespace n ON n.oid = t.relnamespace
+        JOIN LATERAL unnest(x.indkey) WITH ORDINALITY AS k(attnum, ord) ON TRUE
+        JOIN pg_attribute a ON a.attrelid = x.indrelid AND a.attnum = k.attnum
+       WHERE n.nspname = 'public' AND x.indisunique AND t.relname NOT IN ('users','chat_rooms')
+       GROUP BY t.relname, x.indexrelid, x.indpred, x.indrelid`);
+
+    const userCols = new Set(cols.map(c => c.c));
+    let deduped = 0;
+    for (const ix of uniq.rows) {
+      const involved = ix.cols.filter(c => userCols.has(c));
+      if (!involved.length) continue;           // not affected by the remap
+      const keyExpr = ix.cols.map(c => userCols.has(c)
+        ? `(CASE WHEN ${c} = ANY($1) THEN $2 ELSE ${c} END)` : c).join(', ');
+      const scope = involved.map(c => `${c} = ANY($1)`).join(' OR ');
+      const where = ix.pred ? `(${scope}) AND (${ix.pred})` : `(${scope})`;
+      const hasCreated = await client.query(
+        `SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name=$1 AND column_name='created_at'`,
+        [ix.tbl]);
+      const order = hasCreated.rows.length ? 'created_at, ctid' : 'ctid';
+      const r = await client.query(`
+        DELETE FROM ${ix.tbl} d USING (
+          SELECT ctid AS c, ROW_NUMBER() OVER (PARTITION BY ${keyExpr} ORDER BY ${order}) AS rn
+            FROM ${ix.tbl} WHERE ${where}
+        ) x WHERE d.ctid = x.c AND x.rn > 1`, [ALL, TARGET]);
+      if (r.rowCount) { deduped += r.rowCount; log(`[3] ${ix.tbl} (${ix.cols.join(',')}): снято ${r.rowCount}`); }
+    }
+    log(`[3] всего дублей снято: ${deduped}`);
 
     // ── 4. Every remaining reference points at the target ─────────────────
     let moved = 0;
