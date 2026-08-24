@@ -140,7 +140,10 @@ router.get('/api/users/:id/level', async (req, res) => {
 // GET /api/users/:id/portfolio
 router.get('/api/users/:id/portfolio', async (req, res) => {
   try {
-    const userResult = await query('SELECT id, username, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar FROM users WHERE id = $1', [req.params.id]);
+    // This is the page a client lands on when sizing up a freelancer, so it
+    // carries the whole public picture: verification, review count, badges,
+    // whether they are open to work and how long they have been around.
+    const userResult = await query('SELECT id, username, rating, total_reviews, badges, kyc_verified, availability, total_jobs_posted, total_jobs_completed, bio, skills, avatar, created_at FROM users WHERE id = $1', [req.params.id]);
     if (!userResult.rows.length) return res.status(404).json({ error: 'User not found' });
     // No .catch(() => ({rows: []})) here: both tables are created at boot, so
     // a failure is a real one, and swallowing it rendered the owner's

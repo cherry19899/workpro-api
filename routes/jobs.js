@@ -768,7 +768,17 @@ router.get('/api/jobs/:id/applications', auth, async (req, res) => {
     if (!isOwner) return res.status(403).json({ error: 'Forbidden' });
     const [result, totalRes] = await Promise.all([
       query(
-        `SELECT a.*, u.username AS freelancer_username, u.avatar AS freelancer_avatar, u.rating AS applicant_rating
+        // Everything needed to choose between candidates. This used to be
+        // username, avatar and a star rating only, so the person deciding who
+        // to pay saw no skills, no track record and no verification, and had to
+        // open each applicant separately to learn anything at all. Every column
+        // here is already public through /api/users/:id/portfolio — this adds
+        // no new exposure, it just puts them where the decision is made.
+        `SELECT a.*, u.username AS freelancer_username, u.avatar AS freelancer_avatar,
+                u.rating AS applicant_rating, u.total_reviews AS applicant_reviews,
+                u.total_jobs_completed AS applicant_completed, u.skills AS applicant_skills,
+                u.bio AS applicant_bio, u.kyc_verified AS applicant_kyc,
+                u.badges AS applicant_badges, u.availability AS applicant_available
          FROM applications a LEFT JOIN users u ON u.id = a.freelancer_id
          WHERE a.job_id = $1 ORDER BY a.created_at DESC LIMIT $2 OFFSET $3`,
         [req.params.id, limit, offset]
