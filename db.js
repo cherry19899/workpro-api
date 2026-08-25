@@ -256,6 +256,12 @@ async function initDb() {
     await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS terms_accepted BOOLEAN DEFAULT FALSE`).catch(() => {});
     await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS terms_accepted_at TIMESTAMP`).catch(() => {});
     await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP`).catch(() => {});
+    // The user's public Pi wallet key, as reported by Pi at sign-in. Needed to
+    // pay someone by hand while A2U has no Mainnet: without it an admin knows
+    // who is owed but not where to send it. Written only from Pi's verified
+    // /v2/me response — never from a request body, or one user could point
+    // another user's payout at their own wallet.
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS wallet_address VARCHAR(120)`).catch(() => {});
     // ── One rating per reviewer, per person, per job ──────────────
     // Both rating routes check for a duplicate and then insert, which two
     // concurrent requests can both pass, and the `ON CONFLICT DO NOTHING` in

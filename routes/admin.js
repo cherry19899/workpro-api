@@ -90,7 +90,11 @@ router.get('/api/admin/users', adminAuth, async (req, res) => {
   const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 200, 500));
   const offset = Math.max(0, parseInt(req.query.offset) || 0);
   // Exclude heavy fields (avatar/bio) on list to keep payload small
-  const safeFields = 'id, username, role, rating, total_jobs_posted, total_jobs_completed, balance_connects, balance_pi, is_blocked, status, created_at, updated_at';
+  // wallet_address rides along because it is what the admin actually needs to
+  // pay someone by hand while A2U has no Mainnet — knowing a balance is owed
+  // is useless without knowing where to send it. Admin-only route, and it is a
+  // public key, not a secret.
+  const safeFields = 'id, username, role, rating, total_jobs_posted, total_jobs_completed, balance_connects, balance_pi, wallet_address, is_blocked, status, created_at, updated_at';
   try {
     const search = (req.query.search || '').slice(0, 200);
     const timeout = new Promise(resolve => setTimeout(() => resolve(null), 12000));

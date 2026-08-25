@@ -1,4 +1,5 @@
 const logger = require('../src/logger');
+const { StrKey } = require('stellar-sdk');
 /**
  * routes/auth.js — /api/me, /api/auth/*, /api/users/me routes
  */
@@ -208,6 +209,24 @@ router.post('/api/me', authLimiter, async (req, res) => {
             return res.status(403).json({ error: 'Token does not match uid' });
           }
           verifiedUsername = piUser.username || null;
+          // Remember where this person's Pi should be sent, so an admin paying
+          // by hand (A2U has no Mainnet) knows the address and not just the
+          // amount. Taken from the response Pi itself vouched for and never
+          // from the request body: a body-supplied address would let anyone
+          // redirect someone else's payout to their own wallet.
+          //
+          // Validated with StrKey rather than a shape regex. A Pi/Stellar key
+          // carries a checksum, and "56 base32 characters starting with G"
+          // happily accepts 56 letter Gs or a one-character typo — an address
+          // an admin would then be shown as somewhere to send real money, with
+          // no way to get it back. StrKey rejects both.
+          const piWallet = typeof piUser.wallet_address === 'string' ? piUser.wallet_address.trim() : '';
+          if (piWallet && StrKey.isValidEd25519PublicKey(piWallet)) {
+            await query(
+              'UPDATE users SET wallet_address = $1, updated_at = NOW() WHERE id = $2 AND wallet_address IS DISTINCT FROM $1',
+              [piWallet, verifiedCanonical]
+            ).catch((e) => logger.error(`[auth] wallet_address not stored for ${verifiedCanonical}: ${e.message}`));
+          }
           // Persist payments_enabled from Pi so we can gate purchases later
           if (piUser.payments_enabled !== undefined) {
             await query(
@@ -357,6 +376,21 @@ router.post('/api/auth/login', async (req, res) => {
       await query('UPDATE users SET username = $1, updated_at = NOW() WHERE id = $2', [uname, uid]);
     } else {
       await query('UPDATE users SET updated_at = NOW() WHERE id = $1', [uid]);
+    }
+
+    // Remember where this person's Pi should be sent. Taken from `piUser` — the
+    // response Pi itself signed off on — and never from the request body: a
+    // body-supplied address would let anyone redirect someone else's payout to
+    // their own wallet just by logging in with a chosen value.
+    //
+    // Shape-checked before storing, because it is later shown to an admin as
+    // the address to pay: a Pi/Stellar public key is 56 chars of base32 opening
+    // with G. Anything else is not an address and must not be presented as one.
+    const piWallet = piUser && typeof piUser.wallet_address === 'string'
+      ? piUser.wallet_address.trim() : '';
+    if (/^G[A-Z2-7]{55}$/.test(piWallet)) {
+      await query('UPDATE users SET wallet_address = $1, updated_at = NOW() WHERE id = $2 AND wallet_address IS DISTINCT FROM $1',
+        [piWallet, uid]).catch((e) => logger.error(`[auth] wallet_address not stored for ${uid}: ${e.message}`));
     }
     const user = await query('SELECT id, username, role, rating, total_jobs_posted, total_jobs_completed, bio, skills, avatar, kyc_verified, availability, terms_accepted, terms_accepted_at,balance_connects, balance_pi, is_blocked, status, created_at FROM users WHERE id = $1', [uid]);
     if (user.rows[0]?.status === 'deleted') {
