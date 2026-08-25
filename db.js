@@ -262,6 +262,9 @@ async function initDb() {
     // /v2/me response — never from a request body, or one user could point
     // another user's payout at their own wallet.
     await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS wallet_address VARCHAR(120)`).catch(() => {});
+    // `reviews` gained the reply routes that used to write to `ratings`; the
+    // timestamp column came with them.
+    await query(`ALTER TABLE reviews ADD COLUMN IF NOT EXISTS replied_at TIMESTAMP`).catch(() => {});
     // ── One rating per reviewer, per person, per job ──────────────
     // Both rating routes check for a duplicate and then insert, which two
     // concurrent requests can both pass, and the `ON CONFLICT DO NOTHING` in

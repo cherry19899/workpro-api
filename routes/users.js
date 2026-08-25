@@ -323,9 +323,11 @@ router.get('/api/reviews/stats', auth, async (req, res) => {
   try {
     const userId = req.query.user_id || req.userId;
     const [totalResult, avgResult, distResult] = await Promise.all([
-      query('SELECT COUNT(*) FROM ratings WHERE to_user_id = $1', [userId]),
-      query('SELECT AVG(rating) as avg FROM ratings WHERE to_user_id = $1', [userId]),
-      query('SELECT rating, COUNT(*) as count FROM ratings WHERE to_user_id = $1 GROUP BY rating ORDER BY rating DESC', [userId]),
+      // `reviews`, not `ratings`: the old table stopped receiving rows, so
+      // reading it here would have quietly reported stale totals for ever.
+      query('SELECT COUNT(*) FROM reviews WHERE reviewee_id = $1 AND hidden = FALSE', [userId]),
+      query('SELECT AVG(rating) as avg FROM reviews WHERE reviewee_id = $1 AND hidden = FALSE', [userId]),
+      query('SELECT rating, COUNT(*) as count FROM reviews WHERE reviewee_id = $1 AND hidden = FALSE GROUP BY rating ORDER BY rating DESC', [userId]),
     ]);
     const total = parseInt(totalResult.rows[0].count);
     const avg = parseFloat(avgResult.rows[0].avg || 0).toFixed(1);
@@ -340,9 +342,11 @@ router.get('/api/reviews/stats/:userId', async (req, res) => {
   try {
     const userId = req.params.userId;
     const [totalResult, avgResult, distResult] = await Promise.all([
-      query('SELECT COUNT(*) FROM ratings WHERE to_user_id = $1', [userId]),
-      query('SELECT AVG(rating) as avg FROM ratings WHERE to_user_id = $1', [userId]),
-      query('SELECT rating, COUNT(*) as count FROM ratings WHERE to_user_id = $1 GROUP BY rating ORDER BY rating DESC', [userId]),
+      // `reviews`, not `ratings`: the old table stopped receiving rows, so
+      // reading it here would have quietly reported stale totals for ever.
+      query('SELECT COUNT(*) FROM reviews WHERE reviewee_id = $1 AND hidden = FALSE', [userId]),
+      query('SELECT AVG(rating) as avg FROM reviews WHERE reviewee_id = $1 AND hidden = FALSE', [userId]),
+      query('SELECT rating, COUNT(*) as count FROM reviews WHERE reviewee_id = $1 AND hidden = FALSE GROUP BY rating ORDER BY rating DESC', [userId]),
     ]);
     const total = parseInt(totalResult.rows[0].count);
     const avg = parseFloat(avgResult.rows[0].avg || 0).toFixed(1);
@@ -357,8 +361,15 @@ router.get('/api/reviews/user/:userId', async (req, res) => {
   const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 50, 200));
   const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
-    const result = await query('SELECT r.*, u.username as from_username FROM ratings r LEFT JOIN users u ON u.id = r.from_user_id WHERE r.to_user_id = $1 ORDER BY r.created_at DESC LIMIT $2 OFFSET $3', [req.params.userId, limit, offset]);
-    const total = await query('SELECT COUNT(*) FROM ratings WHERE to_user_id = $1', [req.params.userId]);
+    // Aliased back to the old column names so existing callers see the same
+    // shape while the rows now come from the table that actually grows.
+    const result = await query(
+      `SELECT r.id, r.job_id, r.reviewer_id AS from_user_id, r.reviewee_id AS to_user_id,
+              r.rating, r.text AS comment, r.created_at, u.username AS from_username
+         FROM reviews r LEFT JOIN users u ON u.id = r.reviewer_id
+        WHERE r.reviewee_id = $1 AND r.hidden = FALSE
+        ORDER BY r.created_at DESC LIMIT $2 OFFSET $3`, [req.params.userId, limit, offset]);
+    const total = await query('SELECT COUNT(*) FROM reviews WHERE reviewee_id = $1 AND hidden = FALSE', [req.params.userId]);
     res.json({ reviews: result.rows, ratings: result.rows, total: parseInt(total.rows[0].count), limit, offset });
   } catch (err) { serverError(err, res); }
 });
@@ -370,8 +381,8 @@ router.get('/api/reviews', async (req, res) => {
   const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 50, 200));
   const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
-    const result = await query('SELECT r.*, u.username as from_username FROM ratings r LEFT JOIN users u ON u.id = r.from_user_id WHERE r.to_user_id = $1 ORDER BY r.created_at DESC LIMIT $2 OFFSET $3', [userId, limit, offset]);
-    const total = await query('SELECT COUNT(*) FROM ratings WHERE to_user_id = $1', [userId]);
+    const result = await query('SELECT r.id, r.job_id, r.reviewer_id AS from_user_id, r.reviewee_id AS to_user_id, r.rating, r.text AS comment, r.reply, r.created_at, u.username AS from_username FROM reviews r LEFT JOIN users u ON u.id = r.reviewer_id WHERE r.reviewee_id = $1 AND r.hidden = FALSE ORDER BY r.created_at DESC LIMIT $2 OFFSET $3', [userId, limit, offset]);
+    const total = await query('SELECT COUNT(*) FROM reviews WHERE reviewee_id = $1 AND hidden = FALSE', [userId]);
     res.json({ reviews: result.rows, ratings: result.rows, total: parseInt(total.rows[0].count), limit, offset });
   } catch (err) { serverError(err, res); }
 });
@@ -383,7 +394,7 @@ router.get('/api/reviews/:id', async (req, res) => {
   try {
     if (isNumeric) {
       const result = await query(
-        'SELECT r.*, u.username as from_username FROM ratings r LEFT JOIN users u ON u.id = r.from_user_id WHERE r.id = $1',
+        'SELECT r.id, r.job_id, r.reviewer_id AS from_user_id, r.reviewee_id AS to_user_id, r.rating, r.text AS comment, r.reply, r.created_at, u.username AS from_username FROM reviews r LEFT JOIN users u ON u.id = r.reviewer_id WHERE r.id = $1',
         [id]
       );
       if (!result.rows.length) return res.status(404).json({ error: 'Review not found' });
@@ -392,7 +403,7 @@ router.get('/api/reviews/:id', async (req, res) => {
       const limit2 = Math.max(1, Math.min(parseInt(req.query.limit) || 50, 200));
       const offset2 = Math.max(0, parseInt(req.query.offset) || 0);
       const result = await query(
-        'SELECT r.*, u.username as from_username FROM ratings r LEFT JOIN users u ON u.id = r.from_user_id WHERE r.to_user_id = $1 ORDER BY r.created_at DESC LIMIT $2 OFFSET $3',
+        'SELECT r.id, r.job_id, r.reviewer_id AS from_user_id, r.reviewee_id AS to_user_id, r.rating, r.text AS comment, r.reply, r.created_at, u.username AS from_username FROM reviews r LEFT JOIN users u ON u.id = r.reviewer_id WHERE r.reviewee_id = $1 AND r.hidden = FALSE ORDER BY r.created_at DESC LIMIT $2 OFFSET $3',
         [id, limit2, offset2]
       );
       res.json({ reviews: result.rows, ratings: result.rows, limit: limit2, offset: offset2 });
@@ -400,46 +411,47 @@ router.get('/api/reviews/:id', async (req, res) => {
   } catch (err) { serverError(err, res); }
 });
 
-// PUT /api/reviews/:id/reply — reviewed user replies once
+// ─── Replying to a review ───────────────────────────────────────────────────
+// Two routes, one rule. Both used to hold their own copy of it, and both read
+// `ratings` — the table that no longer receives reviews, so a reply to
+// anything written recently answered "Review not found".
+async function replyToReview({ id, userId, reply }) {
+  const body = String(reply || '').trim();
+  if (!body) return { code: 400, error: 'reply required' };
+  if (body.length > 1000) return { code: 400, error: 'Reply too long (max 1000 chars)' };
+  if (!/^\d+$/.test(String(id))) return { code: 400, error: 'Invalid review id' };
+
+  const found = await query('SELECT * FROM reviews WHERE id = $1', [id]);
+  if (!found.rows.length) return { code: 404, error: 'Review not found' };
+  const rev = found.rows[0];
+  // normalizeId, not ===: ids are compared case- and pi_-insensitively
+  // everywhere else, so a reviewed user whose id is stored with different
+  // casing than their token carries was refused a reply to their own review.
+  if (normalizeId(rev.reviewee_id) !== normalizeId(userId)) {
+    return { code: 403, error: 'Only the reviewed user can reply' };
+  }
+  if (rev.reply) return { code: 400, error: 'Reply already submitted' };
+
+  const updated = await query(
+    'UPDATE reviews SET reply = $1, replied_at = NOW() WHERE id = $2 RETURNING *', [body, id]);
+  return { row: updated.rows[0] };
+}
+
 router.put('/api/reviews/:id/reply', auth, checkBlocked, async (req, res) => {
-  const { reply } = req.body;
-  if (!reply || !reply.trim()) return res.status(400).json({ error: 'reply required' });
-  if (reply.length > 1000) return res.status(400).json({ error: 'Reply too long (max 1000 chars)' });
-  const id = req.params.id;
-  if (!/^\d+$/.test(id)) return res.status(400).json({ error: 'Invalid review id' });
-  try {
-    const result = await query('SELECT * FROM ratings WHERE id=$1', [id]);
-    if (!result.rows.length) return res.status(404).json({ error: 'Review not found' });
-    const rev = result.rows[0];
-    // normalizeId, not ===: ids are compared case- and pi_-insensitively
-    // everywhere else, so a reviewed user whose id is stored with different
-    // casing than their token carries was refused a reply to their own review.
-    if (normalizeId(rev.to_user_id) !== normalizeId(req.userId)) return res.status(403).json({ error: 'Only the reviewed user can reply' });
-    if (rev.reply) return res.status(400).json({ error: 'Reply already submitted' });
-    const updated = await query('UPDATE ratings SET reply=$1, replied_at=NOW() WHERE id=$2 RETURNING *', [reply.trim(), id]);
-    res.json({ review: updated.rows[0], success: true });
-  } catch (err) { serverError(err, res); }
+  const r = await replyToReview({ id: req.params.id, userId: req.userId, reply: req.body.reply })
+    .catch((err) => ({ thrown: err }));
+  if (r.thrown) return serverError(r.thrown, res);
+  if (r.error) return res.status(r.code).json({ error: r.error });
+  res.json({ review: r.row, success: true });
 });
 
-// POST /api/ratings/:id/reply — alias
+// POST /api/ratings/:id/reply — same thing, older name.
 router.post('/api/ratings/:id/reply', auth, checkBlocked, async (req, res) => {
-  const { reply } = req.body;
-  if (!reply || !reply.trim()) return res.status(400).json({ error: 'reply required' });
-  if (reply.length > 1000) return res.status(400).json({ error: 'Reply too long (max 1000 chars)' });
-  const id = req.params.id;
-  if (!/^\d+$/.test(id)) return res.status(400).json({ error: 'Invalid review id' });
-  try {
-    const result = await query('SELECT * FROM ratings WHERE id=$1', [id]);
-    if (!result.rows.length) return res.status(404).json({ error: 'Review not found' });
-    const rev = result.rows[0];
-    // normalizeId, not ===: ids are compared case- and pi_-insensitively
-    // everywhere else, so a reviewed user whose id is stored with different
-    // casing than their token carries was refused a reply to their own review.
-    if (normalizeId(rev.to_user_id) !== normalizeId(req.userId)) return res.status(403).json({ error: 'Only the reviewed user can reply' });
-    if (rev.reply) return res.status(400).json({ error: 'Reply already submitted' });
-    const updated = await query('UPDATE ratings SET reply=$1, replied_at=NOW() WHERE id=$2 RETURNING *', [reply.trim(), id]);
-    res.json({ review: updated.rows[0], success: true });
-  } catch (err) { serverError(err, res); }
+  const r = await replyToReview({ id: req.params.id, userId: req.userId, reply: req.body.reply })
+    .catch((err) => ({ thrown: err }));
+  if (r.thrown) return serverError(r.thrown, res);
+  if (r.error) return res.status(r.code).json({ error: r.error });
+  res.json({ review: r.row, success: true });
 });
 
 // ─── GDPR — anonymize all user data ──────────────────────────────────────────
@@ -608,11 +620,11 @@ async function submitFeedback({ reviewerId, revieweeId, jobId, text, rating, min
   // Both tables, because the older routes left rows in `ratings` and one
   // opinion per pair per job has to mean one across the two of them — checking
   // only `reviews` would let the same person rate twice through two doors.
+  // One table is enough now: the legacy rows were folded into `reviews` by
+  // scripts/merge-ratings-into-reviews.js, so nothing hides in the old one.
   const dup = await query(
-    `SELECT 1 FROM reviews WHERE job_id IS NOT DISTINCT FROM $1 AND reviewer_id=$2 AND reviewee_id=$3
-     UNION ALL
-     SELECT 1 FROM ratings WHERE job_id IS NOT DISTINCT FROM $1 AND from_user_id=$2 AND to_user_id=$3
-     LIMIT 1`, [jid, reviewerId, target]);
+    'SELECT 1 FROM reviews WHERE job_id IS NOT DISTINCT FROM $1 AND reviewer_id=$2 AND reviewee_id=$3 LIMIT 1',
+    [jid, reviewerId, target]);
   if (dup.rows.length) return { code: 409, error: 'You already reviewed this person for this job' };
 
   const { sanitizeText } = require('../src/sanitize');

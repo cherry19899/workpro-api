@@ -560,8 +560,11 @@ router.get('/api/user/data-export', auth, async (req, res) => {
       query('SELECT id, job_id, job_title, message, status, created_at FROM applications WHERE freelancer_id = $1', [id]),
       query('SELECT id, job_id, amount, status, created_at FROM escrows WHERE client_id = $1 OR freelancer_id = $1', [id]),
       query('SELECT id, job_id, created_at FROM chat_rooms WHERE client_id = $1 OR freelancer_id = $1', [id]),
-      query('SELECT to_user_id, job_id, rating, comment, created_at FROM ratings WHERE from_user_id = $1', [id]),
-      query('SELECT from_user_id, job_id, rating, comment, created_at FROM ratings WHERE to_user_id = $1', [id]),
+      // A data export that silently omitted everything written after the
+      // tables were unified would be both wrong and, for a GDPR request,
+      // wrong in a way that matters. Same shape, current source.
+      query('SELECT reviewee_id AS to_user_id, job_id, rating, text AS comment, created_at FROM reviews WHERE reviewer_id = $1', [id]),
+      query('SELECT reviewer_id AS from_user_id, job_id, rating, text AS comment, created_at FROM reviews WHERE reviewee_id = $1', [id]),
     ]);
     let messages = [];
     if (chatRooms.rows.length) {
