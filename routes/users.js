@@ -120,8 +120,15 @@ router.get('/api/users/:id/ratings', async (req, res) => {
   const limit = Math.max(1, Math.min(parseInt(req.query.limit) || 50, 200));
   const offset = Math.max(0, parseInt(req.query.offset) || 0);
   try {
-    const result = await query('SELECT * FROM ratings WHERE to_user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3', [req.params.id, limit, offset]);
-    const totalRes = await query('SELECT COUNT(*), AVG(rating) FROM ratings WHERE to_user_id = $1', [req.params.id]);
+    // Reads the same union as everything else. It used to read `ratings`
+    // alone, which no longer receives new rows — so this route would have gone
+    // on answering with history while quietly omitting every review written
+    // from today onwards.
+    const result = await query(
+      `SELECT * FROM (${FEEDBACK_FOR_USER}) f ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
+      [req.params.id, limit, offset]);
+    const totalRes = await query(
+      `SELECT COUNT(*), AVG(rating) FROM (${FEEDBACK_FOR_USER}) f`, [req.params.id]);
     const avg = parseFloat(totalRes.rows[0].avg) || 0;
     res.json({ ratings: result.rows, average: Math.round(avg * 10) / 10, count: parseInt(totalRes.rows[0].count), limit, offset });
   } catch (err) { serverError(err, res); }
@@ -279,98 +286,36 @@ router.get('/api/users/:id/connects', auth, async (req, res) => {
 
 // ─── Reviews (= ratings alias) ──────────────────────────────────────────────
 
-// POST /api/ratings — submit a rating
+// POST /api/ratings — the original route, kept for clients still on an older
+// bundle. A thin adapter now: names in, shape out, rules shared.
 router.post('/api/ratings', auth, checkBlocked, async (req, res) => {
-  const { to_user_id, job_id, rating, comment } = req.body;
-  if (!to_user_id || rating === undefined || rating === null || rating === '') return res.status(400).json({ error: 'to_user_id and rating required' });
-  const jobId = parseJobId(job_id);
-  if (Number.isNaN(jobId)) return res.status(400).json({ error: 'Invalid job_id' });
-  const ratingNum = parseInt(rating);
-  if (isNaN(ratingNum) || ratingNum < 1 || ratingNum > 5) return res.status(400).json({ error: 'Rating must be 1-5' });
-  if (normalizeId(to_user_id) === normalizeId(req.userId)) return res.status(400).json({ error: 'Cannot rate yourself' });
-  if (comment && comment.length > 1000) return res.status(400).json({ error: 'Comment too long (max 1000)' });
-  try {
-    // The id actually written. When a job vouches for the pair, ratingTarget
-    // hands back the spelling the job row holds, so a differently-cased body
-    // value cannot open a second identity for the same person.
-    let targetId = to_user_id;
-    if (jobId) {
-      const jobCheck = await query('SELECT posted_by, hired_freelancer_id, status FROM jobs WHERE id = $1', [jobId]);
-      const verdict = ratingTarget(jobCheck.rows[0] || null, req.userId, to_user_id);
-      if (verdict.error) return _rej(res, verdict.code, verdict.error);
-      targetId = verdict.targetId;
-    } else {
-      const sharedJob = await query(
-        `SELECT id FROM jobs WHERE status='completed' AND (
-          (posted_by=$1 AND hired_freelancer_id=$2) OR (posted_by=$2 AND hired_freelancer_id=$1)
-        ) LIMIT 1`,
-        [req.userId, to_user_id]
-      );
-      if (!sharedJob.rows.length) return _rej(res, 403, 'You have no completed job with this user');
-    }
-    const existing = await query(
-      'SELECT id FROM ratings WHERE from_user_id = $1 AND to_user_id = $2 AND job_id IS NOT DISTINCT FROM $3',
-      [req.userId, targetId, jobId]
-    );
-    if (existing.rows.length) return res.status(400).json({ error: 'Already rated this job' });
-    const result = await query(
-      'INSERT INTO ratings (from_user_id, to_user_id, job_id, rating, comment) VALUES ($1, $2, $3, $4, $5) RETURNING *',
-      [req.userId, targetId, jobId, ratingNum, comment || '']
-    );
-    // One formula for everyone. This used to write a plain AVG here while
-    // /api/reviews/v2 wrote a time-weighted one, so the same column meant two
-    // different things depending on which route last touched it — and this
-    // path never updated total_reviews or badges at all.
-    const stats = await computeBadges(targetId);
-    const newAvg = stats ? stats.rating : ratingNum;
-    await notify(targetId, 'rating', 'Новый отзыв', `Вы получили оценку ${rating}/5. Средний рейтинг: ${newAvg}`, jobId, null, { key: 'nRating', params: { rating, avg: newAvg } });
-    res.json({ rating: result.rows[0], success: true });
-  } catch (err) { serverError(err, res); }
+  const r = await submitFeedback({
+    reviewerId: req.userId,
+    revieweeId: req.body.to_user_id,
+    jobId: req.body.job_id,
+    rating: req.body.rating,
+    text: req.body.comment,
+    maxText: 1000,
+  }).catch((err) => ({ thrown: err }));
+  if (r.thrown) return serverError(r.thrown, res);
+  if (r.error) return _rej(res, r.code, r.error);
+  res.json({ rating: r.row, success: true });
 });
 
-// POST /api/reviews — alias for /api/ratings (bundle sends target_id/text variants)
+// POST /api/reviews — the same thing under another name, accepting the field
+// spellings an older bundle sent (target_id / text).
 router.post('/api/reviews', auth, checkBlocked, async (req, res) => {
-  const { to_user_id, target_id, job_id, rating, comment, text } = req.body;
-  const toId = to_user_id || target_id;
-  const reviewComment = comment || text || '';
-  if (!toId || rating === undefined || rating === null || rating === '') return res.status(400).json({ error: 'to_user_id and rating required' });
-  const jobIdR = parseJobId(job_id);
-  if (Number.isNaN(jobIdR)) return res.status(400).json({ error: 'Invalid job_id' });
-  const ratingNumR = parseInt(rating);
-  if (isNaN(ratingNumR) || ratingNumR < 1 || ratingNumR > 5) return res.status(400).json({ error: 'Rating must be 1-5' });
-  if (normalizeId(toId) === normalizeId(req.userId)) return res.status(400).json({ error: 'Cannot rate yourself' });
-  if (reviewComment.length > 1000) return res.status(400).json({ error: 'Comment too long (max 1000)' });
-  try {
-    // Same rules, and the same fall-through, as POST /api/ratings — see ratingTarget.
-    let targetIdR = toId;
-    if (jobIdR) {
-      const jobCheck = await query('SELECT posted_by, hired_freelancer_id, status FROM jobs WHERE id = $1', [jobIdR]);
-      const verdict = ratingTarget(jobCheck.rows[0] || null, req.userId, toId);
-      if (verdict.error) return res.status(verdict.code).json({ error: verdict.error });
-      targetIdR = verdict.targetId;
-    } else {
-      const sharedJob = await query(
-        `SELECT id FROM jobs WHERE status='completed' AND (
-          (posted_by=$1 AND hired_freelancer_id=$2) OR (posted_by=$2 AND hired_freelancer_id=$1)
-        ) LIMIT 1`,
-        [req.userId, toId]
-      );
-      if (!sharedJob.rows.length) return res.status(403).json({ error: 'You have no completed job with this user' });
-    }
-    const existing = await query(
-      'SELECT id FROM ratings WHERE from_user_id = $1 AND to_user_id = $2 AND job_id IS NOT DISTINCT FROM $3',
-      [req.userId, targetIdR, jobIdR]
-    );
-    if (existing.rows.length) return res.status(400).json({ error: 'Already rated this job' });
-    const result = await query('INSERT INTO ratings (from_user_id, to_user_id, job_id, rating, comment) VALUES ($1, $2, $3, $4, $5) RETURNING *', [req.userId, targetIdR, jobIdR, ratingNumR, reviewComment]);
-    // Same single formula as the other two rating routes — see /api/ratings.
-    const statsR = await computeBadges(targetIdR);
-    const newAvgR = statsR ? statsR.rating : ratingNumR;
-    // This alias never notified the person being rated, so a review left
-    // through it arrived silently.
-    await notify(targetIdR, 'rating', 'Новый отзыв', `Вы получили оценку ${ratingNumR}/5. Средний рейтинг: ${newAvgR}`, jobIdR, null, { key: 'nRating', params: { rating: ratingNumR, avg: newAvgR } });
-    res.json({ review: result.rows[0], rating: result.rows[0], success: true });
-  } catch (err) { serverError(err, res); }
+  const r = await submitFeedback({
+    reviewerId: req.userId,
+    revieweeId: req.body.to_user_id || req.body.target_id,
+    jobId: req.body.job_id,
+    rating: req.body.rating,
+    text: req.body.comment || req.body.text,
+    maxText: 1000,
+  }).catch((err) => ({ thrown: err }));
+  if (r.thrown) return serverError(r.thrown, res);
+  if (r.error) return _rej(res, r.code, r.error);
+  res.json({ review: r.row, rating: r.row, success: true });
 });
 
 // GET /api/reviews/stats — review stats for logged-in user
@@ -610,66 +555,99 @@ router.get('/api/reviews/v2/_diag', adminAuth, async (req, res) => {
   res.json({ last_reject: _lastReviewReject, recent: recent.rows, escrows: escrows.rows });
 });
 const _rej = (res, code, error) => { _lastReviewReject = { code, error, at: new Date().toISOString() }; return res.status(code).json({ error }); };
+
+// ─── One implementation behind all three rating routes ──────────────────────
+// /api/ratings, /api/reviews and /api/reviews/v2 were three near-copies of the
+// same forty lines. They drifted, as copies do: only one of them notified the
+// reviewee, and they disagreed on how the average was computed. Everything
+// they genuinely differ in — the field names they accept, the text limits, the
+// shape of the reply — now lives in the thin handlers below; the rules live
+// here, once.
+//
+// All three write to `reviews`. `ratings` keeps its historical rows and is
+// still read (see src/feedback.js) but no longer grows, which is what makes it
+// possible to retire it later.
+async function submitFeedback({ reviewerId, revieweeId, jobId, text, rating, minText = 0, maxText = 2000 }) {
+  if (!revieweeId || rating === undefined || rating === null || rating === '') {
+    return { code: 400, error: 'to_user_id and rating required' };
+  }
+  const num = parseInt(rating, 10);
+  // The range test alone lets anything non-numeric through: 'abc' < 1 and
+  // 'abc' > 5 are both false, so the value reached the INSERT and Postgres
+  // answered 500 where this belongs.
+  if (isNaN(num) || num < 1 || num > 5) return { code: 400, error: 'Rating must be 1-5' };
+  if (normalizeId(revieweeId) === normalizeId(reviewerId)) return { code: 400, error: 'Cannot review yourself' };
+
+  const body = typeof text === 'string' ? text : '';
+  if (body && minText && body.length < minText) {
+    return { code: 400, error: `Review text must be at least ${minText} characters` };
+  }
+  if (body.length > maxText) return { code: 400, error: `Review too long (max ${maxText} chars)` };
+
+  const jid = parseJobId(jobId);
+  if (Number.isNaN(jid)) return { code: 400, error: 'Invalid job_id' };
+
+  // Only the two sides of a completed job may review each other. When a job
+  // vouches for the pair, ratingTarget hands back the spelling the job row
+  // holds, so a differently-cased body value cannot open a second identity for
+  // the same person.
+  let target = revieweeId;
+  if (jid) {
+    const job = await query('SELECT posted_by, hired_freelancer_id, status FROM jobs WHERE id = $1', [jid]);
+    const verdict = ratingTarget(job.rows[0] || null, reviewerId, revieweeId);
+    if (verdict.error) return { code: verdict.code, error: verdict.error };
+    target = verdict.targetId;
+  } else {
+    const shared = await query(
+      `SELECT id FROM jobs WHERE status='completed' AND (
+         (posted_by=$1 AND hired_freelancer_id=$2) OR (posted_by=$2 AND hired_freelancer_id=$1)
+       ) LIMIT 1`, [reviewerId, revieweeId]);
+    if (!shared.rows.length) return { code: 403, error: 'You have no completed job with this user' };
+  }
+
+  // Both tables, because the older routes left rows in `ratings` and one
+  // opinion per pair per job has to mean one across the two of them — checking
+  // only `reviews` would let the same person rate twice through two doors.
+  const dup = await query(
+    `SELECT 1 FROM reviews WHERE job_id IS NOT DISTINCT FROM $1 AND reviewer_id=$2 AND reviewee_id=$3
+     UNION ALL
+     SELECT 1 FROM ratings WHERE job_id IS NOT DISTINCT FROM $1 AND from_user_id=$2 AND to_user_id=$3
+     LIMIT 1`, [jid, reviewerId, target]);
+  if (dup.rows.length) return { code: 409, error: 'You already reviewed this person for this job' };
+
+  const { sanitizeText } = require('../src/sanitize');
+  const safeText = body ? sanitizeText(body, maxText) : null;
+  const row = await query(
+    'INSERT INTO reviews (job_id, reviewer_id, reviewee_id, rating, text) VALUES ($1,$2,$3,$4,$5) RETURNING *',
+    [jid, reviewerId, target, num, safeText]);
+
+  // Awaited, not fire-and-forget: this is what writes users.rating and
+  // total_reviews, so letting it race meant the response could describe a
+  // rating the profile had not been given yet.
+  const stats = await computeBadges(target);
+  const avg = stats ? stats.rating : num;
+  await notify(target, 'rating', 'Новый отзыв',
+    `Вы получили оценку ${num}/5. Средний рейтинг: ${avg}`, jid, null,
+    { key: 'nRating', params: { rating: num, avg } });
+
+  return { row: row.rows[0] };
+}
+
 router.post('/api/reviews/v2', auth, checkBlocked, async (req, res) => {
-  const { job_id, reviewee_id, rating, text } = req.body;
-  if (!reviewee_id || !rating) return _rej(res, 400, 'reviewee_id and rating required');
-  // The column is INTEGER CHECK (rating BETWEEN 1 AND 5), and the range test
-  // alone lets anything non-numeric through: `'abc' < 1` and `'abc' > 5` are
-  // both false, so the value reached the INSERT and Postgres answered with a
-  // 500 instead of this 400. Same parse the other two rating routes use.
-  const ratingNumV2 = parseInt(rating, 10);
-  if (isNaN(ratingNumV2) || ratingNumV2 < 1 || ratingNumV2 > 5) return _rej(res, 400, 'Rating must be 1-5');
-  if (text && text.length < 10) return _rej(res, 400, 'Review text must be at least 10 characters');
-  if (text && text.length > 2000) return res.status(400).json({ error: 'Review too long (max 2000 chars)' });
-  if (normalizeId(req.userId) === normalizeId(reviewee_id)) return _rej(res, 400, 'Cannot review yourself');
-  const jobIdV2 = parseJobId(job_id);
-  if (Number.isNaN(jobIdV2)) return res.status(400).json({ error: 'Invalid job_id' });
-  try {
-    // Same participant rules as POST /api/ratings: only the two sides of a
-    // completed job may review each other (v2 previously skipped this entirely).
-    let revieweeId = reviewee_id;
-    if (jobIdV2) {
-      const jobCheck = await query('SELECT posted_by, hired_freelancer_id, status FROM jobs WHERE id = $1', [jobIdV2]);
-      const verdict = ratingTarget(jobCheck.rows[0] || null, req.userId, reviewee_id);
-      if (verdict.error) return _rej(res, verdict.code, verdict.error);
-      revieweeId = verdict.targetId;
-    } else {
-      const sharedJob = await query(
-        `SELECT id FROM jobs WHERE status='completed' AND (
-          (posted_by=$1 AND hired_freelancer_id=$2) OR (posted_by=$2 AND hired_freelancer_id=$1)
-        ) LIMIT 1`,
-        [req.userId, reviewee_id]
-      );
-      if (!sharedJob.rows.length) return res.status(403).json({ error: 'You have no completed job with this user' });
-    }
-    // Check for duplicate (job_id NULL included — one general review per pair)
-    const dup = await query('SELECT id FROM reviews WHERE job_id IS NOT DISTINCT FROM $1 AND reviewer_id=$2 AND reviewee_id=$3', [jobIdV2, req.userId, revieweeId]);
-    if (dup.rows.length) return _rej(res, 409, 'You already reviewed this person for this job');
-    const { sanitizeText } = require('../src/sanitize');
-    const safeText = text ? sanitizeText(text, 2000) : null;
-    const r = await query(
-      'INSERT INTO reviews (job_id, reviewer_id, reviewee_id, rating, text) VALUES ($1,$2,$3,$4,$5) RETURNING *',
-      [jobIdV2, req.userId, revieweeId, ratingNumV2, safeText]
-    );
-    // Also insert into ratings for backward compat
-    // Kept so the older read paths still see new reviews. Nothing depends on
-    // it any more — the rating and the count come from both tables (see
-    // src/feedback.js) — but a failure here is still worth knowing about
-    // rather than being dropped on the floor.
-    await query('INSERT INTO ratings (from_user_id, to_user_id, job_id, rating, comment) VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING',
-      [req.userId, revieweeId, jobIdV2, ratingNumV2, safeText])
-      .catch(e => logger.error('[reviews] legacy ratings mirror failed:', e.message));
-    // Awaited, not fire-and-forget: this is what writes users.rating and
-    // total_reviews, so letting it race meant the response could describe a
-    // rating the profile had not been given yet.
-    const statsV2 = await computeBadges(revieweeId);
-    const newAvgV2 = statsV2 ? statsV2.rating : ratingNumV2;
-    // v2 is the route the app actually calls, and it was the one route that
-    // never told the reviewee anything — 18 reviews landed in production
-    // without a single notification.
-    await notify(revieweeId, 'rating', 'Новый отзыв', `Вы получили оценку ${ratingNumV2}/5. Средний рейтинг: ${newAvgV2}`, jobIdV2, null, { key: 'nRating', params: { rating: ratingNumV2, avg: newAvgV2 } });
-    res.json({ review: r.rows[0], success: true });
-  } catch (err) { serverError(err, res); }
+  // The route the app actually calls. It alone asks for a minimum text length,
+  // because its dialog offers a text box and ten characters is the line
+  // between a review and a slip of the thumb.
+  const r = await submitFeedback({
+    reviewerId: req.userId,
+    revieweeId: req.body.reviewee_id,
+    jobId: req.body.job_id,
+    rating: req.body.rating,
+    text: req.body.text,
+    minText: 10, maxText: 2000,
+  }).catch((err) => ({ thrown: err }));
+  if (r.thrown) return serverError(r.thrown, res);
+  if (r.error) return _rej(res, r.code, r.error);
+  res.json({ review: r.row, success: true });
 });
 
 // GET /api/reviews/v2/user/:userId — paginated reviews with weighted stats
