@@ -1,8 +1,19 @@
 // App-to-User (A2U) payments via the official pi-backend SDK.
 // Sends Pi from the app's wallet to a user. Requires:
-//   PI_API_KEY               — mainnet API key
-//   PI_WALLET_PRIVATE_SEED   — app wallet private seed (starts with "S")
-// Always uses PI_API_KEY (mainnet) — frontend is mainnet so A2U must also be mainnet.
+//   PI_API_KEY               — API key of the app registration to pay from
+//   PI_WALLET_PRIVATE_SEED   — that app wallet's private seed (starts with "S")
+//
+// There is no network switch here, and there must not be one. The SDK reads the
+// network off Pi's own response to createPayment (`currentPayment.network`) and
+// picks Horizon from it — "Pi Network" → api.mainnet.minepi.com, otherwise
+// api.testnet.minepi.com. So the network is decided by *which app registration
+// the API key belongs to*, and the seed simply has to be that app's wallet.
+// A mismatched key and seed fail at submitPayment, not silently on the wrong
+// chain. This is why the Testnet deployment needs no code of its own: same
+// build, Testnet key + Testnet seed in its own env.
+//
+// Note that A2U is Testnet-only on Pi's side today; mainnet returns
+// feature_not_available at createPayment, which surfaces in a2uStatus().
 const logger = require('./logger');
 
 let _pi = null;
