@@ -198,10 +198,14 @@ async function main() {
       `UPDATE users SET balance_pi = $2, balance_connects = $3, updated_at = NOW() WHERE id = $1`,
       [TARGET, sums.rows[0].pi, sums.rows[0].cn]);
     // Zeroed as well as retired: a balance left on a retired row is money the
-    // books still count but nobody can ever reach.
+    // books still count but nobody can ever reach. merged_into records where
+    // the data went — without it, login has no way to tell a retired row from
+    // a truly deleted account, and blocks the real person the next time Pi
+    // hands back this uid (see db.js for the incident this caused 2026-08-24).
     await client.query(
-      `UPDATE users SET status = 'deleted', balance_pi = 0, balance_connects = 0, updated_at = NOW()
-        WHERE id = ANY($1)`, [SOURCES]);
+      `UPDATE users SET status = 'deleted', balance_pi = 0, balance_connects = 0,
+              merged_into = $2, updated_at = NOW()
+        WHERE id = ANY($1)`, [SOURCES, TARGET]);
     log(`[6] на целевой аккаунт: ${sums.rows[0].pi}π, ${sums.rows[0].cn} коннектов`);
 
     // ── 6b. Rating and review count, recomputed here and now ──────────────

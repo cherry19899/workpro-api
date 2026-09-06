@@ -243,7 +243,21 @@ router.post('/api/me', authLimiter, async (req, res) => {
     }
 
     // Normalise to canonical uid — auto-merges any non-canonical twin into canonical.
-    const uid = await normalizeLoginUid(rawUid);
+    let uid = await normalizeLoginUid(rawUid);
+
+    // If this uid was retired by an account merge (scripts/merge-users.js sets
+    // merged_into when it retires a duplicate), follow it to the live account
+    // instead of upserting into — and then blocking on — a dead row. This is
+    // exactly what happened to the owner after the 2026-08-24 merge: Pi kept
+    // handing back a pre-merge uid, login found it status='deleted', and
+    // refused with "Account has been deleted" on their own now-canonical
+    // account. One hop only: a merge target is never itself a source.
+    const retired = await query(
+      `SELECT merged_into FROM users WHERE id = $1 AND status = 'deleted' AND merged_into IS NOT NULL`,
+      [uid]
+    );
+    if (retired.rows[0]) uid = retired.rows[0].merged_into;
+
     const uname = verifiedUsername || username || uid.replace(/^pi_/, '') || uid;
 
     // Only a Pi-vouched username may overwrite the stored one. When Pi returns a
@@ -315,12 +329,23 @@ router.post('/api/auth/refresh', async (req, res) => {
     // account carrying someone else's username matched THEIR row under LIMIT 1
     // and this endpoint then minted a fresh 30-day token for it.
     const user = await query(
-      `SELECT id, username, role, status, is_blocked FROM users
+      `SELECT id, username, role, status, is_blocked, merged_into FROM users
        WHERE id = $1 OR id = $2 LIMIT 1`,
       [decoded.id, 'pi_' + decoded.id]
     );
     if (!user.rows.length) return res.status(401).json({ error: 'User not found' });
-    const u = user.rows[0];
+    let u = user.rows[0];
+    // Same retired-row trap as /api/me: a token minted before an account merge
+    // carries the pre-merge id, which is now status='deleted' with merged_into
+    // pointing at the live account. Follow it instead of blocking a real user
+    // out of their own now-canonical account.
+    if (u.status === 'deleted' && u.merged_into) {
+      const target = await query(
+        `SELECT id, username, role, status, is_blocked FROM users WHERE id = $1`,
+        [u.merged_into]
+      );
+      if (target.rows[0]) u = target.rows[0];
+    }
     if (u.status === 'deleted') return res.status(403).json({ error: 'Account has been deleted' });
     if (u.is_blocked) return res.status(403).json({ error: 'Account is blocked' });
     const newToken = jwt.sign({ id: u.id, username: u.username }, JWT_SECRET, { expiresIn: '30d' });
@@ -360,7 +385,14 @@ router.post('/api/auth/login', async (req, res) => {
     }
 
     // Normalise to canonical uid — auto-merges any non-canonical twin.
-    const uid = await normalizeLoginUid(rawUserId);
+    let uid = await normalizeLoginUid(rawUserId);
+    // Follow a merge-retired row to the account it was folded into — see the
+    // matching comment in /api/me above for why this exists.
+    const retiredLegacy = await query(
+      `SELECT merged_into FROM users WHERE id = $1 AND status = 'deleted' AND merged_into IS NOT NULL`,
+      [uid]
+    );
+    if (retiredLegacy.rows[0]) uid = retiredLegacy.rows[0].merged_into;
     const uname = (piUser && piUser.username) || username || uid;
     const paymentsEnabled = piUser ? piUser.payments_enabled === true : false;
     const existing = await query('SELECT id, username, role FROM users WHERE id = $1', [uid]);

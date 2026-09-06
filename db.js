@@ -262,6 +262,24 @@ async function initDb() {
     // /v2/me response — never from a request body, or one user could point
     // another user's payout at their own wallet.
     await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS wallet_address VARCHAR(120)`).catch(() => {});
+    // scripts/merge-users.js retires a duplicate's row (status='deleted') but
+    // never recorded where its data went — so when Pi later hands back that
+    // same uid (as it did for the owner after the 2026-08-24 merge), login
+    // found a dead row and refused with "Account has been deleted", locking
+    // the real person out of their own now-canonical account. This column
+    // lets login follow a retired row to the account it was folded into
+    // instead of blocking. Nullable: only set on rows a merge has retired.
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS merged_into VARCHAR(120) REFERENCES users(id)`).catch(() => {});
+    // One-time backfill for the 2026-08-24 merge, which predates the column
+    // above and so left its 3 retired rows with merged_into still NULL. Safe
+    // to run on every boot: WHERE merged_into IS NULL makes it a no-op once
+    // applied, and it only touches rows already status='deleted'.
+    await query(
+      `UPDATE users SET merged_into = $1
+        WHERE id = ANY($2) AND status = 'deleted' AND merged_into IS NULL`,
+      ['pi_e85a1c9b-9bdf-42cd-a4d0-11b4b278df78',
+       ['pi_cherry19899', 'pi_a2b617f7-f510-4502-a046-805facedcc29', 'pi_a2b617f7']]
+    ).catch((e) => logger.error(`[migrate] merged_into backfill failed: ${e.message}`));
     // `reviews` gained the reply routes that used to write to `ratings`; the
     // timestamp column came with them.
     await query(`ALTER TABLE reviews ADD COLUMN IF NOT EXISTS replied_at TIMESTAMP`).catch(() => {});
