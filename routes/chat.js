@@ -5,7 +5,8 @@ const router = require('express').Router();
 const crypto = require('crypto');
 const { query } = require('../src/db');
 const { notify, serverError } = require('../src/helpers');
-const { auth, softAuth, checkBlocked, messageLimiter } = require('../src/middleware');
+const { auth, softAuth, checkBlocked, messageLimiter, JWT_SECRET } = require('../src/middleware');
+const { mintDownloadToken, verifyDownloadToken, attachmentDisposition } = require('../src/attachment-link');
 const multer = require('multer');
 const { pushText } = require('../src/push-i18n');
 const normalizeId = (id) => (id || '').toString().toLowerCase().replace(/^pi_/, '');
@@ -509,6 +510,40 @@ router.get('/api/chat/attachments/:attId', auth, async (req, res) => {
     if (!member.rows.length) return res.status(403).json({ error: 'Access denied' });
     res.setHeader('Content-Type', att.mimetype || 'application/octet-stream');
     res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(att.filename)}"`);
+    res.send(att.data);
+  } catch (err) { serverError(err, res); }
+});
+
+// POST /api/chat/attachments/:attId/download-link — a 5-minute link that
+// downloads the attachment as a file. Same access rule as viewing it: room
+// members only. See src/attachment-link.js for why a link is needed at all.
+router.post('/api/chat/attachments/:attId/download-link', auth, async (req, res) => {
+  try {
+    const r = await query('SELECT room_id FROM chat_attachments WHERE id = $1', [req.params.attId]);
+    if (!r.rows.length) return res.status(404).json({ error: 'Attachment not found' });
+    const member = await query(`SELECT id FROM chat_rooms WHERE id = $1 AND ${memberOf('$2')}`, [r.rows[0].room_id, req.userId]);
+    if (!member.rows.length) return res.status(403).json({ error: 'Access denied' });
+    const t = mintDownloadToken(JWT_SECRET, req.params.attId, req.userId);
+    res.json({ url: `/api/chat/attachments/${encodeURIComponent(req.params.attId)}/download?t=${encodeURIComponent(t)}` });
+  } catch (err) { serverError(err, res); }
+});
+
+// GET /api/chat/attachments/:attId/download?t= — no Authorization header: the
+// token in the link is the credential, valid for this attachment only.
+router.get('/api/chat/attachments/:attId/download', async (req, res) => {
+  try {
+    const claims = verifyDownloadToken(JWT_SECRET, req.query.t, req.params.attId);
+    if (!claims) return res.status(403).json({ error: 'Download link is invalid or expired' });
+    const r = await query('SELECT * FROM chat_attachments WHERE id = $1', [req.params.attId]);
+    if (!r.rows.length) return res.status(404).json({ error: 'Attachment not found' });
+    const att = r.rows[0];
+    // Checked again at download time: a link minted just before someone lost
+    // access to the room must not outlive that access.
+    const member = await query(`SELECT id FROM chat_rooms WHERE id = $1 AND ${memberOf('$2')}`, [att.room_id, claims.uid]);
+    if (!member.rows.length) return res.status(403).json({ error: 'Access denied' });
+    res.setHeader('Content-Type', att.mimetype || 'application/octet-stream');
+    res.setHeader('Content-Disposition', attachmentDisposition(att.filename));
+    res.setHeader('Cache-Control', 'private, no-store');
     res.send(att.data);
   } catch (err) { serverError(err, res); }
 });
