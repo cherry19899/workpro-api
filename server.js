@@ -798,6 +798,18 @@ initDb().then(async () => {
     setTimeout(hourlySweep, 30 * 1000);       // once shortly after boot
   }
 
+  // One-time close of the test jobs the owner approved on 2026-10-20 — see
+  // src/close-test-jobs.js. Idempotent (each job is skipped once it is no
+  // longer open), so it is harmless on every later boot until it is removed.
+  if (NODE_ENV === 'production') {
+    setTimeout(() => {
+      const { closeTestJobs } = require('./src/close-test-jobs');
+      const { audit } = require('./src/helpers');
+      closeTestJobs({ getPool: require('./src/db').getPool, audit, logger })
+        .catch(e => logger.error('[cleanup] test jobs failed:', e.message));
+    }, 45 * 1000);
+  }
+
   // Graceful shutdown — Render sends SIGTERM before killing the process
   const shutdown = (signal) => {
     logger.info(`[WorkPro API] ${signal} received — graceful shutdown`);
